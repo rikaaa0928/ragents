@@ -19,3 +19,7 @@ eventsource-stream.workspace = true
 bytes.workspace = true
 url.workspace = true
 uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+ragents-apiserver.workspace = true
