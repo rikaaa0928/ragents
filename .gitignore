@@ -1,0 +1,9 @@
+/target
+/.idea
+/.vscode
+/.DS_Store
+/.ragents
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.cwasm
