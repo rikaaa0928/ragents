@@ -75,6 +75,7 @@ mod tests {
         DaemonConfig {
             node_id: NodeId::new(node_id),
             server_url: server_url.to_string(),
+            executor_mode: ExecutorMode::Subprocess,
             max_concurrent_runners: 4,
             max_turns: None,
             default_system_prompt: format!("System prompt from {node_id}"),

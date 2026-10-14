@@ -5,7 +5,7 @@ use ragents_apiserver::{serve_tcp, ApiServerState, SqliteStore, DEFAULT_LEASE_TT
 use ragents_cli::build_scheduling_mode;
 use ragents_client::RagentsClient;
 use ragents_core::make_openresponses_resource;
-use ragents_daemon::{AgentDaemon, DaemonConfig, LocalModelConfig};
+use ragents_daemon::{AgentDaemon, DaemonConfig, ExecutorMode, LocalModelConfig};
 use ragents_protocol::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -134,6 +134,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
     let daemon_cfg = DaemonConfig {
         node_id: NodeId::new("node_dev_mac"),
         server_url: server_url.clone(),
+        executor_mode: ExecutorMode::Subprocess,
         max_concurrent_runners: 4,
         max_turns: None,
         default_system_prompt: "Default node system prompt.".to_string(),

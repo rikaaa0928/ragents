@@ -3,11 +3,13 @@ use crate::model::ModelBackend;
 use async_trait::async_trait;
 use openresponses_rust::{Item, Usage};
 use ragents_protocol::*;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum PermissionOutcome {
     Allowed,
     Denied { reason: String },
@@ -15,13 +17,13 @@ pub enum PermissionOutcome {
 
 /// Node-local OpenResponses endpoint credentials injected by `agent-daemon`.
 /// Never serialized into `ConfigRevision` or sent to `api-server`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEndpointConfig {
     pub base_url: String,
     pub api_key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreRunSpec {
     pub session_id: SessionId,
     pub activation_id: ActivationId,
@@ -32,7 +34,7 @@ pub struct CoreRunSpec {
     pub max_turns: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoreRunSummary {
     pub activation_id: ActivationId,
     pub final_text: String,

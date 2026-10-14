@@ -2011,10 +2011,12 @@ dependencies = [
  "ragents-protocol",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "uuid",
  "wasmtime",
  "wasmtime-wasi",
 ]

@@ -4,6 +4,7 @@ pub mod hooks;
 pub mod host;
 pub mod model;
 pub mod runner;
+pub mod subprocess;
 
 pub use context::*;
 pub use error::*;
@@ -12,6 +13,7 @@ pub use host::*;
 pub use model::*;
 pub use ragents_protocol;
 pub use runner::*;
+pub use subprocess::*;
 
 #[cfg(test)]
 mod tests {
@@ -242,5 +244,91 @@ mod tests {
         assert_eq!(summary.turns_executed, 2);
         let written = std::fs::read_to_string(ws_root.join("hello.txt")).expect("read hello.txt");
         assert_eq!(written, "hello from ragents-core wasm!");
+    }
+
+    #[tokio::test]
+    async fn test_subprocess_executor_with_wasm_file_editor_extension() {
+        let wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+        );
+        if !wasm_path.exists() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws_root = tmp.path().join("ws_subproc");
+        std::fs::create_dir_all(&ws_root).unwrap();
+
+        let host = Arc::new(MockCoreHost {
+            items: Mutex::new(vec![Item::user_message("create subproc.txt")]),
+            events: Mutex::new(vec![]),
+        });
+
+        let fc_item = Item::FunctionCall {
+            id: Some("fc_sub_1".to_string()),
+            call_id: "call_sub_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "subproc.txt",
+                "content": "hello from isolated subprocess executor!"
+            })
+            .to_string(),
+            status: None,
+        };
+
+        let resp1 = make_openresponses_resource("resp_sub_1", "gpt-4.1", vec![fc_item], None);
+        let resp2 = make_openresponses_resource(
+            "resp_sub_2",
+            "gpt-4.1",
+            vec![Item::assistant_message(
+                "Created subproc.txt in subprocess.",
+            )],
+            None,
+        );
+
+        let model_backend = Arc::new(MockModelBackend {
+            responses: Mutex::new(vec![resp1, resp2]),
+        });
+
+        let cfg = ConfigRevision::new_merged(
+            "You are a coding assistant.".to_string(),
+            ModelRequestSpec::new("gpt-4.1"),
+            vec![ExtensionSpec {
+                name: "file_editor".to_string(),
+                path: wasm_path.to_string_lossy().to_string(),
+                enabled: true,
+                config: serde_json::json!({}),
+            }],
+        );
+
+        let run_spec = CoreRunSpec {
+            session_id: SessionId::new("sess_subproc"),
+            activation_id: ActivationId::new("act_subproc"),
+            workspace_root: ws_root.clone(),
+            session_tmp_dir: tmp.path().join("tmp_subproc"),
+            effective_config: cfg,
+            model_endpoint: ModelEndpointConfig {
+                base_url: "http://127.0.0.1:9999/v1".to_string(),
+                api_key: "sk-local-secret".to_string(),
+            },
+            max_turns: None,
+        };
+
+        let executor = SubprocessExecutor::new();
+        let summary = executor
+            .execute(
+                run_spec,
+                host.clone(),
+                model_backend,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute subprocess wasm tool loop");
+
+        assert_eq!(summary.final_text, "Created subproc.txt in subprocess.");
+        assert_eq!(summary.turns_executed, 2);
+        let written =
+            std::fs::read_to_string(ws_root.join("subproc.txt")).expect("read subproc.txt");
+        assert_eq!(written, "hello from isolated subprocess executor!");
     }
 }

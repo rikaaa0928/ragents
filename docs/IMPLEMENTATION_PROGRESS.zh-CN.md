@@ -21,7 +21,7 @@
 | **S3：Agent 容器内核与 WASM 扩展** | ✅ 已完成 | `7b84db7` | `ragents-core`：纯 OpenResponses 模型对接（`ModelBackend` / `OpenResponsesModelBackend`）、`ContextProjection`、Wasmtime WASI P2 `HookManager`、显式 `workspace_root` 目录隔离的 `InProcessExecutor`、以及 `shell` / `file_editor` / `image_viewer` 三个标准 WASM 组件构建脚本 |
 | **S4：节点守护进程 (`agent-daemon`)** | ✅ 已完成 | `871aff4` | `ragents-daemon`：节点本地模型凭证库（保管 `base_url` 与 `api_key`，仅向 `api-server` 上报 `supported_models`）、多级配置合并与 SHA-256 快照回写、权限门卫（支持 `Allow` / `Deny` / `Ask` 挂起等待审批）、调谐循环（Reconcile Loop） |
 | **S5：控制台 CLI、`ragents up` 与端到端验收** | ✅ 已完成 | `8df9ae7` | `ragents-cli`：提供 `ragents up`（单进程内嵌 `apiserver` + `daemon`）、`apiserver`、`daemon`、`node`、`session`、`run`、`cancel`、`approve`、`watch` 全套命令及跨机/WASM/权限审批 E2E 验收测试 |
-| **S6：子进程执行器与生态扩展** | ⏳ 待按需启动 | - | `SubprocessExecutor` 单二进制自孵化、流式 Delta 增强、TUI/WebUI 及外部协议扩展 |
+| **S6：子进程隔离执行器 (`SubprocessExecutor`)** | ✅ 已完成（已设为默认模式） | 最新提交 | 单二进制自孵化 `internal-core-worker` 子进程隔离执行、本地 Loopback JSONL IPC 桥接 `CoreHost`/`ModelBackend`、子进程环境自动剥离 `RAGENTS_API_KEY`、Wasmtime `.cwasm` 内容寻址预编译缓存 |
 
 ---
 

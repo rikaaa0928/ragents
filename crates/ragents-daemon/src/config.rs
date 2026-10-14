@@ -61,11 +61,21 @@ impl LocalModelConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorMode {
+    #[default]
+    Subprocess,
+    InProcess,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
     pub node_id: NodeId,
     #[serde(default = "default_server_url")]
     pub server_url: String,
+    #[serde(default)]
+    pub executor_mode: ExecutorMode,
     #[serde(default = "default_max_concurrent_runners")]
     pub max_concurrent_runners: u32,
     #[serde(default)]
@@ -131,6 +141,7 @@ impl DaemonConfig {
         Self {
             node_id: node_id.into(),
             server_url: server_url.into(),
+            executor_mode: ExecutorMode::Subprocess,
             max_concurrent_runners: default_max_concurrent_runners(),
             max_turns: None,
             default_system_prompt: default_system_prompt(),

@@ -3,6 +3,10 @@ name = "ragents-core"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "ragents-core-worker"
+path = "src/bin/ragents_core_worker.rs"
+
 [dependencies]
 ragents-protocol.workspace = true
 openresponses-rust.workspace = true
@@ -16,6 +20,8 @@ anyhow.workspace = true
 async-trait.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
+sha2.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

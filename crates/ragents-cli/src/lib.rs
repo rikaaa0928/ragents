@@ -4,7 +4,7 @@ use futures::StreamExt;
 use openresponses_rust::Item;
 use ragents_apiserver::{serve_tcp, ApiServerState, SqliteStore, DEFAULT_LEASE_TTL_MS};
 use ragents_client::RagentsClient;
-use ragents_core::extract_item_text;
+use ragents_core::{extract_item_text, run_subprocess_worker};
 use ragents_daemon::{AgentDaemon, DaemonConfig};
 use ragents_protocol::*;
 use std::collections::BTreeMap;
@@ -118,6 +118,14 @@ pub enum Commands {
         session: Option<String>,
         #[arg(long, default_value_t = 0)]
         after_rv: u64,
+    },
+    /// Internal subprocess worker entrypoint for SubprocessExecutor (single-binary re-exec)
+    #[command(hide = true, name = "internal-core-worker")]
+    InternalCoreWorker {
+        #[arg(long)]
+        ipc_addr: String,
+        #[arg(long)]
+        ipc_token: String,
     },
 }
 
@@ -574,6 +582,13 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 let env = ev?;
                 println!("{}", serde_json::to_string(&env)?);
             }
+            Ok(())
+        }
+        Commands::InternalCoreWorker {
+            ipc_addr,
+            ipc_token,
+        } => {
+            run_subprocess_worker(&ipc_addr, &ipc_token).await?;
             Ok(())
         }
     }

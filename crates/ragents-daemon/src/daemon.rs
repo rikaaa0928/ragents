@@ -1,4 +1,4 @@
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, ExecutorMode};
 use crate::permission::{evaluate_capability_policy, PolicyEvalResult};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -8,7 +8,7 @@ use ragents_client::{
 };
 use ragents_core::{
     CoreError, CoreExecutor, CoreHost, CoreRunSpec, InProcessExecutor, ModelBackend,
-    OpenResponsesModelBackend, PermissionOutcome,
+    OpenResponsesModelBackend, PermissionOutcome, SubprocessExecutor,
 };
 use ragents_protocol::*;
 use std::collections::HashMap;
@@ -36,9 +36,13 @@ pub struct AgentDaemon {
 
 impl AgentDaemon {
     pub fn new(config: DaemonConfig) -> Self {
+        let executor: Arc<dyn CoreExecutor> = match config.executor_mode {
+            ExecutorMode::Subprocess => Arc::new(SubprocessExecutor::new()),
+            ExecutorMode::InProcess => Arc::new(InProcessExecutor),
+        };
         Self {
             config: Arc::new(config),
-            executor: Arc::new(InProcessExecutor),
+            executor,
             model_backend: Arc::new(OpenResponsesModelBackend),
         }
     }
