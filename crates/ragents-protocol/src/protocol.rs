@@ -1,0 +1,252 @@
+use crate::events::{ItemBatch, ItemBatchKind, SessionEvent, SessionEventEnvelope};
+use crate::ids::*;
+use crate::resources::*;
+use openresponses_rust::{Item, Usage};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+// ============================================================================
+// 1. Declarative REST API Request / Response Payloads
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    pub spec: SessionSpec,
+    /// Optional inline initial activation to start a conversation in one declarative call
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_activation: Option<InitialActivationRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitialActivationRequest {
+    pub input: Vec<Item>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<ModelRequestSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionResponse {
+    pub session: Session,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_activation: Option<Activation>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PatchSessionSpecRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_phase: Option<DesiredSessionPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRequestSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<ExtensionSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionPolicyLayer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateActivationRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activation_id: Option<ActivationId>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    pub spec: ActivationSpec,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PatchActivationSpecRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_phase: Option<DesiredActivationPhase>,
+    #[serde(default)]
+    pub interaction_responses: BTreeMap<PermissionRequestId, PermissionResolutionSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionContextResponse {
+    pub session_id: SessionId,
+    pub resource_version: ResourceVersion,
+    pub effective_items: Vec<Item>,
+    pub local_batches: Vec<ItemBatch>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WatchQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_rv: Option<u64>,
+}
+
+// ============================================================================
+// 2. Daemon <-> API Server WebSocket Tunnel Messages
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DaemonToServerMessage {
+    RegisterNode {
+        request_id: String,
+        node_id: NodeId,
+        hostname: String,
+        os: String,
+        arch: String,
+        #[serde(default)]
+        labels: BTreeMap<String, String>,
+        #[serde(default)]
+        supported_models: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_model: Option<String>,
+        #[serde(default)]
+        installed_extensions: Vec<String>,
+        max_concurrent_runners: u32,
+    },
+    Heartbeat {
+        request_id: String,
+        node_id: NodeId,
+        active_runners: u32,
+    },
+    /// Daemon claims a scheduled activation, reporting merged effective ConfigRevision & PermissionSnapshot
+    AcceptActivation {
+        request_id: String,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        effective_config: Box<ConfigRevision>,
+        effective_permission: Box<PermissionSnapshot>,
+    },
+    /// Daemon commits a prepared Input, ModelOutput, or ToolOutput batch along with its pairing event
+    CommitBatch {
+        request_id: String,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        kind: ItemBatchKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        items: Vec<Item>,
+        companion_event: BatchCompanionEvent,
+    },
+    /// Daemon emits a standalone lifecycle event (e.g. TurnStarted, ToolCallStarted, PermissionRequested)
+    EmitEvent {
+        request_id: String,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+        event: SessionEvent,
+    },
+    /// Daemon requests reading effective context for a session
+    FetchEffectiveContext {
+        request_id: String,
+        session_id: SessionId,
+    },
+    /// Daemon requests spawning a child session from a tool/extension command
+    SpawnChildSession {
+        request_id: String,
+        parent_session_id: SessionId,
+        parent_activation_id: ActivationId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_turn_id: Option<TurnId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        command_id: CommandId,
+        child_request: Box<CreateSessionRequest>,
+    },
+    /// Daemon completes an activation (Succeeded, Failed, or Cancelled)
+    CompleteActivation {
+        request_id: String,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+        outcome: ActivationTerminalOutcome,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BatchCompanionEvent {
+    InputSubmitted,
+    TurnCompleted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+    },
+    ToolCallFinished {
+        call_id: String,
+        name: String,
+        success: bool,
+        duration_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ActivationTerminalOutcome {
+    Succeeded {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerToDaemonMessage {
+    Registered {
+        request_id: String,
+        node_id: NodeId,
+        lease_ttl_ms: u64,
+        resource_version: ResourceVersion,
+    },
+    Ack {
+        request_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resource_version: Option<ResourceVersion>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        batch_seq: Option<BatchSeq>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spawned_session_id: Option<SessionId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    EffectiveContextReply {
+        request_id: String,
+        ok: bool,
+        #[serde(default)]
+        items: Vec<Item>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Server pushes a newly scheduled activation to this daemon
+    DispatchActivation {
+        session: Box<Session>,
+        activation: Box<Activation>,
+        lease_epoch: LeaseEpoch,
+    },
+    /// Server pushes declarative spec updates (e.g. desired_phase=Cancelled or permission resolutions)
+    ReconcileActivation {
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        desired_phase: DesiredActivationPhase,
+        #[serde(default)]
+        interaction_responses: BTreeMap<PermissionRequestId, PermissionResolutionSpec>,
+    },
+    /// Server notifies daemon that a session Event was committed (useful for local observers)
+    EventNotification { envelope: Box<SessionEventEnvelope> },
+}

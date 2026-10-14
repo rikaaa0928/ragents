@@ -1,0 +1,30 @@
+[package]
+name = "ragents-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ragents"
+path = "src/main.rs"
+
+[dependencies]
+ragents-protocol.workspace = true
+ragents-core.workspace = true
+ragents-apiserver.workspace = true
+ragents-client.workspace = true
+ragents-daemon.workspace = true
+openresponses-rust.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+chrono.workspace = true
+toml.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

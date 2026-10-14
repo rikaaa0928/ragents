@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ragents-protocol",
+    "crates/ragents-core",
+    "crates/ragents-apiserver",
+    "crates/ragents-client",
+    "crates/ragents-daemon",
+    "crates/ragents-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+ragents-protocol = { path = "crates/ragents-protocol" }
+ragents-core = { path = "crates/ragents-core" }
+ragents-apiserver = { path = "crates/ragents-apiserver" }
+ragents-client = { path = "crates/ragents-client" }
+ragents-daemon = { path = "crates/ragents-daemon" }
+
+openresponses-rust = "2026.7.26"
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+wasmtime = { version = "37", features = ["component-model", "async"] }
+wasmtime-wasi = "37"
+toml = "0.8"
+dirs = "5.0"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+sha2 = "0.10"
+uuid = { version = "1.0", features = ["v7", "v4", "serde"] }
+axum = { version = "0.8", features = ["ws"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+tokio-tungstenite = "0.29"
+eventsource-stream = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+bytes = "1.0"
+url = "2.5"
+tempfile = "3.27.0"

@@ -1,0 +1,21 @@
+[package]
+name = "ragents-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ragents-protocol.workspace = true
+openresponses-rust.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

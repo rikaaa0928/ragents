@@ -1,0 +1,23 @@
+[package]
+name = "ragents-apiserver"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ragents-protocol.workspace = true
+openresponses-rust.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+axum.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

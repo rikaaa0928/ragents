@@ -1,0 +1,13 @@
+[package]
+name = "ragents-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+openresponses-rust.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+uuid.workspace = true
