@@ -1957,6 +1957,7 @@ name = "ragents-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "dirs",
@@ -1982,9 +1983,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "eventsource-stream",
  "futures",
  "openresponses-rust",
+ "ragents-apiserver",
  "ragents-protocol",
  "reqwest",
  "serde",

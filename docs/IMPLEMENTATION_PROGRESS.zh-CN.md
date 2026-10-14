@@ -1,0 +1,80 @@
+# ragents 实施进度记录
+
+更新日期：2026-10-14  
+关联文档：
+- [产品需求文档](./PRODUCT_REQUIREMENTS.zh-CN.md)
+- [详细技术方案](./TECHNICAL_DESIGN.zh-CN.md)
+- [分阶段实施路线图](./IMPLEMENTATION_ROADMAP.zh-CN.md)
+
+---
+
+## 1. 阶段完成总览
+
+目前 **S0 至 S5（Milestone v0.1 核心闭环）已全部落地并通过全量测试与严格 Clippy 检查**，每个阶段均已独立提交 Git Commit：
+
+| 阶段 | 状态 | Commit | 核心完成内容 |
+| :--- | :---: | :--- | :--- |
+| **Docs 基线** | ✅ 已完成 | `776f05c` | 全新架构设计：PRD、详细技术方案、分阶段实施路线图 |
+| **S0：Workspace 与协议层** | ✅ 已完成 | `7c20604` | 6 个 Workspace Crate 骨架；`ragents-protocol` 声明式资源（`Node`、`Session`、`Activation`、`ConfigRevision`、`PermissionSnapshot`、`ItemBatch`、`SessionEventEnvelope`）与 REST/SSE/WebSocket 消息协议 |
+| **S1：存储引擎与双模调度器** | ✅ 已完成 | `8d3aad0` | `ragents-apiserver::store`：SQLite WAL 9 张核心表、全局单调递增 `ResourceVersion`、`Pinned`（绑定节点+目录，不跨机迁移）与 `Floating`（自动调度+临时目录+跨机容灾重调度）双模式调度器、`lease_epoch` 防脑裂 Fencing Token、`SessionSource` 跨会话血缘展开 |
+| **S2：API Server 网络层与 Client SDK** | ✅ 已完成 | `92bfcda` | `ragents-apiserver::server`（Axum HTTP REST + SSE `/api/v1/watch` + WebSocket `/api/v1/daemon/tunnel`）与 `ragents-client`（`RagentsClient` + `DaemonTunnelHandle`） |
+| **S3：Agent 容器内核与 WASM 扩展** | ✅ 已完成 | `7b84db7` | `ragents-core`：纯 OpenResponses 模型对接（`ModelBackend` / `OpenResponsesModelBackend`）、`ContextProjection`、Wasmtime WASI P2 `HookManager`、显式 `workspace_root` 目录隔离的 `InProcessExecutor`、以及 `shell` / `file_editor` / `image_viewer` 三个标准 WASM 组件构建脚本 |
+| **S4：节点守护进程 (`agent-daemon`)** | ✅ 已完成 | `871aff4` | `ragents-daemon`：节点本地模型凭证库（保管 `base_url` 与 `api_key`，仅向 `api-server` 上报 `supported_models`）、多级配置合并与 SHA-256 快照回写、权限门卫（支持 `Allow` / `Deny` / `Ask` 挂起等待审批）、调谐循环（Reconcile Loop） |
+| **S5：控制台 CLI、`ragents up` 与端到端验收** | ✅ 已完成 | `8df9ae7` | `ragents-cli`：提供 `ragents up`（单进程内嵌 `apiserver` + `daemon`）、`apiserver`、`daemon`、`node`、`session`、`run`、`cancel`、`approve`、`watch` 全套命令及跨机/WASM/权限审批 E2E 验收测试 |
+| **S6：子进程执行器与生态扩展** | ⏳ 待按需启动 | - | `SubprocessExecutor` 单二进制自孵化、流式 Delta 增强、TUI/WebUI 及外部协议扩展 |
+
+---
+
+## 2. 已验证的核心能力与测试矩阵
+
+当前全仓自动化测试共覆盖以下关键不变量与端到端链路：
+
+1. **协议与内容寻址不变量 (`crates/ragents-protocol/src/lib.rs`)**
+   - `SchedulingMode::Pinned`（强制要求安全 `node_id` 与绝对路径 `workspace_path`）与 `SchedulingMode::Floating` 校验。
+   - `ConfigRevision` 与 `PermissionSnapshot` 规范化 JSON SHA-256 哈希稳定性。
+   - 原生 `openresponses_rust::Item` 批次序列化往返一致性。
+   - `SessionSource` 固定范围校验。
+
+2. **控制面存储、双模式调度与防脑裂 (`crates/ragents-apiserver/src/lib.rs`)**
+   - **`Pinned` 不迁移保证**：当 `node_a` 租约过期而 `node_b` 在线时，`Pinned` 会话的任务转为 `Interrupted` 或保持 `Queued` 等待 `node_a`，绝不漂移至 `node_b`。
+   - **`Floating` 自动故障切换与 `lease_epoch` Fencing**：当 `node_a` 租约过期时，未开始的 `Floating` 任务自动重调度至 `node_b` 并递增 `lease_epoch`；`node_a` 恢复后携带旧 `lease_epoch` 的延迟写入被 `StaleLeaseEpoch` 严格拦截。
+   - **跨会话零复制血缘 (`SessionSource`)**：子会话通过 `ForkedFrom [from..=through]` 零复制继承父会话上下文切片并与本地新批次拼接。
+
+3. **HTTP REST + SSE Watch + WebSocket Daemon 隧道 (`crates/ragents-client/tests/server_client_roundtrip.rs`)**
+   - 验证 Daemon 通过 WebSocket 主动拨号注册节点及 `supported_models`、接收 `DispatchActivation`、提交 `ItemBatch` 与 `SessionEvent`，客户端通过 SSE `/api/v1/watch?after_rv=0` 实时按序接收全部事件。
+
+4. **Agent 容器内核与 WASM 组件隔离执行 (`crates/ragents-core/src/lib.rs`)**
+   - 验证 `InProcessExecutor` ReAct 循环与 `file_editor` WASM 组件加载执行；相对路径在 WASI guest `"."` 映射下精确落入 `workspace_root`，不污染宿主机全局 `cwd`。
+
+5. **多节点集群 `Floating` 任务跨机接力 (`crates/ragents-daemon/src/lib.rs`)**
+   - 启动 `node_a` 完成 `Floating` 会话第一轮对话 $\rightarrow$ `node_a` 下线超时 $\rightarrow$ 启动 `node_b` 提交第二轮追问 $\rightarrow$ `api-server` 自动将第二轮调度至 `node_b`，且 `node_b` 从 `api-server` 完整拉取到第一轮在 `node_a` 产出的历史 `ItemBatch`。
+
+6. **真实 OpenResponses HTTP 协议 + WASM 扩展 + 声明式权限审批 (`crates/ragents-cli/tests/e2e_cluster_acceptance.rs`)**
+   - 启动标准 OpenResponses HTTP 服务端（`/v1/responses`）+ `ragents-apiserver` + `ragents-daemon` + `RagentsClient`。
+   - 配置 `file_write` 默认策略为 `Ask`，触发 WASM `write_file` 工具调用 $\rightarrow$ 激活进入 `WaitingForInteraction` 并推送 `PermissionRequested` 事件 $\rightarrow$ 客户端声明式调用 `respond_permission(AllowOnce)` $\rightarrow$ Daemon 收到 `ReconcileActivation` 唤醒工具完成文件写入并最终 `Succeeded`。
+
+---
+
+## 3. 常用构建、验证与运行命令
+
+```bash
+# 1. 编译全部 WASM 扩展 (shell, file_editor, image_viewer)
+./scripts/build-extensions.sh
+
+# 2. 运行全仓格式化检查、测试与严格 Clippy
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+# 3. 单机 All-in-One 快速启动与运行
+cargo run -p ragents-cli -- up --prompt "Hello ragents!"
+
+# 4. 独立启动控制面与多节点 Daemon
+cargo run -p ragents-cli -- apiserver --bind 127.0.0.1:8080 --db .ragents/control.sqlite3
+cargo run -p ragents-cli -- --server http://127.0.0.1:8080 daemon --node-id node_a
+
+# 5. 通过 CLI 查看节点、创建 Pinned / Floating 会话并监听事件
+cargo run -p ragents-cli -- node list
+cargo run -p ragents-cli -- run --floating "Analyze this problem"
+cargo run -p ragents-cli -- run --node node_a --workdir /tmp/my-proj "Edit files in /tmp/my-proj"
+```
