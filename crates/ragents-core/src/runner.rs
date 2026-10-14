@@ -274,7 +274,6 @@ async fn run_react_loop(
         })
         .collect::<Vec<_>>();
 
-    let max_turns = run_spec.max_turns.max(1);
     let mut iteration = 0usize;
     let mut final_text = String::new();
     let mut accumulated_usage: Option<Usage> = None;
@@ -284,8 +283,10 @@ async fn run_react_loop(
         if cancellation.is_cancelled() {
             return Err(CoreError::Cancelled);
         }
-        if iteration >= max_turns {
-            break;
+        if let Some(max_turns) = run_spec.max_turns {
+            if iteration >= max_turns {
+                break;
+            }
         }
         iteration += 1;
 

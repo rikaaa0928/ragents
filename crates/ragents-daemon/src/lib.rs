@@ -76,7 +76,7 @@ mod tests {
             node_id: NodeId::new(node_id),
             server_url: server_url.to_string(),
             max_concurrent_runners: 4,
-            max_turns: 8,
+            max_turns: None,
             default_system_prompt: format!("System prompt from {node_id}"),
             default_model: models.first().map(|s| s.to_string()),
             temp_root_dir: temp_root,

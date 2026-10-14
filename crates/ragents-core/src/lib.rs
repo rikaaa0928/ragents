@@ -141,7 +141,7 @@ mod tests {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local".to_string(),
             },
-            max_turns: 8,
+            max_turns: None,
         };
 
         let executor = InProcessExecutor;
@@ -224,7 +224,7 @@ mod tests {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local".to_string(),
             },
-            max_turns: 8,
+            max_turns: None,
         };
 
         let executor = InProcessExecutor;

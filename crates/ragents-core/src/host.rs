@@ -29,7 +29,7 @@ pub struct CoreRunSpec {
     pub session_tmp_dir: PathBuf,
     pub effective_config: ConfigRevision,
     pub model_endpoint: ModelEndpointConfig,
-    pub max_turns: usize,
+    pub max_turns: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

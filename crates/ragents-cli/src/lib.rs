@@ -39,6 +39,9 @@ pub enum Commands {
         node_id: String,
         #[arg(long)]
         daemon_config: Option<PathBuf>,
+        /// Optional working directory for Pinned one-shot run
+        #[arg(long)]
+        workdir: Option<PathBuf>,
         /// Optional one-shot prompt to run immediately after starting `up`
         #[arg(long)]
         prompt: Option<String>,
@@ -220,6 +223,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             db,
             node_id,
             daemon_config,
+            workdir,
             prompt,
             model,
         } => {
@@ -235,6 +239,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 None => DaemonConfig::default_local(NodeId::new(&node_id), &local_server_url),
             };
             d_cfg.server_url = local_server_url.clone();
+            let registered_node_id = d_cfg.node_id.clone();
 
             let daemon = AgentDaemon::new(d_cfg);
             daemon.start(cancel.clone()).await?;
@@ -246,14 +251,28 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
 
             if let Some(prompt_text) = prompt {
                 let up_client = RagentsClient::new(&local_server_url);
+                let scheduling = match workdir {
+                    Some(w) => {
+                        let abs_w = if w.is_absolute() {
+                            w
+                        } else {
+                            std::env::current_dir()?.join(w)
+                        };
+                        SchedulingMode::Pinned {
+                            node_id: registered_node_id,
+                            workspace_path: abs_w,
+                        }
+                    }
+                    None => SchedulingMode::Floating {
+                        node_selector: BTreeMap::new(),
+                    },
+                };
                 let created = up_client
                     .create_session(CreateSessionRequest {
                         session_id: None,
                         labels: BTreeMap::new(),
                         spec: SessionSpec {
-                            scheduling: SchedulingMode::Floating {
-                                node_selector: BTreeMap::new(),
-                            },
+                            scheduling,
                             sources: vec![],
                             producer: None,
                             desired_phase: DesiredSessionPhase::Open,
@@ -693,8 +712,13 @@ pub async fn watch_activation_to_completion(
             }
             SessionEvent::ActivationCompleted { .. } => {
                 let ctx = client.get_session_context(session_id).await?;
-                if let Some(last_item) = ctx.effective_items.last() {
-                    let text = extract_item_text(last_item);
+                if let Some(last_msg) = ctx
+                    .effective_items
+                    .iter()
+                    .rev()
+                    .find(|item| matches!(item, Item::Message { .. }))
+                {
+                    let text = extract_item_text(last_msg);
                     if !text.is_empty() {
                         println!("\n{text}");
                     }

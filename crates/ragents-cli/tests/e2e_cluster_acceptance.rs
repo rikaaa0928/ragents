@@ -135,7 +135,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
         node_id: NodeId::new("node_dev_mac"),
         server_url: server_url.clone(),
         max_concurrent_runners: 4,
-        max_turns: 8,
+        max_turns: None,
         default_system_prompt: "Default node system prompt.".to_string(),
         default_model: Some("gpt-4.1".to_string()),
         temp_root_dir: tmp.path().join("daemon_tmp"),

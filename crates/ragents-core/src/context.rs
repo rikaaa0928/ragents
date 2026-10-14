@@ -19,7 +19,31 @@ impl ContextProjection {
     }
 
     pub fn to_openresponses_input(&self) -> Input {
-        Input::Items(self.items.clone())
+        let cleaned = self
+            .items
+            .iter()
+            .cloned()
+            .map(strip_reasoning_summary)
+            .collect();
+        Input::Items(cleaned)
+    }
+}
+
+pub fn strip_reasoning_summary(item: Item) -> Item {
+    match item {
+        Item::Reasoning {
+            id,
+            status,
+            encrypted_content,
+            ..
+        } => Item::Reasoning {
+            id,
+            status,
+            content: None,
+            summary: vec![],
+            encrypted_content,
+        },
+        other => other,
     }
 }
 

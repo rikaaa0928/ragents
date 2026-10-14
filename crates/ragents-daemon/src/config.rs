@@ -52,9 +52,7 @@ impl LocalModelConfig {
                 }
             }
         }
-        if let Ok(val) =
-            std::env::var("RAGENTS_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY"))
-        {
+        if let Ok(val) = std::env::var("RAGENTS_API_KEY") {
             if !val.trim().is_empty() {
                 return Ok(val);
             }
@@ -70,8 +68,8 @@ pub struct DaemonConfig {
     pub server_url: String,
     #[serde(default = "default_max_concurrent_runners")]
     pub max_concurrent_runners: u32,
-    #[serde(default = "default_max_turns")]
-    pub max_turns: usize,
+    #[serde(default)]
+    pub max_turns: Option<usize>,
     #[serde(default = "default_system_prompt")]
     pub default_system_prompt: String,
     #[serde(default)]
@@ -96,10 +94,6 @@ fn default_max_concurrent_runners() -> u32 {
     4
 }
 
-fn default_max_turns() -> usize {
-    16
-}
-
 fn default_system_prompt() -> String {
     "You are a helpful AI assistant managed by ragents.".to_string()
 }
@@ -117,11 +111,9 @@ impl DaemonConfig {
 
     pub fn default_local(node_id: impl Into<NodeId>, server_url: impl Into<String>) -> Self {
         let base_url = std::env::var("RAGENTS_BASE_URL")
-            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let api_key = std::env::var("RAGENTS_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .unwrap_or_else(|_| "sk-placeholder".to_string());
+            .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
+        let api_key =
+            std::env::var("RAGENTS_API_KEY").unwrap_or_else(|_| "sk-placeholder".to_string());
         let model_name = std::env::var("RAGENTS_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string());
 
         let mut models = BTreeMap::new();
@@ -140,7 +132,7 @@ impl DaemonConfig {
             node_id: node_id.into(),
             server_url: server_url.into(),
             max_concurrent_runners: default_max_concurrent_runners(),
-            max_turns: default_max_turns(),
+            max_turns: None,
             default_system_prompt: default_system_prompt(),
             default_model: Some(model_name),
             temp_root_dir: default_temp_root(),
