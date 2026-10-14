@@ -8,6 +8,11 @@ members = [
     "crates/ragents-daemon",
     "crates/ragents-cli",
 ]
+exclude = [
+    "extensions/shell",
+    "extensions/file_editor",
+    "extensions/image_viewer",
+]
 
 [workspace.package]
 version = "0.1.0"
