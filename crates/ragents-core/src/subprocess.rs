@@ -8,16 +8,19 @@ use async_trait::async_trait;
 use openresponses_rust::{CreateResponseBody, Item, ResponseResource, Usage};
 use ragents_protocol::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex, OnceCell};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
 type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
+type WorkerStreamPair = (Lines<BufReader<BoxedReader>>, BoxedWriter);
 
 enum IpcListener {
     #[cfg(unix)]
@@ -37,7 +40,11 @@ impl IpcListener {
         if prefer_uds {
             let ipc_dir = PathBuf::from("/tmp/ragents-ipc");
             if std::fs::create_dir_all(&ipc_dir).is_ok() {
-                let sock_path = ipc_dir.join(format!("w_{}.sock", Uuid::now_v7().simple()));
+                let sock_path = ipc_dir.join(format!(
+                    "daemon_{}_{}.sock",
+                    std::process::id(),
+                    &Uuid::now_v7().simple().to_string()[..8]
+                ));
                 let _ = std::fs::remove_file(&sock_path);
                 if let Ok(listener) = tokio::net::UnixListener::bind(&sock_path) {
                     let addr_str = format!("unix:{}", sock_path.to_string_lossy());
@@ -84,11 +91,91 @@ impl IpcListener {
             }
         }
     }
+}
 
-    fn cleanup(&self) {
+/// Shared IPC Hub bound once per `SubprocessExecutor` (i.e. once per `agent-daemon`).
+/// All worker subprocesses connect to the same UDS (or TCP loopback) endpoint and are
+/// demultiplexed to their owning activation task via `Hello { ipc_token }`.
+struct SharedIpcHub {
+    ipc_addr: String,
+    #[cfg(unix)]
+    socket_path: Option<PathBuf>,
+    pending_workers: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<WorkerStreamPair>>>>,
+    accept_task: JoinHandle<()>,
+}
+
+impl SharedIpcHub {
+    async fn start(prefer_uds: bool) -> Result<Arc<Self>, CoreError> {
+        let (listener, ipc_addr) = IpcListener::bind(prefer_uds).await?;
         #[cfg(unix)]
-        if let Self::Unix { socket_path, .. } = self {
-            let _ = std::fs::remove_file(socket_path);
+        let socket_path = match &listener {
+            IpcListener::Unix { socket_path, .. } => Some(socket_path.clone()),
+            IpcListener::Tcp { .. } => None,
+        };
+
+        let pending_workers: Arc<
+            std::sync::Mutex<HashMap<String, oneshot::Sender<WorkerStreamPair>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pending_for_loop = pending_workers.clone();
+
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let (reader, writer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let pending_map = pending_for_loop.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(reader).lines();
+                    if let Ok(Some(first_line)) = lines.next_line().await {
+                        if let Ok(WorkerToParentMessage::Hello { ipc_token }) =
+                            serde_json::from_str::<WorkerToParentMessage>(&first_line)
+                        {
+                            let maybe_tx = pending_map
+                                .lock()
+                                .expect("pending_workers mutex poisoned")
+                                .remove(&ipc_token);
+                            if let Some(tx) = maybe_tx {
+                                let _ = tx.send((lines, writer));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        Ok(Arc::new(Self {
+            ipc_addr,
+            #[cfg(unix)]
+            socket_path,
+            pending_workers,
+            accept_task,
+        }))
+    }
+
+    fn register_token(&self, token: String) -> oneshot::Receiver<WorkerStreamPair> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_workers
+            .lock()
+            .expect("pending_workers mutex poisoned")
+            .insert(token, tx);
+        rx
+    }
+
+    fn remove_token(&self, token: &str) {
+        self.pending_workers
+            .lock()
+            .expect("pending_workers mutex poisoned")
+            .remove(token);
+    }
+}
+
+impl Drop for SharedIpcHub {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+        #[cfg(unix)]
+        if let Some(ref path) = self.socket_path {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -186,11 +273,21 @@ pub enum ParentToWorkerMessage {
 /// Out-of-process container executor (`SubprocessExecutor`).
 /// Spawns an isolated OS child process (`internal-core-worker`) per activation with its own
 /// working directory, stripped API key environment, and hard-kill lifecycle management.
-/// Prefers Unix Domain Socket (UDS) for IPC, falling back to TCP loopback (`127.0.0.1:0`) if UDS is unavailable.
-#[derive(Debug, Clone)]
+/// Uses a single shared UDS listener (with TCP loopback fallback) across all activations.
+#[derive(Clone)]
 pub struct SubprocessExecutor {
     worker_bin: Option<PathBuf>,
     prefer_uds: bool,
+    hub: Arc<OnceCell<Arc<SharedIpcHub>>>,
+}
+
+impl std::fmt::Debug for SubprocessExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubprocessExecutor")
+            .field("worker_bin", &self.worker_bin)
+            .field("prefer_uds", &self.prefer_uds)
+            .finish()
+    }
 }
 
 impl Default for SubprocessExecutor {
@@ -204,6 +301,7 @@ impl SubprocessExecutor {
         Self {
             worker_bin: None,
             prefer_uds: true,
+            hub: Arc::new(OnceCell::new()),
         }
     }
 
@@ -214,7 +312,23 @@ impl SubprocessExecutor {
 
     pub fn with_prefer_uds(mut self, prefer_uds: bool) -> Self {
         self.prefer_uds = prefer_uds;
+        self.hub = Arc::new(OnceCell::new());
         self
+    }
+
+    async fn get_or_init_hub(&self) -> Result<Arc<SharedIpcHub>, CoreError> {
+        let prefer_uds = self.prefer_uds;
+        let hub = self
+            .hub
+            .get_or_try_init(|| async move { SharedIpcHub::start(prefer_uds).await })
+            .await?;
+        Ok(hub.clone())
+    }
+
+    /// Returns the shared IPC address (`unix:/tmp/...` or `tcp:127.0.0.1:...`) once initialized.
+    pub async fn shared_ipc_addr(&self) -> Result<String, CoreError> {
+        let hub = self.get_or_init_hub().await?;
+        Ok(hub.ipc_addr.clone())
     }
 
     fn resolve_worker_command(&self) -> Result<(PathBuf, bool), CoreError> {
@@ -273,14 +387,15 @@ impl CoreExecutor for SubprocessExecutor {
         let _ = std::fs::create_dir_all(&run_spec.workspace_root);
         let _ = std::fs::create_dir_all(&run_spec.session_tmp_dir);
 
-        let (listener, ipc_addr) = IpcListener::bind(self.prefer_uds).await?;
+        let hub = self.get_or_init_hub().await?;
         let ipc_token = format!("tok_{}", Uuid::now_v7());
+        let worker_conn_rx = hub.register_token(ipc_token.clone());
 
         let (worker_bin, _) = self.resolve_worker_command()?;
         let mut cmd = tokio::process::Command::new(&worker_bin);
         cmd.arg("internal-core-worker")
             .arg("--ipc-addr")
-            .arg(&ipc_addr)
+            .arg(&hub.ipc_addr)
             .arg("--ipc-token")
             .arg(&ipc_token)
             .current_dir(&run_spec.workspace_root)
@@ -290,7 +405,7 @@ impl CoreExecutor for SubprocessExecutor {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                listener.cleanup();
+                hub.remove_token(&ipc_token);
                 return Err(CoreError::HostError(format!(
                     "failed to spawn subprocess worker {worker_bin:?}: {e}"
                 )));
@@ -303,8 +418,8 @@ impl CoreExecutor for SubprocessExecutor {
         sanitized_spec.model_endpoint.api_key = String::new();
 
         let service_res = async {
-            let (reader, mut writer) = tokio::select! {
-                res = listener.accept() => res?,
+            let (mut lines, mut writer) = tokio::select! {
+                res = worker_conn_rx => res.map_err(|_| CoreError::HostError("worker handshake channel dropped".into()))?,
                 status = child.wait() => {
                     return Err(CoreError::HostError(format!(
                         "worker subprocess exited before connecting: {status:?}"
@@ -315,26 +430,7 @@ impl CoreExecutor for SubprocessExecutor {
                 }
             };
 
-            let mut lines = BufReader::new(reader).lines();
-
-            // 1. Verify Hello token
-            let first_line = tokio::select! {
-                res = lines.next_line() => res
-                    .map_err(|e| CoreError::HostError(format!("ipc read error: {e}")))?
-                    .ok_or_else(|| CoreError::HostError("worker closed ipc before Hello".into()))?,
-                _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-            };
-            let hello: WorkerToParentMessage = serde_json::from_str(&first_line)?;
-            match hello {
-                WorkerToParentMessage::Hello { ipc_token: t } if t == ipc_token => {}
-                _ => {
-                    return Err(CoreError::HostError(
-                        "invalid ipc handshake from subprocess worker".into(),
-                    ))
-                }
-            }
-
-            // 2. Send Start { run_spec }
+            // 1. Send Start { run_spec }
             send_jsonl(
                 &mut writer,
                 &ParentToWorkerMessage::Start {
@@ -343,7 +439,7 @@ impl CoreExecutor for SubprocessExecutor {
             )
             .await?;
 
-            // 3. Proxy CoreHost & ModelBackend calls until Finished
+            // 2. Proxy CoreHost & ModelBackend calls until Finished
             loop {
                 let next_line = tokio::select! {
                     res = lines.next_line() => res.map_err(|e| CoreError::HostError(format!("ipc read error: {e}")))?,
@@ -465,11 +561,11 @@ impl CoreExecutor for SubprocessExecutor {
         }
         .await;
 
+        hub.remove_token(&ipc_token);
         if service_res.is_err() {
             let _ = child.kill().await;
         }
         let _ = child.wait().await;
-        listener.cleanup();
         service_res
     }
 }
@@ -531,7 +627,7 @@ pub async fn run_subprocess_worker(ipc_addr: &str, ipc_token: &str) -> Result<()
 }
 
 struct WorkerIpcChannel {
-    lines: tokio::io::Lines<BufReader<BoxedReader>>,
+    lines: Lines<BufReader<BoxedReader>>,
     writer: BoxedWriter,
 }
 

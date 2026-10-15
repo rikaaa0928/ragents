@@ -315,6 +315,10 @@ mod tests {
         };
 
         let executor = SubprocessExecutor::new();
+        let addr_before = executor.shared_ipc_addr().await.expect("shared ipc addr");
+        #[cfg(unix)]
+        assert!(addr_before.starts_with("unix:"));
+
         let summary = executor
             .execute(
                 run_spec.clone(),
@@ -330,6 +334,31 @@ mod tests {
         let written =
             std::fs::read_to_string(ws_root.join("subproc.txt")).expect("read subproc.txt");
         assert_eq!(written, "hello from isolated subprocess executor!");
+
+        // Run a second task on the same executor and verify it reuses the exact same UDS listener!
+        let resp_second = make_openresponses_resource(
+            "resp_sub_second",
+            "gpt-4.1",
+            vec![Item::assistant_message("Second task on same UDS ok.")],
+            None,
+        );
+        let summary2 = executor
+            .execute(
+                run_spec.clone(),
+                host.clone(),
+                Arc::new(MockModelBackend {
+                    responses: Mutex::new(vec![resp_second]),
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second task on shared UDS");
+        assert_eq!(summary2.final_text, "Second task on same UDS ok.");
+        assert_eq!(
+            executor.shared_ipc_addr().await.unwrap(),
+            addr_before,
+            "must reuse the single shared UDS listener"
+        );
 
         // Also verify TCP loopback fallback path when UDS is unavailable/disabled
         let tcp_executor = SubprocessExecutor::new().with_prefer_uds(false);
