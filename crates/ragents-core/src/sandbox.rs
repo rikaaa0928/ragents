@@ -1,4 +1,3 @@
-use crate::hooks::runtime::ragent::extension::host::CommandOutput;
 use crate::host::CoreRunSpec;
 use ragents_protocol::{CapabilityRequest, PermissionPolicyLayer};
 use serde::{Deserialize, Serialize};
@@ -7,6 +6,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub error: Option<String>,
+}
 
 /// OS Kernel Sandbox enforcement mode for external commands executed by WASM extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -344,6 +351,21 @@ impl SandboxState {
         &self.workspace_root
     }
 
+    pub fn mode(&self) -> SandboxMode {
+        self.mode
+    }
+
+    pub fn build_sandboxed_command_for_process(
+        &self,
+        work_dir: &Path,
+        command: &str,
+        trace_tag: &str,
+    ) -> Result<tokio::process::Command, String> {
+        let hermetic_tmp = self.session_tmp_dir.join("tmp");
+        let _ = std::fs::create_dir_all(&hermetic_tmp);
+        self.build_sandboxed_command(work_dir, command, &hermetic_tmp, trace_tag)
+    }
+
     pub fn is_path_writable(&self, target: &Path) -> bool {
         let norm_target = canonicalize_or_normalize(target);
         let denied = self
@@ -508,7 +530,7 @@ pub fn normalize_violation_to_request_dir(raw_path: &Path) -> PathBuf {
 }
 
 /// Fast-path extraction of absolute paths from error lines containing `Operation not permitted` / `os error 1`.
-fn extract_eperm_paths_from_text(text: &str) -> Vec<PathBuf> {
+pub(crate) fn extract_eperm_paths_from_text(text: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for line in text.lines() {
         if !line.contains("Operation not permitted") && !line.contains("os error 1") {
@@ -609,7 +631,7 @@ pub fn build_macos_seatbelt_profile(
 
 /// Queries the macOS Unified Log for kernel sandbox violations tagged with `trace_tag`,
 /// extracting `(operation, denied_path)` even when the child process swallowed the path in stderr.
-async fn query_macos_sandbox_violations(trace_tag: &str) -> Vec<(String, String)> {
+pub(crate) async fn query_macos_sandbox_violations(trace_tag: &str) -> Vec<(String, String)> {
     let predicate = format!("sender == \"Sandbox\" AND eventMessage CONTAINS \"{trace_tag}\"");
     let mut cmd = tokio::process::Command::new("/usr/bin/log");
     cmd.arg("show")

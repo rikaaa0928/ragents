@@ -338,6 +338,10 @@ async fn run_react_loop(
         host.emit_event(Some(turn_id.clone()), SessionEvent::TurnStarted)
             .await?;
 
+        // Drain all pending real-time messages (background process exit notifications, steer messages)
+        // in one atomic batch before loading the effective context for this Turn.
+        let _ = host.drain_realtime_messages(Some(turn_id.clone())).await?;
+
         let raw_items = host.load_effective_context().await?;
         let projected_items =
             apply_context_projection_hook(hook_manager, iteration, raw_items).await?;
@@ -430,7 +434,12 @@ async fn run_react_loop(
                 .await?;
             }
         } else {
-            break;
+            // Before finishing the activation, check if any real-time messages arrived during the final turn.
+            // If so, continue into another Turn so the agent can process the notification.
+            let late_realtime = host.drain_realtime_messages(None).await?;
+            if late_realtime.is_empty() {
+                break;
+            }
         }
     }
 

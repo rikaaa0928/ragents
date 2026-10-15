@@ -242,7 +242,29 @@ export RAGENTS_MODEL="gemini-3.8-flash"
 
 ---
 
-### 4.6 场景六：实时事件流监控与任务取消 (`watch` / `cancel`)
+### 4.6 场景六：双消息队列（FollowUp 等待队列 vs Realtime 实时队列）与后台进程管理
+
+`ragents` 在 `api-server` 中维护每个会话的两条消息队列，并在 `agent-daemon` 中内置完整的后台命令进程管理系统：
+
+1. **实时队列注入 (`ragents steer`)**：
+   在某个 `Activation` 正在运行（例如执行多步代码测试）期间，用户或外部系统可随时向该会话的**实时队列 (Realtime Queue)** 推送一条或多条消息块。`agent-core` 会在每个 ReAct Turn 开始前（以及退出循环前）**一次性全部取出**待处理消息，并在单条 `Item::Message` 中保留多个独立的 `MessageContent` 块注入模型上下文：
+   ```bash
+   ./target/debug/ragents steer sess_01a13d8f-8fe9-7504-9e8b-1a344c074450 \
+     "请同时检查边界条件 n=0" \
+     "测试通过后先不要删除临时日志"
+   ```
+
+2. **后台进程管理 (`shell` / `process_status` / `process_logs` / `process_stop`)**：
+   `extensions/shell` 提供 4 个协同工具，支持前后台联合调试（如启动后台被测 Server + 前台运行测试脚本）：
+   - `shell`：支持 `wait: true | false`（默认 `true` 同步等待；`false` 异步后台启动并立即返回 `process_id` 与系统 `pid`）以及 `lifecycle: "activation" | "session"`（默认 `"activation"`，在当前 Activation 结束时自动按进程组清理；`"session"` 跨多次 Activation 持续保活）。
+   - `process_status`：查询指定 `process_id` 的运行状态（`running` / `exited` / `killed` / `timed_out`）、`pid`、`exit_code` 与运行时长。
+   - `process_logs`：按需拉取后台进程的 `stdout`、`stderr` 或 `combined`（标准输出+错误交织）日志，支持 `tail_lines` 与 `offset`。
+   - `process_stop`：主动终止指定 `process_id` 及其整个子进程组。
+   - **后台进程自然退出实时通知**：当 `wait = false` 的后台进程自行退出时，`agent-daemon` 会自动向 `api-server` 的实时队列推送一条包含 `process_id`、`pid`、`exit_code` 的系统通知，Agent 在下一个 Turn 会自动感知！
+
+---
+
+### 4.7 场景七：实时事件流监控与任务取消 (`watch` / `cancel`)
 
 ```bash
 # 1. 实时监听全集群事件流（支持从指定 ResourceVersion 断点续传）
@@ -309,4 +331,5 @@ async fn main() -> anyhow::Result<()> {
 - **[技术方案设计 (TECHNICAL_DESIGN.zh-CN.md)](./docs/TECHNICAL_DESIGN.zh-CN.md)**：声明式资源模型、SQLite 表结构、状态机与协议规范。
 - **[扩展架构设计 (EXTENSION_ARCHITECTURE.zh-CN.md)](./docs/EXTENSION_ARCHITECTURE.zh-CN.md)**：`agent-daemon` 与 `api-server` 的 WASM / Webhook 扩展体系设计。
 - **[分阶段实施路线图 (IMPLEMENTATION_ROADMAP.zh-CN.md)](./docs/IMPLEMENTATION_ROADMAP.zh-CN.md)**：Stage 0 – Stage 7 工程演进拆解。
+- **[双消息队列与后台命令进程管理系统设计 (PROCESS_AND_QUEUE_DESIGN.zh-CN.md)](./docs/PROCESS_AND_QUEUE_DESIGN.zh-CN.md)**：`FollowUp` 等待队列与 `Realtime` 实时队列、后台进程生命周期（`activation` vs `session`）与三通道日志查询设计。
 - **[实施进度记录 (IMPLEMENTATION_PROGRESS.zh-CN.md)](./docs/IMPLEMENTATION_PROGRESS.zh-CN.md)**：各阶段完成状态、Commit 记录与测试验证矩阵。

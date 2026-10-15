@@ -1,5 +1,5 @@
 use crate::ids::*;
-use crate::resources::{PermissionDecision, PermissionRequest};
+use crate::resources::{ManagedProcessInfo, PermissionDecision, PermissionRequest};
 use chrono::{DateTime, Utc};
 use openresponses_rust::{Item, Usage};
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,17 @@ pub enum SessionEvent {
         child_session_id: SessionId,
         command_id: CommandId,
     },
+
+    BackgroundProcessStarted {
+        process: ManagedProcessInfo,
+    },
+    BackgroundProcessExited {
+        process: ManagedProcessInfo,
+    },
+    RealtimeMessagesDrained {
+        count: usize,
+        batch_seq: BatchSeq,
+    },
 }
 
 impl SessionEvent {
@@ -156,6 +167,9 @@ impl SessionEvent {
             SessionEvent::PermissionRequested { .. } => "permission_requested",
             SessionEvent::PermissionResolved { .. } => "permission_resolved",
             SessionEvent::SessionSpawned { .. } => "session_spawned",
+            SessionEvent::BackgroundProcessStarted { .. } => "background_process_started",
+            SessionEvent::BackgroundProcessExited { .. } => "background_process_exited",
+            SessionEvent::RealtimeMessagesDrained { .. } => "realtime_messages_drained",
         }
     }
 }

@@ -177,6 +177,16 @@ impl RagentsClient {
         Self::parse_response(resp).await
     }
 
+    pub async fn push_realtime_message(
+        &self,
+        session_id: &SessionId,
+        req: PushRealtimeMessageRequest,
+    ) -> Result<PushRealtimeMessageResponse, ClientError> {
+        let url = format!("{}/api/v1/sessions/{}/realtime", self.base_url, session_id);
+        let resp = self.http.post(url).json(&req).send().await?;
+        Self::parse_response(resp).await
+    }
+
     pub async fn get_activation(
         &self,
         activation_id: &ActivationId,
@@ -519,6 +529,56 @@ impl DaemonTunnelHandle {
         }
     }
 
+    pub async fn push_realtime_message(
+        &self,
+        session_id: SessionId,
+        activation_id: Option<ActivationId>,
+        content: Vec<openresponses_rust::MessageContent>,
+    ) -> Result<(), ClientError> {
+        let request_id = format!("req_{}", Uuid::now_v7());
+        let resp = self
+            .call(DaemonToServerMessage::PushRealtimeMessage {
+                request_id,
+                session_id,
+                activation_id,
+                content,
+            })
+            .await?;
+        Self::expect_ack(resp).map(|_| ())
+    }
+
+    pub async fn drain_realtime_messages(
+        &self,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        turn_id: Option<TurnId>,
+    ) -> Result<Vec<Item>, ClientError> {
+        let request_id = format!("req_{}", Uuid::now_v7());
+        let resp = self
+            .call(DaemonToServerMessage::DrainRealtimeMessages {
+                request_id,
+                session_id,
+                activation_id,
+                lease_epoch,
+                turn_id,
+            })
+            .await?;
+        match resp {
+            ServerToDaemonMessage::RealtimeMessagesReply {
+                ok: true, items, ..
+            } => Ok(items),
+            ServerToDaemonMessage::RealtimeMessagesReply {
+                ok: false, error, ..
+            } => Err(ClientError::Tunnel(
+                error.unwrap_or_else(|| "drain realtime messages failed".into()),
+            )),
+            other => Err(ClientError::Tunnel(format!(
+                "unexpected realtime messages reply: {other:?}"
+            ))),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child_session(
         &self,
@@ -597,6 +657,8 @@ impl DaemonTunnelHandle {
             | DaemonToServerMessage::CommitBatch { request_id, .. }
             | DaemonToServerMessage::EmitEvent { request_id, .. }
             | DaemonToServerMessage::FetchEffectiveContext { request_id, .. }
+            | DaemonToServerMessage::PushRealtimeMessage { request_id, .. }
+            | DaemonToServerMessage::DrainRealtimeMessages { request_id, .. }
             | DaemonToServerMessage::SpawnChildSession { request_id, .. }
             | DaemonToServerMessage::CompleteActivation { request_id, .. } => request_id,
         }
@@ -664,7 +726,8 @@ pub async fn connect_daemon_tunnel_with_token(
             match incoming {
                 ServerToDaemonMessage::Registered { ref request_id, .. }
                 | ServerToDaemonMessage::Ack { ref request_id, .. }
-                | ServerToDaemonMessage::EffectiveContextReply { ref request_id, .. } => {
+                | ServerToDaemonMessage::EffectiveContextReply { ref request_id, .. }
+                | ServerToDaemonMessage::RealtimeMessagesReply { ref request_id, .. } => {
                     let req_id = request_id.clone();
                     let tx = pending_reader
                         .lock()

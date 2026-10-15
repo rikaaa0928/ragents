@@ -107,6 +107,13 @@ pub enum Commands {
         /// User prompt text
         prompt: String,
     },
+    /// Push one or more real-time message blocks into a session's in-turn Realtime Queue
+    Steer {
+        session_id: String,
+        /// One or more text blocks to enqueue into the session's Realtime Queue
+        #[arg(required = true)]
+        messages: Vec<String>,
+    },
     /// Declaratively cancel an active or queued activation (`desired_phase = Cancelled`)
     Cancel { activation_id: String },
     /// Declaratively respond to a permission request on an activation
@@ -568,6 +575,24 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Commands::Steer {
+            session_id,
+            messages,
+        } => {
+            let sess_id = SessionId::new(&session_id);
+            let blocks = messages
+                .into_iter()
+                .map(|text| openresponses_rust::MessageContent::InputText { text })
+                .collect();
+            let resp = client
+                .push_realtime_message(&sess_id, PushRealtimeMessageRequest { content: blocks })
+                .await?;
+            println!(
+                "Enqueued real-time message block(s) into session {} (total pending: {})",
+                sess_id, resp.queued_count
+            );
+            Ok(())
+        }
         Commands::Cancel { activation_id } => {
             let act = client
                 .cancel_activation(&ActivationId::new(&activation_id))
@@ -775,6 +800,29 @@ pub async fn watch_activation_to_completion(
                 println!(
                     "[event] permission resolved: request_id={} decision={:?} override_path={:?}",
                     request_id, decision, override_path
+                );
+            }
+            SessionEvent::BackgroundProcessStarted { process } => {
+                println!(
+                    "[event] background process started: id={} pid={:?} lifecycle={:?} cmd={}",
+                    process.process_id, process.pid, process.lifecycle, process.command
+                );
+            }
+            SessionEvent::BackgroundProcessExited { process } => {
+                println!(
+                    "[event] background process exited: id={} pid={:?} phase={:?} exit_code={:?} ({}ms)",
+                    process.process_id,
+                    process.pid,
+                    process.phase,
+                    process.exit_code,
+                    process.duration_ms
+                );
+            }
+            SessionEvent::RealtimeMessagesDrained { count, batch_seq } => {
+                println!(
+                    "[event] drained {} real-time message block(s) into context (batch_seq={})",
+                    count,
+                    batch_seq.value()
                 );
             }
             SessionEvent::ActivationCompleted { .. } => {

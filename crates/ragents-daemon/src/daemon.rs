@@ -3,14 +3,15 @@ use crate::interceptors::{DaemonInterceptor, DaemonInterceptorChain, Intercepted
 use crate::permission::{capability_covered_by, evaluate_capability_policy, PolicyEvalResult};
 use async_trait::async_trait;
 use chrono::Utc;
-use openresponses_rust::{Item, Usage};
+use openresponses_rust::{Item, MessageContent, Usage};
 use ragents_client::{
     connect_daemon_tunnel_with_token, ClientError, DaemonPushEvent, DaemonTunnelHandle,
     RagentsClient,
 };
 use ragents_core::{
     CoreError, CoreExecutor, CoreHost, CoreRunSpec, InProcessExecutor, ModelBackend,
-    OpenResponsesModelBackend, PermissionOutcome, SubprocessExecutor,
+    OpenResponsesModelBackend, PermissionOutcome, ProcessManager, ProcessNotificationSink,
+    SandboxMode, SandboxState, SubprocessExecutor,
 };
 use ragents_protocol::*;
 use std::collections::HashMap;
@@ -27,6 +28,71 @@ struct ActiveActivationControl {
     cancel: CancellationToken,
     permission_waiters:
         Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionResolutionSpec>>>>,
+}
+
+struct DaemonProcessSink {
+    tunnel: DaemonTunnelHandle,
+    lease_epochs: Arc<Mutex<HashMap<ActivationId, LeaseEpoch>>>,
+}
+
+#[async_trait]
+impl ProcessNotificationSink for DaemonProcessSink {
+    async fn on_process_started(&self, process: ManagedProcessInfo) {
+        let maybe_epoch = self
+            .lease_epochs
+            .lock()
+            .expect("lease_epochs poisoned")
+            .get(&process.activation_id)
+            .copied();
+        if let Some(epoch) = maybe_epoch {
+            let _ = self
+                .tunnel
+                .emit_event(
+                    process.session_id.clone(),
+                    process.activation_id.clone(),
+                    epoch,
+                    None,
+                    SessionEvent::BackgroundProcessStarted { process },
+                )
+                .await;
+        }
+    }
+
+    async fn on_process_exited_naturally(
+        &self,
+        process: ManagedProcessInfo,
+        realtime_notification: MessageContent,
+    ) {
+        // 1. Push background process completion notification into `api-server`'s real-time message queue
+        let _ = self
+            .tunnel
+            .push_realtime_message(
+                process.session_id.clone(),
+                Some(process.activation_id.clone()),
+                vec![realtime_notification],
+            )
+            .await;
+
+        // 2. Also emit `BackgroundProcessExited` event if the spawning activation is still active
+        let maybe_epoch = self
+            .lease_epochs
+            .lock()
+            .expect("lease_epochs poisoned")
+            .get(&process.activation_id)
+            .copied();
+        if let Some(epoch) = maybe_epoch {
+            let _ = self
+                .tunnel
+                .emit_event(
+                    process.session_id.clone(),
+                    process.activation_id.clone(),
+                    epoch,
+                    None,
+                    SessionEvent::BackgroundProcessExited { process },
+                )
+                .await;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -109,6 +175,12 @@ impl AgentDaemon {
         let active_runners = Arc::new(AtomicU32::new(0));
         let active_tasks: Arc<Mutex<HashMap<ActivationId, ActiveActivationControl>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let lease_epochs: Arc<Mutex<HashMap<ActivationId, LeaseEpoch>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let process_manager = Arc::new(ProcessManager::new(Some(Arc::new(DaemonProcessSink {
+            tunnel: tunnel.clone(),
+            lease_epochs: lease_epochs.clone(),
+        }))));
 
         // Spawn periodic heartbeat task
         let hb_tunnel = tunnel.clone();
@@ -149,6 +221,8 @@ impl AgentDaemon {
                                     tunnel.clone(),
                                     active_runners.clone(),
                                     active_tasks.clone(),
+                                    lease_epochs.clone(),
+                                    process_manager.clone(),
                                     shutdown.clone(),
                                 );
                             }
@@ -199,6 +273,8 @@ impl AgentDaemon {
         tunnel: DaemonTunnelHandle,
         active_runners: Arc<AtomicU32>,
         active_tasks: Arc<Mutex<HashMap<ActivationId, ActiveActivationControl>>>,
+        lease_epochs: Arc<Mutex<HashMap<ActivationId, LeaseEpoch>>>,
+        process_manager: Arc<ProcessManager>,
         daemon_shutdown: CancellationToken,
     ) {
         let daemon = self.clone();
@@ -260,6 +336,10 @@ impl AgentDaemon {
                         permission_waiters: permission_waiters.clone(),
                     },
                 );
+            lease_epochs
+                .lock()
+                .expect("lease_epochs poisoned")
+                .insert(act_id.clone(), lease_epoch);
             active_runners.fetch_add(1, Ordering::Relaxed);
 
             if tunnel
@@ -277,6 +357,10 @@ impl AgentDaemon {
                 active_tasks
                     .lock()
                     .expect("active_tasks mutex poisoned")
+                    .remove(&act_id);
+                lease_epochs
+                    .lock()
+                    .expect("lease_epochs poisoned")
                     .remove(&act_id);
                 return;
             }
@@ -343,6 +427,13 @@ impl AgentDaemon {
                 }
             }
 
+            let sandbox_state = Arc::new(SandboxState::from_policy(
+                SandboxMode::Auto,
+                &workspace_root,
+                &session_tmp_dir,
+                &runtime_permissions,
+            ));
+
             let host = Arc::new(DaemonCoreHost {
                 node_id: daemon.config.node_id.clone(),
                 session_id: sess_id.clone(),
@@ -353,10 +444,12 @@ impl AgentDaemon {
                 session_tmp_dir: session_tmp_dir.clone(),
                 effective_policy: runtime_permissions.clone(),
                 interceptor_chain: daemon.interceptor_chain.clone(),
-                activation_grants: Mutex::new(Vec::new()),
+                activation_grants: Arc::new(Mutex::new(Vec::new())),
                 session_grants: daemon.session_grants.clone(),
                 workspace_grants: daemon.workspace_grants.clone(),
                 node_grants: daemon.node_grants.clone(),
+                sandbox_state,
+                process_manager: process_manager.clone(),
                 tunnel: tunnel.clone(),
                 permission_waiters,
                 cancellation: task_cancel.clone(),
@@ -392,10 +485,18 @@ impl AgentDaemon {
                 .execute(run_spec, host, effective_model_backend, task_cancel)
                 .await;
 
+            // Automatically clean up all `lifecycle == Activation` background processes when this activation finishes.
+            // Processes started with `lifecycle == Session` continue running in `process_manager`.
+            process_manager.cleanup_activation_processes(&act_id).await;
+
             active_runners.fetch_sub(1, Ordering::Relaxed);
             active_tasks
                 .lock()
                 .expect("active_tasks mutex poisoned")
+                .remove(&act_id);
+            lease_epochs
+                .lock()
+                .expect("lease_epochs poisoned")
                 .remove(&act_id);
 
             match exec_res {
@@ -441,6 +542,7 @@ impl AgentDaemon {
     }
 }
 
+#[derive(Clone)]
 struct DaemonCoreHost {
     node_id: NodeId,
     session_id: SessionId,
@@ -451,10 +553,12 @@ struct DaemonCoreHost {
     session_tmp_dir: PathBuf,
     effective_policy: PermissionPolicyLayer,
     interceptor_chain: DaemonInterceptorChain,
-    activation_grants: Mutex<Vec<CapabilityRequest>>,
+    activation_grants: Arc<Mutex<Vec<CapabilityRequest>>>,
     session_grants: Arc<Mutex<HashMap<SessionId, Vec<CapabilityRequest>>>>,
     workspace_grants: Arc<Mutex<HashMap<PathBuf, Vec<CapabilityRequest>>>>,
     node_grants: Arc<Mutex<Vec<CapabilityRequest>>>,
+    sandbox_state: Arc<SandboxState>,
+    process_manager: Arc<ProcessManager>,
     tunnel: DaemonTunnelHandle,
     permission_waiters:
         Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionResolutionSpec>>>>,
@@ -755,5 +859,41 @@ impl CoreHost for DaemonCoreHost {
             )
             .await
             .map_err(|e| CoreError::HostError(e.to_string()))
+    }
+
+    async fn drain_realtime_messages(
+        &self,
+        turn_id: Option<TurnId>,
+    ) -> Result<Vec<Item>, CoreError> {
+        self.tunnel
+            .drain_realtime_messages(
+                self.session_id.clone(),
+                self.activation_id.clone(),
+                self.lease_epoch,
+                turn_id,
+            )
+            .await
+            .map_err(|e| CoreError::HostError(e.to_string()))
+    }
+
+    async fn manage_process(
+        &self,
+        extension_id: Option<&str>,
+        request: ProcessActionRequest,
+    ) -> Result<Option<ProcessActionResponse>, CoreError> {
+        let self_arc: Arc<dyn CoreHost> = Arc::new(self.clone());
+        let resp = self
+            .process_manager
+            .handle_action(
+                &self.session_id,
+                &self.activation_id,
+                extension_id.unwrap_or("shell"),
+                &self.workspace_root,
+                &self.sandbox_state,
+                Some(&self_arc),
+                request,
+            )
+            .await?;
+        Ok(Some(resp))
     }
 }

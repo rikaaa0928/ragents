@@ -128,6 +128,24 @@ pub trait CoreHost: Send + Sync {
         call_id: Option<String>,
         command_id: CommandId,
     ) -> Result<SessionId, CoreError>;
+
+    /// Drains all pending real-time messages for this session at the start of a Turn (or before loop exit).
+    async fn drain_realtime_messages(
+        &self,
+        _turn_id: Option<TurnId>,
+    ) -> Result<Vec<Item>, CoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Delegates background process management (`wait=false`, `status`, `logs`, `stop`) to the host daemon.
+    /// Returns `Ok(None)` if the host prefers `HostState` to handle it with its local `ProcessManager`.
+    async fn manage_process(
+        &self,
+        _extension_id: Option<&str>,
+        _request: ProcessActionRequest,
+    ) -> Result<Option<ProcessActionResponse>, CoreError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]

@@ -1,8 +1,12 @@
 use crate::error::CoreError;
 use crate::hooks::protocol::{ExtensionMetadata, HookRequest};
 use crate::host::{CoreHost, PermissionOutcome};
+use crate::process::ProcessManager;
 use crate::sandbox::{SandboxMode, SandboxState};
-use ragents_protocol::{CapabilityRequest, PermissionPolicyLayer};
+use ragents_protocol::{
+    ActivationId, CapabilityRequest, PermissionPolicyLayer, ProcessActionRequest,
+    ProcessActionResponse, SessionId,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component as PathComponent, Path, PathBuf};
@@ -92,6 +96,7 @@ struct HostState {
     preopen_dirs: Vec<PathBuf>,
     core_host: Option<Arc<dyn CoreHost>>,
     sandbox_state: Arc<SandboxState>,
+    local_process_manager: ProcessManager,
     /// Tracks the resolved host `PathBuf` for each WASI 0.2 `wasi:filesystem/types.descriptor` resource rep.
     dir_paths: HashMap<u32, PathBuf>,
     ws_fd_rep: Option<u32>,
@@ -719,159 +724,63 @@ impl wasi_fs_types::HostDescriptor for HostState {
 }
 
 // ============================================================================
-// 3. Single Host Import for Shell Command Execution (`ragent:extension/host`)
+// 3. Single Host Import for Command Process Management (`ragent:extension/host`)
 // ============================================================================
 
 impl ragent::extension::host::Host for HostState {
-    async fn execute_command_with_timeout(
-        &mut self,
-        command: String,
-        timeout_ms: u64,
-    ) -> ragent::extension::host::CommandOutput {
-        // 1. Mandatory Host-Import Permission Check:
+    async fn manage_process(&mut self, request_json: String) -> String {
+        let req: ProcessActionRequest = match serde_json::from_str(&request_json) {
+            Ok(r) => r,
+            Err(err) => {
+                return serde_json::to_string(&ProcessActionResponse {
+                    ok: false,
+                    error: Some(format!("invalid process action request: {err}")),
+                    ..Default::default()
+                })
+                .unwrap_or_default();
+            }
+        };
+
         if let Some(ref host) = self.core_host {
-            let cap = CapabilityRequest::CommandWorkDir {
-                work_dir: self.workspace_root.clone(),
-            };
-            let reason = format!(
-                "Extension '{}' executing shell command: {}",
-                self.plugin_name, command
-            );
             match host
-                .check_permission(Some(&self.plugin_name), cap, Some(reason))
+                .manage_process(Some(&self.plugin_name), req.clone())
                 .await
             {
-                Ok(PermissionOutcome::Allowed { .. }) => {}
-                Ok(PermissionOutcome::Denied { reason }) => {
-                    return command_error(format!("Permission denied: {reason}"));
-                }
+                Ok(Some(resp)) => return serde_json::to_string(&resp).unwrap_or_default(),
+                Ok(None) => {}
                 Err(err) => {
-                    return command_error(format!("Permission check error: {err}"));
+                    return serde_json::to_string(&ProcessActionResponse {
+                        ok: false,
+                        error: Some(err.to_string()),
+                        ..Default::default()
+                    })
+                    .unwrap_or_default();
                 }
             }
         }
 
-        // 2. OS Kernel Sandboxed Execution with Multi-Directory Loop & Automatic Retry:
-        const MAX_SANDBOX_ESCALATION_ROUNDS: usize = 16;
-        let mut unlocked_paths: Vec<PathBuf> = Vec::new();
-        let mut temporary_once_paths: Vec<PathBuf> = Vec::new();
+        let resp = match self
+            .local_process_manager
+            .handle_action(
+                &SessionId::new("sess_local"),
+                &ActivationId::new("act_local"),
+                &self.plugin_name,
+                &self.workspace_root,
+                &self.sandbox_state,
+                self.core_host.as_ref(),
+                req,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => ProcessActionResponse {
+                ok: false,
+                error: Some(err.to_string()),
+                ..Default::default()
+            },
+        };
 
-        let mut final_output = command_error(
-            "sandbox multi-directory permission escalation loop exceeded maximum rounds",
-        );
-
-        for _round in 0..MAX_SANDBOX_ESCALATION_ROUNDS {
-            let (mut output, violations) = self
-                .sandbox_state
-                .execute_command_with_violations(&self.workspace_root, &command, timeout_ms)
-                .await;
-
-            if output.exit_code == 0 || violations.is_empty() {
-                final_output = output;
-                break;
-            }
-
-            let Some(ref host) = self.core_host else {
-                final_output = output;
-                break;
-            };
-
-            let new_violations: Vec<_> = violations
-                .into_iter()
-                .filter(|v| !unlocked_paths.iter().any(|u| v.raw_path.starts_with(u)))
-                .collect();
-
-            if new_violations.is_empty() {
-                final_output = output;
-                break;
-            }
-
-            let mut all_approved = true;
-            for v in new_violations {
-                let reason = format!(
-                    "Command `{}` requires {} access to '{}' (suggested directory: '{}')",
-                    command,
-                    v.operation,
-                    v.raw_path.display(),
-                    v.capability
-                        .path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                );
-                match host
-                    .check_permission_with_original_path(
-                        Some(&self.plugin_name),
-                        v.capability.clone(),
-                        Some(v.raw_path.clone()),
-                        Some(reason),
-                    )
-                    .await
-                {
-                    Ok(PermissionOutcome::Allowed {
-                        effective_capability,
-                        persist_in_activation,
-                    }) => {
-                        let granted_cap =
-                            effective_capability.unwrap_or_else(|| v.capability.clone());
-                        if let Some(p) = granted_cap.path() {
-                            unlocked_paths.push(p.to_path_buf());
-                            if !persist_in_activation {
-                                temporary_once_paths.push(p.to_path_buf());
-                            }
-                        }
-                        unlocked_paths.push(v.raw_path.clone());
-                        match granted_cap {
-                            CapabilityRequest::FileWrite { path } => {
-                                self.sandbox_state.allow_writable_path(path);
-                            }
-                            CapabilityRequest::CommandWorkDir { work_dir } => {
-                                self.sandbox_state.allow_writable_path(work_dir);
-                            }
-                            CapabilityRequest::FileRead { path } => {
-                                self.sandbox_state.allow_readable_path(path);
-                            }
-                            CapabilityRequest::Http { .. } => {}
-                        }
-                    }
-                    Ok(PermissionOutcome::Denied { reason }) => {
-                        output.stderr.push_str(&format!(
-                            "\n[RAGENTS_SANDBOX_DENIED] Permission denied for {:?}: {reason}",
-                            v.capability
-                        ));
-                        all_approved = false;
-                        break;
-                    }
-                    Err(err) => {
-                        output.stderr.push_str(&format!(
-                            "\n[RAGENTS_SANDBOX_ERROR] Permission request failed: {err}"
-                        ));
-                        all_approved = false;
-                        break;
-                    }
-                }
-            }
-
-            if !all_approved {
-                final_output = output;
-                break;
-            }
-        }
-
-        // Revoke any paths that were approved with `AllowOnce` so they don't carry over to future commands
-        for tmp_path in temporary_once_paths {
-            self.sandbox_state.revoke_temporary_path(&tmp_path);
-        }
-
-        final_output
-    }
-}
-
-fn command_error(error: impl ToString) -> ragent::extension::host::CommandOutput {
-    ragent::extension::host::CommandOutput {
-        exit_code: -1,
-        stdout: String::new(),
-        stderr: String::new(),
-        error: Some(error.to_string()),
+        serde_json::to_string(&resp).unwrap_or_default()
     }
 }
 
@@ -1081,6 +990,7 @@ impl WasmPlugin {
             preopen_dirs: preopen_dirs.to_vec(),
             core_host,
             sandbox_state,
+            local_process_manager: ProcessManager::new(None),
             dir_paths: HashMap::new(),
             ws_fd_rep: None,
             root_fd_rep: None,

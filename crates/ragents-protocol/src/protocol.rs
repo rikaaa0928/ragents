@@ -1,7 +1,7 @@
 use crate::events::{ItemBatch, ItemBatchKind, SessionEvent, SessionEventEnvelope};
 use crate::ids::*;
 use crate::resources::*;
-use openresponses_rust::{Item, Usage};
+use openresponses_rust::{Item, MessageContent, Usage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -82,6 +82,24 @@ pub struct WatchQuery {
     pub after_rv: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushRealtimeMessageRequest {
+    pub content: Vec<MessageContent>,
+}
+
+impl PushRealtimeMessageRequest {
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![MessageContent::InputText { text: text.into() }],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushRealtimeMessageResponse {
+    pub queued_count: usize,
+}
+
 // ============================================================================
 // 2. Daemon <-> API Server WebSocket Tunnel Messages
 // ============================================================================
@@ -147,6 +165,23 @@ pub enum DaemonToServerMessage {
     FetchEffectiveContext {
         request_id: String,
         session_id: SessionId,
+    },
+    /// Daemon pushes a real-time notification (e.g. background process exit) into the session's real-time message queue on `api-server`
+    PushRealtimeMessage {
+        request_id: String,
+        session_id: SessionId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activation_id: Option<ActivationId>,
+        content: Vec<MessageContent>,
+    },
+    /// Daemon drains all pending real-time messages for the session in one atomic batch at the start of a Turn
+    DrainRealtimeMessages {
+        request_id: String,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
     },
     /// Daemon requests spawning a child session from a tool/extension command
     SpawnChildSession {
@@ -229,6 +264,16 @@ pub enum ServerToDaemonMessage {
         ok: bool,
         #[serde(default)]
         items: Vec<Item>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    RealtimeMessagesReply {
+        request_id: String,
+        ok: bool,
+        #[serde(default)]
+        items: Vec<Item>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        batch_seq: Option<BatchSeq>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

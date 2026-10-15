@@ -456,4 +456,412 @@ mod tests {
         d_cancel.cancel();
         server_cancel.cancel();
     }
+
+    #[tokio::test]
+    async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_queue() {
+        let shell_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm",
+        );
+        if !shell_wasm_path.exists() {
+            return;
+        }
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let state = ApiServerState::new(store, 5000);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_cancel = CancellationToken::new();
+        let addr = serve_tcp(listener, state, server_cancel.clone())
+            .await
+            .unwrap();
+        let server_url = format!("http://{addr}");
+        let client = RagentsClient::new(&server_url);
+
+        let base_tmp =
+            std::env::temp_dir().join(format!("ragents-bg-proc-{}", uuid::Uuid::now_v7()));
+        let ws_root = base_tmp.join("ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+
+        let mut cfg = DaemonConfig::default_local("node-bg", &server_url);
+        cfg.executor_mode = ExecutorMode::Subprocess;
+        cfg.extensions.push(ExtensionSpec {
+            name: "shell".to_string(),
+            path: shell_wasm_path.to_string_lossy().to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+        });
+
+        struct BgTestBackend {
+            step_counter: std::sync::atomic::AtomicUsize,
+            session_id: Arc<Mutex<Option<SessionId>>>,
+            client: RagentsClient,
+            session_srv_proc_id: Arc<Mutex<Option<String>>>,
+            act_srv_pid: Arc<Mutex<Option<u32>>>,
+        }
+
+        #[async_trait]
+        impl ModelBackend for BgTestBackend {
+            async fn create_response(
+                &self,
+                _endpoint: &ModelEndpointConfig,
+                request: CreateResponseBody,
+            ) -> Result<ResponseResource, CoreError> {
+                let step = self
+                    .step_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let items = match request.input {
+                    Some(openresponses_rust::Input::Items(ref v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+
+                match step {
+                    0 => {
+                        // Turn 1 of Activation #1:
+                        // Start 3 background processes:
+                        // 1) short-lived background job (wait=false, lifecycle=activation) that prints stdout+stderr and exits in ~0.3s
+                        // 2) long-lived activation-scoped job (wait=false, lifecycle=activation) that sleeps 60s (should be auto-killed when Activation #1 ends)
+                        // 3) long-lived session-scoped job (wait=false, lifecycle=session) that sleeps 60s (should survive into Activation #2)
+                        Ok(make_openresponses_resource(
+                            "resp_bg_1",
+                            "gpt-4.1",
+                            vec![
+                                Item::FunctionCall {
+                                    id: Some("fc_bg_short".into()),
+                                    call_id: "call_bg_short".into(),
+                                    name: "shell".into(),
+                                    arguments: serde_json::json!({
+                                        "command": "echo out_line_1 && echo err_line_1 >&2 && sleep 0.3 && echo out_line_2",
+                                        "wait": false,
+                                        "lifecycle": "activation"
+                                    })
+                                    .to_string(),
+                                    status: None,
+                                },
+                                Item::FunctionCall {
+                                    id: Some("fc_bg_act".into()),
+                                    call_id: "call_bg_act".into(),
+                                    name: "shell".into(),
+                                    arguments: serde_json::json!({
+                                        "command": "sleep 60",
+                                        "wait": false,
+                                        "lifecycle": "activation"
+                                    })
+                                    .to_string(),
+                                    status: None,
+                                },
+                                Item::FunctionCall {
+                                    id: Some("fc_bg_sess".into()),
+                                    call_id: "call_bg_sess".into(),
+                                    name: "shell".into(),
+                                    arguments: serde_json::json!({
+                                        "command": "echo session_daemon_ready && sleep 60",
+                                        "wait": false,
+                                        "lifecycle": "session"
+                                    })
+                                    .to_string(),
+                                    status: None,
+                                },
+                            ],
+                            None,
+                        ))
+                    }
+                    1 => {
+                        // Parse the returned `process_id` and `pid` from Turn 1 tool outputs
+                        let mut short_id = String::new();
+                        for item in &items {
+                            if let Item::FunctionCallOutput {
+                                call_id, output, ..
+                            } = item
+                            {
+                                let text = serde_json::to_value(output)
+                                    .ok()
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_default();
+                                if call_id == "call_bg_short" {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                                    {
+                                        short_id = v["process_id"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                    }
+                                } else if call_id == "call_bg_act" {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                                    {
+                                        *self.act_srv_pid.lock().unwrap() =
+                                            v["pid"].as_u64().map(|p| p as u32);
+                                    }
+                                } else if call_id == "call_bg_sess" {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                                    {
+                                        *self.session_srv_proc_id.lock().unwrap() =
+                                            v["process_id"].as_str().map(String::from);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Wait 450ms so `call_bg_short` has definitely finished, and push TWO real-time messages
+                        // to `api-server` during Turn 2 so Turn 3 drains both at once as 2 separate `MessageContent` blocks!
+                        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                        let maybe_sess = self.session_id.lock().unwrap().clone();
+                        if let Some(sess_id) = maybe_sess {
+                            let _ = self
+                                .client
+                                .push_realtime_message(
+                                    &sess_id,
+                                    PushRealtimeMessageRequest::from_text(
+                                        "User steer message block #1",
+                                    ),
+                                )
+                                .await;
+                            let _ = self
+                                .client
+                                .push_realtime_message(
+                                    &sess_id,
+                                    PushRealtimeMessageRequest::from_text(
+                                        "User steer message block #2",
+                                    ),
+                                )
+                                .await;
+                        }
+
+                        // Query `process_logs` (stdout, stderr, combined) on `short_id`
+                        Ok(make_openresponses_resource(
+                            "resp_bg_2",
+                            "gpt-4.1",
+                            vec![
+                                Item::FunctionCall {
+                                    id: Some("fc_logs_out".into()),
+                                    call_id: "call_logs_out".into(),
+                                    name: "process_logs".into(),
+                                    arguments: serde_json::json!({
+                                        "process_id": short_id,
+                                        "stream": "stdout"
+                                    })
+                                    .to_string(),
+                                    status: None,
+                                },
+                                Item::FunctionCall {
+                                    id: Some("fc_logs_err".into()),
+                                    call_id: "call_logs_err".into(),
+                                    name: "process_logs".into(),
+                                    arguments: serde_json::json!({
+                                        "process_id": short_id,
+                                        "stream": "stderr"
+                                    })
+                                    .to_string(),
+                                    status: None,
+                                },
+                            ],
+                            None,
+                        ))
+                    }
+                    2 => {
+                        // Turn 3 of Activation #1: complete Activation #1
+                        Ok(make_openresponses_resource(
+                            "resp_bg_3",
+                            "gpt-4.1",
+                            vec![Item::assistant_message("Activation 1 done.")],
+                            None,
+                        ))
+                    }
+                    3 => {
+                        // Turn 1 of Activation #2:
+                        // Query status of the `lifecycle = session` process and then stop it via `process_stop`
+                        let sess_proc = self
+                            .session_srv_proc_id
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("session proc id");
+                        Ok(make_openresponses_resource(
+                            "resp_bg_4",
+                            "gpt-4.1",
+                            vec![
+                                Item::FunctionCall {
+                                    id: Some("fc_st".into()),
+                                    call_id: "call_st".into(),
+                                    name: "process_status".into(),
+                                    arguments: serde_json::json!({
+                                        "process_id": sess_proc
+                                    })
+                                    .to_string(),
+                                    status: None,
+                                },
+                                Item::FunctionCall {
+                                    id: Some("fc_stop".into()),
+                                    call_id: "call_stop".into(),
+                                    name: "process_stop".into(),
+                                    arguments: serde_json::json!({
+                                        "process_id": sess_proc
+                                    })
+                                    .to_string(),
+                                    status: None,
+                                },
+                            ],
+                            None,
+                        ))
+                    }
+                    _ => Ok(make_openresponses_resource(
+                        "resp_bg_5",
+                        "gpt-4.1",
+                        vec![Item::assistant_message("Activation 2 done.")],
+                        None,
+                    )),
+                }
+            }
+        }
+
+        let session_id_holder = Arc::new(Mutex::new(None));
+        let session_srv_proc_id = Arc::new(Mutex::new(None));
+        let act_srv_pid = Arc::new(Mutex::new(None));
+
+        let backend = Arc::new(BgTestBackend {
+            step_counter: std::sync::atomic::AtomicUsize::new(0),
+            session_id: session_id_holder.clone(),
+            client: client.clone(),
+            session_srv_proc_id: session_srv_proc_id.clone(),
+            act_srv_pid: act_srv_pid.clone(),
+        });
+
+        let daemon = AgentDaemon::new(cfg).with_model_backend(backend);
+        let d_cancel = CancellationToken::new();
+        daemon.start(d_cancel.clone()).await.unwrap();
+
+        let created = client
+            .create_session(CreateSessionRequest {
+                session_id: None,
+                labels: BTreeMap::new(),
+                spec: SessionSpec {
+                    scheduling: SchedulingMode::Pinned {
+                        node_id: NodeId::new("node-bg"),
+                        workspace_path: ws_root.clone(),
+                    },
+                    sources: vec![],
+                    producer: None,
+                    desired_phase: DesiredSessionPhase::Open,
+                    system_prompt: None,
+                    model: Some(ModelRequestSpec::new("gpt-4.1")),
+                    extensions: vec![],
+                    permissions: PermissionPolicyLayer::default(),
+                },
+                initial_activation: None,
+            })
+            .await
+            .unwrap();
+        let sess_id = SessionId::new(created.session.metadata.id);
+        *session_id_holder.lock().unwrap() = Some(sess_id.clone());
+
+        let act1 = client
+            .create_activation(CreateActivationRequest {
+                activation_id: None,
+                labels: BTreeMap::new(),
+                spec: ActivationSpec {
+                    session_id: sess_id.clone(),
+                    submission_kind: SubmissionKind::Normal,
+                    input: vec![Item::user_message("Start background services")],
+                    model_override: None,
+                    desired_phase: DesiredActivationPhase::Running,
+                    interaction_responses: BTreeMap::new(),
+                },
+            })
+            .await
+            .unwrap();
+        let act1_id = ActivationId::new(act1.metadata.id);
+
+        let mut watch = client.watch_events(Some(&sess_id), 0).await.unwrap();
+        while let Some(Ok(env)) = watch.next().await {
+            if env.activation_id.as_ref() == Some(&act1_id)
+                && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+            {
+                break;
+            }
+        }
+
+        // 1. Verify that the drained real-time message batch in context contains a single `Item::Message`
+        //    with MULTIPLE separate `MessageContent::InputText` blocks (NOT concatenated into one string!)
+        let ctx1 = client.get_session_context(&sess_id).await.unwrap();
+        let multi_block_msg = ctx1.effective_items.iter().find(|item| {
+            if let Item::Message { content, .. } = item {
+                content.len() >= 2
+            } else {
+                false
+            }
+        });
+        assert!(
+            multi_block_msg.is_some(),
+            "Expected drained real-time queue item to have multiple separate MessageContent blocks, got items: {:?}",
+            ctx1.effective_items
+        );
+        if let Some(Item::Message { content, .. }) = multi_block_msg {
+            let n = content.len();
+            let second_last = serde_json::to_string(&content[n - 2]).unwrap();
+            let last = serde_json::to_string(&content[n - 1]).unwrap();
+            assert!(second_last.contains("User steer message block #1"));
+            assert!(last.contains("User steer message block #2"));
+        }
+        let ctx1_json = serde_json::to_string(&ctx1.effective_items).unwrap();
+        assert!(
+            ctx1_json.contains("Background Process Exited"),
+            "ctx1 must also contain background process exit notification: {ctx1_json}"
+        );
+
+        // 2. Verify that `lifecycle = activation` process was automatically killed when Activation #1 finished
+        let maybe_act_pid = *act_srv_pid.lock().unwrap();
+        if let Some(act_pid) = maybe_act_pid {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let status = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(act_pid.to_string())
+                .status();
+            assert!(
+                status.map(|s| !s.success()).unwrap_or(true),
+                "activation-scoped background process pid {act_pid} should have been terminated"
+            );
+        }
+
+        // 3. Submit Activation #2 to verify `lifecycle = session` process survived Activation #1 and can be queried & stopped
+        let act2 = client
+            .create_activation(CreateActivationRequest {
+                activation_id: None,
+                labels: BTreeMap::new(),
+                spec: ActivationSpec {
+                    session_id: sess_id.clone(),
+                    submission_kind: SubmissionKind::FollowUp,
+                    input: vec![Item::user_message("Check and stop session process")],
+                    model_override: None,
+                    desired_phase: DesiredActivationPhase::Running,
+                    interaction_responses: BTreeMap::new(),
+                },
+            })
+            .await
+            .unwrap();
+        let act2_id = ActivationId::new(act2.metadata.id);
+
+        while let Some(Ok(env)) = watch.next().await {
+            if env.activation_id.as_ref() == Some(&act2_id)
+                && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+            {
+                break;
+            }
+        }
+
+        let ctx2 = client.get_session_context(&sess_id).await.unwrap();
+        let ctx2_json = serde_json::to_string(&ctx2.effective_items).unwrap();
+        // Verify `process_status` in Activation #2 saw the session process as `"running"` and `process_stop` transitioned it to `"killed"`
+        assert!(
+            ctx2_json.contains("\\\"phase\\\": \\\"running\\\""),
+            "ctx2: {ctx2_json}"
+        );
+        assert!(
+            ctx2_json.contains("\\\"phase\\\": \\\"killed\\\""),
+            "ctx2: {ctx2_json}"
+        );
+        assert!(ctx2_json.contains("out_line_1"), "ctx2: {ctx2_json}");
+        assert!(ctx2_json.contains("err_line_1"), "ctx2: {ctx2_json}");
+
+        d_cancel.cancel();
+        server_cancel.cancel();
+        let _ = std::fs::remove_dir_all(&base_tmp);
+    }
 }

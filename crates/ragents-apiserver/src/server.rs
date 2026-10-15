@@ -147,6 +147,10 @@ pub fn build_router(state: ApiServerState) -> Router {
             "/api/v1/sessions/{session_id}/activations",
             get(handle_list_session_activations),
         )
+        .route(
+            "/api/v1/sessions/{session_id}/realtime",
+            post(handle_push_realtime_message),
+        )
         .route("/api/v1/activations", post(handle_create_activation))
         .route(
             "/api/v1/activations/{activation_id}",
@@ -536,6 +540,43 @@ async fn handle_create_activation(
         .await?;
     let (act, _) = state.store.create_activation(admitted)?;
     Ok((StatusCode::CREATED, Json(act)))
+}
+
+async fn handle_push_realtime_message(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(req): Json<PushRealtimeMessageRequest>,
+) -> Result<(StatusCode, Json<PushRealtimeMessageResponse>), ApiError> {
+    let principal = state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "POST",
+            &format!("/api/v1/sessions/{session_id}/realtime"),
+            &headers,
+        )
+        .await?;
+    let id = SessionId::new(session_id.clone());
+    let sess = state
+        .store
+        .get_session(&id)?
+        .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
+    state
+        .extensions
+        .authorize(
+            &principal,
+            ResourceVerb::Patch,
+            ResourceKind::Session,
+            Some(&session_id),
+            &sess.metadata.labels,
+        )
+        .await?;
+    let queued_count = state.store.push_realtime_message(&id, req.content)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PushRealtimeMessageResponse { queued_count }),
+    ))
 }
 
 async fn handle_get_activation(
@@ -1037,6 +1078,64 @@ async fn run_daemon_tunnel_socket(socket: WebSocket, state: ApiServerState) {
                         request_id,
                         ok: false,
                         items: vec![],
+                        error: Some(e.to_string()),
+                    });
+                }
+            },
+            DaemonToServerMessage::PushRealtimeMessage {
+                request_id,
+                session_id,
+                activation_id: _,
+                content,
+            } => match state.store.push_realtime_message(&session_id, content) {
+                Ok(_count) => {
+                    let _ = out_tx.send(ServerToDaemonMessage::Ack {
+                        request_id,
+                        ok: true,
+                        resource_version: None,
+                        batch_seq: None,
+                        spawned_session_id: None,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    let _ = out_tx.send(ServerToDaemonMessage::Ack {
+                        request_id,
+                        ok: false,
+                        resource_version: None,
+                        batch_seq: None,
+                        spawned_session_id: None,
+                        error: Some(e.to_string()),
+                    });
+                }
+            },
+            DaemonToServerMessage::DrainRealtimeMessages {
+                request_id,
+                session_id,
+                activation_id,
+                lease_epoch,
+                turn_id,
+            } => match state.store.drain_realtime_messages(
+                &session_id,
+                &activation_id,
+                lease_epoch,
+                turn_id,
+            ) {
+                Ok((items, batch_seq)) => {
+                    let _ = out_tx.send(ServerToDaemonMessage::RealtimeMessagesReply {
+                        request_id,
+                        ok: true,
+                        items,
+                        batch_seq,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    let _ = out_tx.send(ServerToDaemonMessage::RealtimeMessagesReply {
+                        request_id,
+                        ok: false,
+                        items: vec![],
+                        batch_seq: None,
                         error: Some(e.to_string()),
                     });
                 }

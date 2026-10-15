@@ -238,6 +238,13 @@ pub enum WorkerToParentMessage {
         call_id: Option<String>,
         command_id: CommandId,
     },
+    DrainRealtimeMessages {
+        turn_id: Option<TurnId>,
+    },
+    ManageProcess {
+        extension_id: Option<String>,
+        request: ProcessActionRequest,
+    },
     CreateModelResponse {
         request: Box<CreateResponseBody>,
     },
@@ -266,6 +273,12 @@ pub enum ParentToWorkerMessage {
     },
     SpawnChildSessionReply {
         result: Result<SessionId, String>,
+    },
+    DrainRealtimeMessagesReply {
+        result: Result<Vec<Item>, String>,
+    },
+    ManageProcessReply {
+        result: Result<Option<ProcessActionResponse>, String>,
     },
     CreateModelResponseReply {
         result: Result<Box<ResponseResource>, String>,
@@ -545,6 +558,31 @@ impl CoreExecutor for SubprocessExecutor {
                         )
                         .await?;
                     }
+                    WorkerToParentMessage::DrainRealtimeMessages { turn_id } => {
+                        let res = tokio::select! {
+                            r = host.drain_realtime_messages(turn_id) => r.map_err(|e| e.to_string()),
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        };
+                        send_jsonl(
+                            &mut writer,
+                            &ParentToWorkerMessage::DrainRealtimeMessagesReply { result: res },
+                        )
+                        .await?;
+                    }
+                    WorkerToParentMessage::ManageProcess {
+                        extension_id,
+                        request,
+                    } => {
+                        let res = tokio::select! {
+                            r = host.manage_process(extension_id.as_deref(), request) => r.map_err(|e| e.to_string()),
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        };
+                        send_jsonl(
+                            &mut writer,
+                            &ParentToWorkerMessage::ManageProcessReply { result: res },
+                        )
+                        .await?;
+                    }
                     WorkerToParentMessage::CreateModelResponse { request } => {
                         let res = tokio::select! {
                             r = model_backend.create_response(&parent_endpoint, *request) => r.map(Box::new).map_err(|e| e.to_string()),
@@ -807,6 +845,46 @@ impl CoreHost for IpcCoreHostProxy {
             }
             other => Err(CoreError::HostError(format!(
                 "unexpected reply to SpawnChildSession: {other:?}"
+            ))),
+        }
+    }
+
+    async fn drain_realtime_messages(
+        &self,
+        turn_id: Option<TurnId>,
+    ) -> Result<Vec<Item>, CoreError> {
+        let mut ch = self.channel.lock().await;
+        match ch
+            .call(&WorkerToParentMessage::DrainRealtimeMessages { turn_id })
+            .await?
+        {
+            ParentToWorkerMessage::DrainRealtimeMessagesReply { result } => {
+                result.map_err(CoreError::HostError)
+            }
+            other => Err(CoreError::HostError(format!(
+                "unexpected reply to DrainRealtimeMessages: {other:?}"
+            ))),
+        }
+    }
+
+    async fn manage_process(
+        &self,
+        extension_id: Option<&str>,
+        request: ProcessActionRequest,
+    ) -> Result<Option<ProcessActionResponse>, CoreError> {
+        let mut ch = self.channel.lock().await;
+        match ch
+            .call(&WorkerToParentMessage::ManageProcess {
+                extension_id: extension_id.map(String::from),
+                request,
+            })
+            .await?
+        {
+            ParentToWorkerMessage::ManageProcessReply { result } => {
+                result.map_err(CoreError::HostError)
+            }
+            other => Err(CoreError::HostError(format!(
+                "unexpected reply to ManageProcess: {other:?}"
             ))),
         }
     }

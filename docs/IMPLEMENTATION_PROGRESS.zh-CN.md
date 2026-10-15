@@ -6,12 +6,13 @@
 - [详细技术方案](./TECHNICAL_DESIGN.zh-CN.md)
 - [分阶段实施路线图](./IMPLEMENTATION_ROADMAP.zh-CN.md)
 - [扩展架构设计文档](./EXTENSION_ARCHITECTURE.zh-CN.md)
+- [双消息队列与后台命令进程管理系统设计](./PROCESS_AND_QUEUE_DESIGN.zh-CN.md)
 
 ---
 
 ## 1. 阶段完成总览
 
-目前 **S0 至 S7（含 OS 内核沙箱、自动权限升级与 Daemon / API Server 扩展体系）已全部落地并通过全量测试与严格 Clippy 检查**，每个阶段均已独立提交 Git Commit：
+目前 **S0 至 S7（含 OS 内核沙箱、WASI 0.2 原生权限统一、Daemon / API Server 扩展体系、以及双消息队列与后台命令进程管理系统）已全部落地并通过全量测试与严格 Clippy 检查**，每个阶段均已独立提交 Git Commit：
 
 | 阶段 | 状态 | Commit | 核心完成内容 |
 | :--- | :---: | :--- | :--- |
@@ -25,7 +26,9 @@
 | **S6：子进程隔离执行器 (`SubprocessExecutor`)** | ✅ 已完成 | `701fe02`, `4735a0a` | 单二进制自孵化 `internal-core-worker` 子进程隔离执行、单 Daemon 共享 UDS Listener（`SharedIpcHub`，TCP Loopback 自动回退）多路复用 IPC、子进程环境自动剥离 `RAGENTS_API_KEY`、Wasmtime `.cwasm` 内容寻址预编译缓存 |
 | **S7A：OS 内核命令沙箱与自动化多级权限审批** | ✅ 已完成 | `98cb7e2`, `5df048b`, `bb84cb6` | Host Import 强制鉴权、macOS `sandbox-exec` (Seatbelt) / Linux `bwrap` 内核沙箱、越界路径双通道（`stderr` + 内核日志）自动识别与多目录循环申请、同时展示 `original_path` 与 `suggested_path`、支持 `--path` 手动微调审批目录及 5 级生效周期（`allow-once` / `allow-activation` / `allow-session` / `allow-workspace` / `allow-node`） |
 | **S7B：`agent-daemon` 拦截器扩展体系** | ✅ 已完成 | `bab6fc7` | `DaemonInterceptor` 原生 Trait + WASM 组件驱动 + HTTP/UDS Webhook 驱动，支持 `before_model_request`（修改标准模型参数、注入供应商扩展字段、注入自定义 Header、动态轮换 `api_key`）、`after_model_response` 与 `evaluate_permission` |
-| **S7C：`api-server` 鉴权与准入控制扩展体系** | ✅ 已完成 | `e7149b6` | `AuthnPlugin`（区分 `client_http` 与 `daemon_tunnel`）、`AuthzPlugin`（支持 `enforced_label_selector` 多租户透明隔离）、`AdmissionPlugin`（`Mutating` 变更准入与 `Validating` 校验准入）及 CLI/SDK `--auth-token` 支持 |
+| **S7C：`api-server` 鉴权与准入控制扩展体系** | ✅ 已完成 | `e7149b6`, `8d95166` | `AuthnPlugin`（区分 `client_http` 与 `daemon_tunnel`）、`AuthzPlugin`（支持 `enforced_label_selector` 多租户透明隔离）、`AdmissionPlugin`（`Mutating` 变更准入与 `Validating` 校验准入）及 CLI/SDK `--auth-token` 支持 |
+| **S7D：原生 WASI 0.2 权限统一与控制面 WASM 隔离** | ✅ 已完成 | `268cc28`, `c6056c1`, `e6b9efb` | 保持 WIT 最小化，直接接管 WASI 0.2 `wasi:filesystem/types::HostDescriptor`、`wasi:http/outgoing-handler` (`WasiHttpView`) 与 `wasi:sockets` (`socket_addr_check`)；控制面 WASM 插件默认开放网络、隔离宿主机 `/` 并仅挂载私有目录与 `allowed_dirs` |
+| **S7E：双消息队列与后台命令进程管理系统** | ✅ 已完成 | 本次提交 | `api-server` 双消息队列（`FollowUp` 等待队列 + `Realtime` 实时队列，支持单次全部取出并保持多个独立 `MessageContent` 块）；`agent-daemon` 托管 `ProcessManager` 支持 `wait: bool`、`lifecycle: "activation" \| "session"`、进程组级回收、`stdout`/`stderr`/`combined` 三通道日志查询、后台进程自然退出实时通知及 `ragents steer` CLI |
 
 ---
 

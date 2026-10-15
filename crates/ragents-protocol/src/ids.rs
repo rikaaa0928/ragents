@@ -57,6 +57,7 @@ define_string_id!(TurnId, "turn_");
 define_string_id!(EventId, "evt_");
 define_string_id!(PermissionRequestId, "permreq_");
 define_string_id!(CommandId, "cmd_");
+define_string_id!(ProcessId, "proc_");
 define_string_id!(ConfigRef, "cfg_sha256:");
 define_string_id!(PermissionSnapshotRef, "permsnap_sha256:");
 
