@@ -10,11 +10,108 @@ use ragents_protocol::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
+type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
+
+enum IpcListener {
+    #[cfg(unix)]
+    Unix {
+        listener: tokio::net::UnixListener,
+        socket_path: PathBuf,
+    },
+    Tcp {
+        listener: TcpListener,
+    },
+}
+
+impl IpcListener {
+    /// Prefers Unix Domain Socket (UDS) when available, automatically falling back to TCP loopback (`127.0.0.1:0`).
+    async fn bind(prefer_uds: bool) -> Result<(Self, String), CoreError> {
+        #[cfg(unix)]
+        if prefer_uds {
+            let ipc_dir = PathBuf::from("/tmp/ragents-ipc");
+            if std::fs::create_dir_all(&ipc_dir).is_ok() {
+                let sock_path = ipc_dir.join(format!("w_{}.sock", Uuid::now_v7().simple()));
+                let _ = std::fs::remove_file(&sock_path);
+                if let Ok(listener) = tokio::net::UnixListener::bind(&sock_path) {
+                    let addr_str = format!("unix:{}", sock_path.to_string_lossy());
+                    return Ok((
+                        Self::Unix {
+                            listener,
+                            socket_path: sock_path,
+                        },
+                        addr_str,
+                    ));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = prefer_uds;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| CoreError::HostError(format!("failed to bind tcp ipc listener: {e}")))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| CoreError::HostError(format!("failed to read tcp ipc local_addr: {e}")))?;
+        Ok((Self::Tcp { listener }, format!("tcp:{addr}")))
+    }
+
+    async fn accept(&self) -> Result<(BoxedReader, BoxedWriter), CoreError> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix { listener, .. } => {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|e| CoreError::HostError(format!("uds ipc accept error: {e}")))?;
+                let (r, w) = tokio::io::split(stream);
+                Ok((Box::new(r), Box::new(w)))
+            }
+            Self::Tcp { listener } => {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|e| CoreError::HostError(format!("tcp ipc accept error: {e}")))?;
+                let (r, w) = tokio::io::split(stream);
+                Ok((Box::new(r), Box::new(w)))
+            }
+        }
+    }
+
+    fn cleanup(&self) {
+        #[cfg(unix)]
+        if let Self::Unix { socket_path, .. } = self {
+            let _ = std::fs::remove_file(socket_path);
+        }
+    }
+}
+
+async fn connect_ipc_stream(ipc_addr: &str) -> Result<(BoxedReader, BoxedWriter), CoreError> {
+    #[cfg(unix)]
+    if let Some(unix_path) = ipc_addr.strip_prefix("unix:") {
+        let stream = tokio::net::UnixStream::connect(unix_path)
+            .await
+            .map_err(|e| {
+                CoreError::HostError(format!("worker failed to connect to uds {unix_path}: {e}"))
+            })?;
+        let (r, w) = tokio::io::split(stream);
+        return Ok((Box::new(r), Box::new(w)));
+    }
+
+    let tcp_addr = ipc_addr.strip_prefix("tcp:").unwrap_or(ipc_addr);
+    let stream = TcpStream::connect(tcp_addr).await.map_err(|e| {
+        CoreError::HostError(format!("worker failed to connect to tcp {tcp_addr}: {e}"))
+    })?;
+    let (r, w) = tokio::io::split(stream);
+    Ok((Box::new(r), Box::new(w)))
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -89,18 +186,34 @@ pub enum ParentToWorkerMessage {
 /// Out-of-process container executor (`SubprocessExecutor`).
 /// Spawns an isolated OS child process (`internal-core-worker`) per activation with its own
 /// working directory, stripped API key environment, and hard-kill lifecycle management.
-#[derive(Debug, Clone, Default)]
+/// Prefers Unix Domain Socket (UDS) for IPC, falling back to TCP loopback (`127.0.0.1:0`) if UDS is unavailable.
+#[derive(Debug, Clone)]
 pub struct SubprocessExecutor {
     worker_bin: Option<PathBuf>,
+    prefer_uds: bool,
+}
+
+impl Default for SubprocessExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SubprocessExecutor {
     pub fn new() -> Self {
-        Self { worker_bin: None }
+        Self {
+            worker_bin: None,
+            prefer_uds: true,
+        }
     }
 
     pub fn with_worker_binary(mut self, path: impl Into<PathBuf>) -> Self {
         self.worker_bin = Some(path.into());
+        self
+    }
+
+    pub fn with_prefer_uds(mut self, prefer_uds: bool) -> Self {
+        self.prefer_uds = prefer_uds;
         self
     }
 
@@ -160,30 +273,29 @@ impl CoreExecutor for SubprocessExecutor {
         let _ = std::fs::create_dir_all(&run_spec.workspace_root);
         let _ = std::fs::create_dir_all(&run_spec.session_tmp_dir);
 
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| CoreError::HostError(format!("failed to bind ipc listener: {e}")))?;
-        let ipc_addr = listener
-            .local_addr()
-            .map_err(|e| CoreError::HostError(format!("failed to read ipc local_addr: {e}")))?;
+        let (listener, ipc_addr) = IpcListener::bind(self.prefer_uds).await?;
         let ipc_token = format!("tok_{}", Uuid::now_v7());
 
         let (worker_bin, _) = self.resolve_worker_command()?;
         let mut cmd = tokio::process::Command::new(&worker_bin);
         cmd.arg("internal-core-worker")
             .arg("--ipc-addr")
-            .arg(ipc_addr.to_string())
+            .arg(&ipc_addr)
             .arg("--ipc-token")
             .arg(&ipc_token)
             .current_dir(&run_spec.workspace_root)
             .env_remove("RAGENTS_API_KEY")
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| {
-            CoreError::HostError(format!(
-                "failed to spawn subprocess worker {worker_bin:?}: {e}"
-            ))
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                listener.cleanup();
+                return Err(CoreError::HostError(format!(
+                    "failed to spawn subprocess worker {worker_bin:?}: {e}"
+                )));
+            }
+        };
 
         let parent_endpoint = run_spec.model_endpoint.clone();
         let mut sanitized_spec = run_spec;
@@ -191,8 +303,8 @@ impl CoreExecutor for SubprocessExecutor {
         sanitized_spec.model_endpoint.api_key = String::new();
 
         let service_res = async {
-            let (stream, _) = tokio::select! {
-                res = listener.accept() => res.map_err(|e| CoreError::HostError(format!("ipc accept error: {e}")))?,
+            let (reader, mut writer) = tokio::select! {
+                res = listener.accept() => res?,
                 status = child.wait() => {
                     return Err(CoreError::HostError(format!(
                         "worker subprocess exited before connecting: {status:?}"
@@ -203,7 +315,6 @@ impl CoreExecutor for SubprocessExecutor {
                 }
             };
 
-            let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
 
             // 1. Verify Hello token
@@ -358,6 +469,7 @@ impl CoreExecutor for SubprocessExecutor {
             let _ = child.kill().await;
         }
         let _ = child.wait().await;
+        listener.cleanup();
         service_res
     }
 }
@@ -367,10 +479,7 @@ impl CoreExecutor for SubprocessExecutor {
 // ============================================================================
 
 pub async fn run_subprocess_worker(ipc_addr: &str, ipc_token: &str) -> Result<(), CoreError> {
-    let stream = TcpStream::connect(ipc_addr).await.map_err(|e| {
-        CoreError::HostError(format!("worker failed to connect to {ipc_addr}: {e}"))
-    })?;
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = connect_ipc_stream(ipc_addr).await?;
     let mut lines = BufReader::new(reader).lines();
 
     send_jsonl(
@@ -422,8 +531,8 @@ pub async fn run_subprocess_worker(ipc_addr: &str, ipc_token: &str) -> Result<()
 }
 
 struct WorkerIpcChannel {
-    lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-    writer: tokio::net::tcp::OwnedWriteHalf,
+    lines: tokio::io::Lines<BufReader<BoxedReader>>,
+    writer: BoxedWriter,
 }
 
 impl WorkerIpcChannel {

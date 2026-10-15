@@ -317,18 +317,39 @@ mod tests {
         let executor = SubprocessExecutor::new();
         let summary = executor
             .execute(
-                run_spec,
+                run_spec.clone(),
                 host.clone(),
                 model_backend,
                 CancellationToken::new(),
             )
             .await
-            .expect("execute subprocess wasm tool loop");
+            .expect("execute subprocess wasm tool loop over UDS");
 
         assert_eq!(summary.final_text, "Created subproc.txt in subprocess.");
         assert_eq!(summary.turns_executed, 2);
         let written =
             std::fs::read_to_string(ws_root.join("subproc.txt")).expect("read subproc.txt");
         assert_eq!(written, "hello from isolated subprocess executor!");
+
+        // Also verify TCP loopback fallback path when UDS is unavailable/disabled
+        let tcp_executor = SubprocessExecutor::new().with_prefer_uds(false);
+        let resp3 = make_openresponses_resource(
+            "resp_sub_3",
+            "gpt-4.1",
+            vec![Item::assistant_message("TCP fallback ok.")],
+            None,
+        );
+        let tcp_summary = tcp_executor
+            .execute(
+                run_spec,
+                host,
+                Arc::new(MockModelBackend {
+                    responses: Mutex::new(vec![resp3]),
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute subprocess over TCP fallback");
+        assert_eq!(tcp_summary.final_text, "TCP fallback ok.");
     }
 }
