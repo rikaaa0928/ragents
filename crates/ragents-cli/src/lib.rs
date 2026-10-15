@@ -219,9 +219,11 @@ impl From<CliDesiredSessionPhase> for DesiredSessionPhase {
 }
 
 pub async fn run_cli(cli: Cli) -> Result<()> {
-    let server_url = cli
+    let explicit_server = cli
         .server
-        .or_else(|| std::env::var("RAGENTS_SERVER_URL").ok())
+        .or_else(|| std::env::var("RAGENTS_SERVER_URL").ok());
+    let server_url = explicit_server
+        .clone()
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
     let client = RagentsClient::new(&server_url);
 
@@ -332,14 +334,16 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 Some(path) => DaemonConfig::load_from_file(path)?,
                 None => DaemonConfig::default_local(NodeId::new(&node_id), &server_url),
             };
-            d_cfg.server_url = server_url.clone();
+            if let Some(ref exp_srv) = explicit_server {
+                d_cfg.server_url = exp_srv.clone();
+            }
             let cancel = CancellationToken::new();
             let daemon = AgentDaemon::new(d_cfg);
             daemon.start(cancel.clone()).await?;
             println!(
                 "ragents-daemon '{}' connected to {}",
                 daemon.config().node_id,
-                server_url
+                daemon.config().server_url
             );
             tokio::signal::ctrl_c().await?;
             cancel.cancel();
