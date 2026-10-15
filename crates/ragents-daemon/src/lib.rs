@@ -430,6 +430,20 @@ mod tests {
             raw_body.get("thinking_budget"),
             Some(&serde_json::json!(4096))
         );
+        let meta = raw_body.get("metadata").expect("metadata injected");
+        assert_eq!(
+            meta.get("ragents.session_id").and_then(|v| v.as_str()),
+            Some(sess_id.as_str())
+        );
+        assert_eq!(
+            meta.get("ragents.activation_id").and_then(|v| v.as_str()),
+            Some(act_id.as_str())
+        );
+        assert!(meta
+            .get("ragents.turn_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .starts_with("turn_"));
 
         // Verify `after_model_response` mutation was committed to session context
         let ctx = client.get_session_context(&sess_id).await.unwrap();

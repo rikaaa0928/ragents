@@ -235,6 +235,11 @@ impl ModelBackend for InterceptedModelBackend {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+        let turn_id = request_json
+            .get("metadata")
+            .and_then(|m| m.get("ragents.turn_id"))
+            .and_then(|v| v.as_str())
+            .map(TurnId::new);
 
         // 1. Run `before_model_request` interceptors
         let mut short_circuit_response: Option<ResponseResource> = None;
@@ -244,6 +249,7 @@ impl ModelBackend for InterceptedModelBackend {
                 node_id: self.node_id.clone(),
                 session_id: self.session_id.clone(),
                 activation_id: self.activation_id.clone(),
+                turn_id: turn_id.clone(),
                 session_labels: self.session_labels.clone(),
                 endpoint: InterceptEndpointView {
                     model_id: model_id.clone(),
@@ -299,6 +305,7 @@ impl ModelBackend for InterceptedModelBackend {
         }
 
         // 2. Call underlying ModelBackend (unless short-circuited by an interceptor)
+        let started_at = std::time::Instant::now();
         let mut response = match short_circuit_response {
             Some(resp) => resp,
             None => {
@@ -307,6 +314,7 @@ impl ModelBackend for InterceptedModelBackend {
                     .await?
             }
         };
+        let duration_ms = started_at.elapsed().as_millis() as u64;
 
         // 3. Run `after_model_response` interceptors
         for interceptor in &self.chain.interceptors {
@@ -314,7 +322,9 @@ impl ModelBackend for InterceptedModelBackend {
                 node_id: self.node_id.clone(),
                 session_id: self.session_id.clone(),
                 activation_id: self.activation_id.clone(),
+                turn_id: turn_id.clone(),
                 model_id: model_id.clone(),
+                duration_ms,
                 response: response.clone(),
             };
 

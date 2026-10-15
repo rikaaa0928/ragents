@@ -46,6 +46,7 @@ impl AgentCore {
         max_output_tokens: Option<i32>,
         reasoning: Option<ReasoningConfig>,
         tools: Vec<Tool>,
+        metadata: Option<std::collections::HashMap<String, String>>,
         endpoint: &ModelEndpointConfig,
         model_backend: &dyn ModelBackend,
     ) -> Result<AgentCoreStepResult, CoreError> {
@@ -65,6 +66,7 @@ impl AgentCore {
             temperature,
             max_output_tokens,
             reasoning,
+            metadata,
             stream: Some(false),
             ..Default::default()
         };
@@ -341,6 +343,17 @@ async fn run_react_loop(
             apply_context_projection_hook(hook_manager, iteration, raw_items).await?;
         let projection = ContextProjection::new(projected_items);
 
+        let mut turn_metadata = std::collections::HashMap::new();
+        turn_metadata.insert(
+            "ragents.session_id".to_string(),
+            run_spec.session_id.to_string(),
+        );
+        turn_metadata.insert(
+            "ragents.activation_id".to_string(),
+            run_spec.activation_id.to_string(),
+        );
+        turn_metadata.insert("ragents.turn_id".to_string(), turn_id.to_string());
+
         let step = tokio::select! {
             res = AgentCore::step(
                 &draft.system_prompt,
@@ -350,6 +363,7 @@ async fn run_react_loop(
                 draft.model.max_output_tokens,
                 draft.model.reasoning.clone(),
                 request_tools.clone(),
+                Some(turn_metadata),
                 &run_spec.model_endpoint,
                 model_backend,
             ) => res?,

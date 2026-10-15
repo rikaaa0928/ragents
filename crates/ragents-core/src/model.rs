@@ -51,7 +51,12 @@ impl ModelBackend for OpenResponsesModelBackend {
         endpoint: &ModelEndpointConfig,
         request_json: serde_json::Value,
     ) -> Result<ResponseResource, CoreError> {
-        let url = format!("{}/responses", endpoint.base_url.trim_end_matches('/'));
+        let trimmed = endpoint.base_url.trim_end_matches('/');
+        let url = if trimmed.ends_with("/v1") {
+            format!("{trimmed}/responses")
+        } else {
+            format!("{trimmed}/v1/responses")
+        };
         let http = reqwest::Client::new();
         let mut req_builder = http
             .post(&url)

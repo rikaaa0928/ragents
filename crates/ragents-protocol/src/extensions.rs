@@ -100,6 +100,8 @@ pub struct ModelRequestInterceptInput {
     pub node_id: NodeId,
     pub session_id: SessionId,
     pub activation_id: ActivationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
     #[serde(default)]
     pub session_labels: BTreeMap<String, String>,
     pub endpoint: InterceptEndpointView,
@@ -147,7 +149,11 @@ pub struct ModelResponseInterceptInput {
     pub node_id: NodeId,
     pub session_id: SessionId,
     pub activation_id: ActivationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
     pub model_id: String,
+    #[serde(default)]
+    pub duration_ms: u64,
     pub response: ResponseResource,
 }
 
