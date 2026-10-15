@@ -4,14 +4,19 @@ use crate::host::{CoreHost, PermissionOutcome};
 use crate::sandbox::{SandboxMode, SandboxState};
 use ragents_protocol::{CapabilityRequest, PermissionPolicyLayer};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::{Component as PathComponent, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, HasSelf, Linker, Resource};
 use wasmtime::{Config, Engine, Store};
+use wasmtime_wasi::filesystem::{WasiFilesystemCtxView, WasiFilesystemView as _};
+use wasmtime_wasi::p2::bindings::filesystem::{preopens as wasi_preopens, types as wasi_fs_types};
+use wasmtime_wasi::p2::{DynInputStream, DynOutputStream, FsError, FsResult};
 use wasmtime_wasi::{
     DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 static SHARED_ENGINE: OnceLock<Engine> = OnceLock::new();
 
@@ -80,11 +85,20 @@ wasmtime::component::bindgen!({
 
 struct HostState {
     wasi_ctx: WasiCtx,
+    http_ctx: WasiHttpCtx,
     table: ResourceTable,
     plugin_name: String,
     workspace_root: PathBuf,
     core_host: Option<Arc<dyn CoreHost>>,
     sandbox_state: Arc<SandboxState>,
+    /// Tracks the resolved host `PathBuf` for each WASI 0.2 `wasi:filesystem/types.descriptor` resource rep.
+    dir_paths: HashMap<u32, PathBuf>,
+    ws_fd_rep: Option<u32>,
+    root_fd_rep: Option<u32>,
+    /// Tracks paths approved during the current `invoke` call so multi-syscall operations
+    /// (`create_directory_at` followed by `open_at`) don't double-prompt under `AllowOnce`.
+    invoke_approved_writes: Vec<PathBuf>,
+    invoke_approved_reads: Vec<PathBuf>,
 }
 
 impl WasiView for HostState {
@@ -96,15 +110,611 @@ impl WasiView for HostState {
     }
 }
 
+// ============================================================================
+// 1. WASI 0.2 Built-in HTTP Permission Management (`wasi:http/outgoing-handler`)
+// ============================================================================
+
+impl WasiHttpView for HostState {
+    fn ctx(&mut self) -> &mut WasiHttpCtx {
+        &mut self.http_ctx
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+
+    fn send_request(
+        &mut self,
+        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+        let core_host = self.core_host.clone();
+        let plugin_name = self.plugin_name.clone();
+        let scheme = if config.use_tls { "https" } else { "http" }.to_string();
+        let host_str = request
+            .uri()
+            .host()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase();
+        let port = request
+            .uri()
+            .port_u16()
+            .or(Some(if config.use_tls { 443 } else { 80 }));
+        let method_str = request.method().as_str().to_ascii_uppercase();
+        let full_url = request.uri().to_string();
+
+        let handle = wasmtime_wasi::runtime::spawn(async move {
+            if let Some(host_cb) = core_host {
+                let cap = CapabilityRequest::Http {
+                    scheme,
+                    host: host_str.clone(),
+                    port,
+                    method: method_str.clone(),
+                };
+                let reason = format!(
+                    "WASI 0.2 HTTP (`wasi:http/outgoing-handler`) from extension '{plugin_name}': {method_str} {full_url}"
+                );
+                match host_cb
+                    .check_permission_with_original_path(
+                        Some(&plugin_name),
+                        cap,
+                        Some(PathBuf::from(&full_url)),
+                        Some(reason),
+                    )
+                    .await
+                {
+                    Ok(PermissionOutcome::Allowed {
+                        effective_capability,
+                        ..
+                    }) => {
+                        if let Some(CapabilityRequest::Http {
+                            host: ref approved_host,
+                            ..
+                        }) = effective_capability
+                        {
+                            if !host_matches_pattern(approved_host, &host_str) {
+                                return Ok(Err(
+                                    wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(PermissionOutcome::Denied { .. }) | Err(_) => {
+                        return Ok(Err(
+                            wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
+                        ));
+                    }
+                }
+            }
+            Ok(wasmtime_wasi_http::types::default_send_request_handler(request, config).await)
+        });
+        Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle))
+    }
+}
+
+// ============================================================================
+// 2. WASI 0.2 Built-in Filesystem Permission Management (`wasi:filesystem`)
+// ============================================================================
+
+impl HostState {
+    fn resolve_fd_path(&self, fd: &Resource<wasi_fs_types::Descriptor>, rel: &str) -> PathBuf {
+        let base = self
+            .dir_paths
+            .get(&fd.rep())
+            .cloned()
+            .unwrap_or_else(|| self.workspace_root.clone());
+        let joined = if rel.is_empty() || rel == "." {
+            base
+        } else {
+            base.join(rel.trim_start_matches('/'))
+        };
+        normalize_lexical_path(&joined)
+    }
+
+    fn remap_fd_and_resolve_path(
+        &self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        rel: &str,
+    ) -> (Resource<wasi_fs_types::Descriptor>, PathBuf) {
+        if Some(fd.rep()) == self.root_fd_rep {
+            let trimmed = rel.trim_start_matches('/');
+            let first_seg = trimmed.split('/').next().unwrap_or("");
+            let is_system_root_dir =
+                !first_seg.is_empty() && Path::new("/").join(first_seg).is_dir();
+            if !is_system_root_dir {
+                if let Some(ws_rep) = self.ws_fd_rep {
+                    let remapped_fd = Resource::new_borrow(ws_rep);
+                    let full = normalize_lexical_path(&self.workspace_root.join(trimmed));
+                    return (remapped_fd, full);
+                }
+            }
+        }
+        let full = self.resolve_fd_path(&fd, rel);
+        (fd, full)
+    }
+
+    async fn check_wasi_fs_permission(
+        &mut self,
+        full_path: &Path,
+        is_write: bool,
+        op_name: &str,
+    ) -> FsResult<()> {
+        let Some(ref host) = self.core_host else {
+            return Ok(());
+        };
+
+        let norm_ws = crate::sandbox::canonicalize_or_normalize(&self.workspace_root);
+        let norm_target = crate::sandbox::canonicalize_or_normalize(full_path);
+        let in_workspace =
+            full_path.starts_with(&self.workspace_root) || norm_target.starts_with(&norm_ws);
+
+        // If already approved earlier within this same `invoke` call (e.g. `create_directory_at` right before `open_at`),
+        // skip duplicate permission check.
+        if is_write {
+            if self
+                .invoke_approved_writes
+                .iter()
+                .any(|p| norm_target.starts_with(p) || full_path.starts_with(p))
+            {
+                return Ok(());
+            }
+        } else if self
+            .invoke_approved_reads
+            .iter()
+            .any(|p| norm_target.starts_with(p) || full_path.starts_with(p))
+        {
+            return Ok(());
+        }
+
+        let suggested_path = if in_workspace {
+            full_path.to_path_buf()
+        } else {
+            crate::sandbox::normalize_violation_to_request_dir(full_path)
+        };
+
+        let cap = if is_write {
+            CapabilityRequest::FileWrite {
+                path: suggested_path.clone(),
+            }
+        } else {
+            CapabilityRequest::FileRead {
+                path: suggested_path.clone(),
+            }
+        };
+
+        let reason = format!(
+            "WASI 0.2 filesystem (`wasi:filesystem/{op_name}`) from extension '{}' requires {} access to '{}' (suggested path: '{}')",
+            self.plugin_name,
+            if is_write { "file-write" } else { "file-read" },
+            full_path.display(),
+            suggested_path.display()
+        );
+
+        match host
+            .check_permission_with_original_path(
+                Some(&self.plugin_name),
+                cap.clone(),
+                Some(full_path.to_path_buf()),
+                Some(reason),
+            )
+            .await
+        {
+            Ok(PermissionOutcome::Allowed {
+                effective_capability,
+                ..
+            }) => {
+                let granted_cap = effective_capability.unwrap_or(cap);
+                let approved_path = granted_cap
+                    .path()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or(suggested_path);
+                let norm_approved = crate::sandbox::canonicalize_or_normalize(&approved_path);
+                if !norm_target.starts_with(&norm_approved)
+                    && !full_path.starts_with(&approved_path)
+                {
+                    return Err(wasi_fs_types::ErrorCode::NotPermitted.into());
+                }
+                if is_write {
+                    self.invoke_approved_writes.push(norm_approved);
+                    self.invoke_approved_writes.push(approved_path);
+                } else {
+                    self.invoke_approved_reads.push(norm_approved);
+                    self.invoke_approved_reads.push(approved_path);
+                }
+                Ok(())
+            }
+            Ok(PermissionOutcome::Denied { .. }) | Err(_) => {
+                Err(wasi_fs_types::ErrorCode::NotPermitted.into())
+            }
+        }
+    }
+}
+
+impl wasi_preopens::Host for HostState {
+    fn get_directories(
+        &mut self,
+    ) -> wasmtime::Result<Vec<(Resource<wasi_fs_types::Descriptor>, String)>> {
+        let mut fs_view: WasiFilesystemCtxView<'_> = self.filesystem();
+        let dirs = wasi_preopens::Host::get_directories(&mut fs_view)?;
+        let ws = self.workspace_root.clone();
+        for (res, guest_path) in &dirs {
+            let host_path = if guest_path == "." {
+                self.ws_fd_rep = Some(res.rep());
+                ws.clone()
+            } else {
+                if guest_path == "/" {
+                    self.root_fd_rep = Some(res.rep());
+                }
+                PathBuf::from(guest_path)
+            };
+            self.dir_paths.insert(res.rep(), host_path);
+        }
+        Ok(dirs)
+    }
+}
+
+impl wasi_fs_types::Host for HostState {
+    fn convert_error_code(&mut self, err: FsError) -> anyhow::Result<wasi_fs_types::ErrorCode> {
+        wasi_fs_types::Host::convert_error_code(&mut self.filesystem(), err)
+    }
+
+    fn filesystem_error_code(
+        &mut self,
+        err: Resource<anyhow::Error>,
+    ) -> anyhow::Result<Option<wasi_fs_types::ErrorCode>> {
+        wasi_fs_types::Host::filesystem_error_code(&mut self.filesystem(), err)
+    }
+}
+
+impl wasi_fs_types::HostDirectoryEntryStream for HostState {
+    async fn read_directory_entry(
+        &mut self,
+        stream: Resource<wasi_fs_types::DirectoryEntryStream>,
+    ) -> FsResult<Option<wasi_fs_types::DirectoryEntry>> {
+        wasi_fs_types::HostDirectoryEntryStream::read_directory_entry(
+            &mut self.filesystem(),
+            stream,
+        )
+        .await
+    }
+
+    fn drop(
+        &mut self,
+        stream: Resource<wasi_fs_types::DirectoryEntryStream>,
+    ) -> anyhow::Result<()> {
+        wasi_fs_types::HostDirectoryEntryStream::drop(&mut self.filesystem(), stream)
+    }
+}
+
+impl wasi_fs_types::HostDescriptor for HostState {
+    async fn advise(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        offset: wasi_fs_types::Filesize,
+        len: wasi_fs_types::Filesize,
+        advice: wasi_fs_types::Advice,
+    ) -> FsResult<()> {
+        wasi_fs_types::HostDescriptor::advise(&mut self.filesystem(), fd, offset, len, advice).await
+    }
+
+    async fn sync_data(&mut self, fd: Resource<wasi_fs_types::Descriptor>) -> FsResult<()> {
+        wasi_fs_types::HostDescriptor::sync_data(&mut self.filesystem(), fd).await
+    }
+
+    async fn get_flags(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+    ) -> FsResult<wasi_fs_types::DescriptorFlags> {
+        wasi_fs_types::HostDescriptor::get_flags(&mut self.filesystem(), fd).await
+    }
+
+    async fn get_type(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+    ) -> FsResult<wasi_fs_types::DescriptorType> {
+        wasi_fs_types::HostDescriptor::get_type(&mut self.filesystem(), fd).await
+    }
+
+    async fn set_size(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        size: wasi_fs_types::Filesize,
+    ) -> FsResult<()> {
+        wasi_fs_types::HostDescriptor::set_size(&mut self.filesystem(), fd, size).await
+    }
+
+    async fn set_times(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        atim: wasi_fs_types::NewTimestamp,
+        mtim: wasi_fs_types::NewTimestamp,
+    ) -> FsResult<()> {
+        wasi_fs_types::HostDescriptor::set_times(&mut self.filesystem(), fd, atim, mtim).await
+    }
+
+    async fn read(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        len: wasi_fs_types::Filesize,
+        offset: wasi_fs_types::Filesize,
+    ) -> FsResult<(Vec<u8>, bool)> {
+        wasi_fs_types::HostDescriptor::read(&mut self.filesystem(), fd, len, offset).await
+    }
+
+    async fn write(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        buf: Vec<u8>,
+        offset: wasi_fs_types::Filesize,
+    ) -> FsResult<wasi_fs_types::Filesize> {
+        wasi_fs_types::HostDescriptor::write(&mut self.filesystem(), fd, buf, offset).await
+    }
+
+    async fn read_directory(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+    ) -> FsResult<Resource<wasi_fs_types::DirectoryEntryStream>> {
+        if let Some(dir_path) = self.dir_paths.get(&fd.rep()).cloned() {
+            self.check_wasi_fs_permission(&dir_path, false, "read-directory")
+                .await?;
+        }
+        wasi_fs_types::HostDescriptor::read_directory(&mut self.filesystem(), fd).await
+    }
+
+    async fn sync(&mut self, fd: Resource<wasi_fs_types::Descriptor>) -> FsResult<()> {
+        wasi_fs_types::HostDescriptor::sync(&mut self.filesystem(), fd).await
+    }
+
+    async fn create_directory_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        path: String,
+    ) -> FsResult<()> {
+        let (fd, full_path) = self.remap_fd_and_resolve_path(fd, &path);
+        // Only check write permission if the directory does not already exist on disk
+        if !full_path.exists() {
+            self.check_wasi_fs_permission(&full_path, true, "create-directory-at")
+                .await?;
+        }
+        wasi_fs_types::HostDescriptor::create_directory_at(&mut self.filesystem(), fd, path).await
+    }
+
+    async fn stat(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+    ) -> FsResult<wasi_fs_types::DescriptorStat> {
+        wasi_fs_types::HostDescriptor::stat(&mut self.filesystem(), fd).await
+    }
+
+    async fn stat_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        path_flags: wasi_fs_types::PathFlags,
+        path: String,
+    ) -> FsResult<wasi_fs_types::DescriptorStat> {
+        let (fd, _full_path) = self.remap_fd_and_resolve_path(fd, &path);
+        wasi_fs_types::HostDescriptor::stat_at(&mut self.filesystem(), fd, path_flags, path).await
+    }
+
+    async fn set_times_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        path_flags: wasi_fs_types::PathFlags,
+        path: String,
+        atim: wasi_fs_types::NewTimestamp,
+        mtim: wasi_fs_types::NewTimestamp,
+    ) -> FsResult<()> {
+        let (fd, full_path) = self.remap_fd_and_resolve_path(fd, &path);
+        self.check_wasi_fs_permission(&full_path, true, "set-times-at")
+            .await?;
+        wasi_fs_types::HostDescriptor::set_times_at(
+            &mut self.filesystem(),
+            fd,
+            path_flags,
+            path,
+            atim,
+            mtim,
+        )
+        .await
+    }
+
+    async fn link_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        old_path_flags: wasi_fs_types::PathFlags,
+        old_path: String,
+        new_descriptor: Resource<wasi_fs_types::Descriptor>,
+        new_path: String,
+    ) -> FsResult<()> {
+        let (fd, _full_old) = self.remap_fd_and_resolve_path(fd, &old_path);
+        let (new_descriptor, full_new) = self.remap_fd_and_resolve_path(new_descriptor, &new_path);
+        self.check_wasi_fs_permission(&full_new, true, "link-at")
+            .await?;
+        wasi_fs_types::HostDescriptor::link_at(
+            &mut self.filesystem(),
+            fd,
+            old_path_flags,
+            old_path,
+            new_descriptor,
+            new_path,
+        )
+        .await
+    }
+
+    async fn open_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        path_flags: wasi_fs_types::PathFlags,
+        path: String,
+        oflags: wasi_fs_types::OpenFlags,
+        flags: wasi_fs_types::DescriptorFlags,
+    ) -> FsResult<Resource<wasi_fs_types::Descriptor>> {
+        let (fd, full_path) = self.remap_fd_and_resolve_path(fd, &path);
+        let is_write = oflags
+            .intersects(wasi_fs_types::OpenFlags::CREATE | wasi_fs_types::OpenFlags::TRUNCATE)
+            || flags.intersects(
+                wasi_fs_types::DescriptorFlags::WRITE
+                    | wasi_fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            );
+        let is_dir_only = oflags.contains(wasi_fs_types::OpenFlags::DIRECTORY) && !is_write;
+
+        if !is_dir_only {
+            self.check_wasi_fs_permission(&full_path, is_write, "open-at")
+                .await?;
+        }
+
+        let child_fd = wasi_fs_types::HostDescriptor::open_at(
+            &mut self.filesystem(),
+            fd,
+            path_flags,
+            path,
+            oflags,
+            flags,
+        )
+        .await?;
+        self.dir_paths.insert(child_fd.rep(), full_path);
+        Ok(child_fd)
+    }
+
+    fn drop(&mut self, fd: Resource<wasi_fs_types::Descriptor>) -> anyhow::Result<()> {
+        self.dir_paths.remove(&fd.rep());
+        wasi_fs_types::HostDescriptor::drop(&mut self.filesystem(), fd)
+    }
+
+    async fn readlink_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        path: String,
+    ) -> FsResult<String> {
+        let (fd, full_path) = self.remap_fd_and_resolve_path(fd, &path);
+        self.check_wasi_fs_permission(&full_path, false, "readlink-at")
+            .await?;
+        wasi_fs_types::HostDescriptor::readlink_at(&mut self.filesystem(), fd, path).await
+    }
+
+    async fn remove_directory_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        path: String,
+    ) -> FsResult<()> {
+        let (fd, full_path) = self.remap_fd_and_resolve_path(fd, &path);
+        self.check_wasi_fs_permission(&full_path, true, "remove-directory-at")
+            .await?;
+        wasi_fs_types::HostDescriptor::remove_directory_at(&mut self.filesystem(), fd, path).await
+    }
+
+    async fn rename_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        old_path: String,
+        new_fd: Resource<wasi_fs_types::Descriptor>,
+        new_path: String,
+    ) -> FsResult<()> {
+        let (fd, full_old) = self.remap_fd_and_resolve_path(fd, &old_path);
+        let (new_fd, full_new) = self.remap_fd_and_resolve_path(new_fd, &new_path);
+        self.check_wasi_fs_permission(&full_old, true, "rename-at")
+            .await?;
+        self.check_wasi_fs_permission(&full_new, true, "rename-at")
+            .await?;
+        wasi_fs_types::HostDescriptor::rename_at(
+            &mut self.filesystem(),
+            fd,
+            old_path,
+            new_fd,
+            new_path,
+        )
+        .await
+    }
+
+    async fn symlink_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        src_path: String,
+        dest_path: String,
+    ) -> FsResult<()> {
+        let (fd, full_dest) = self.remap_fd_and_resolve_path(fd, &dest_path);
+        self.check_wasi_fs_permission(&full_dest, true, "symlink-at")
+            .await?;
+        wasi_fs_types::HostDescriptor::symlink_at(&mut self.filesystem(), fd, src_path, dest_path)
+            .await
+    }
+
+    async fn unlink_file_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        path: String,
+    ) -> FsResult<()> {
+        let (fd, full_path) = self.remap_fd_and_resolve_path(fd, &path);
+        self.check_wasi_fs_permission(&full_path, true, "unlink-file-at")
+            .await?;
+        wasi_fs_types::HostDescriptor::unlink_file_at(&mut self.filesystem(), fd, path).await
+    }
+
+    fn read_via_stream(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        offset: wasi_fs_types::Filesize,
+    ) -> FsResult<Resource<DynInputStream>> {
+        wasi_fs_types::HostDescriptor::read_via_stream(&mut self.filesystem(), fd, offset)
+    }
+
+    fn write_via_stream(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        offset: wasi_fs_types::Filesize,
+    ) -> FsResult<Resource<DynOutputStream>> {
+        wasi_fs_types::HostDescriptor::write_via_stream(&mut self.filesystem(), fd, offset)
+    }
+
+    fn append_via_stream(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+    ) -> FsResult<Resource<DynOutputStream>> {
+        wasi_fs_types::HostDescriptor::append_via_stream(&mut self.filesystem(), fd)
+    }
+
+    async fn is_same_object(
+        &mut self,
+        a: Resource<wasi_fs_types::Descriptor>,
+        b: Resource<wasi_fs_types::Descriptor>,
+    ) -> anyhow::Result<bool> {
+        wasi_fs_types::HostDescriptor::is_same_object(&mut self.filesystem(), a, b).await
+    }
+
+    async fn metadata_hash(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+    ) -> FsResult<wasi_fs_types::MetadataHashValue> {
+        wasi_fs_types::HostDescriptor::metadata_hash(&mut self.filesystem(), fd).await
+    }
+
+    async fn metadata_hash_at(
+        &mut self,
+        fd: Resource<wasi_fs_types::Descriptor>,
+        path_flags: wasi_fs_types::PathFlags,
+        path: String,
+    ) -> FsResult<wasi_fs_types::MetadataHashValue> {
+        wasi_fs_types::HostDescriptor::metadata_hash_at(
+            &mut self.filesystem(),
+            fd,
+            path_flags,
+            path,
+        )
+        .await
+    }
+}
+
+// ============================================================================
+// 3. Single Host Import for Shell Command Execution (`ragent:extension/host`)
+// ============================================================================
+
 impl ragent::extension::host::Host for HostState {
     async fn execute_command_with_timeout(
         &mut self,
         command: String,
         timeout_ms: u64,
     ) -> ragent::extension::host::CommandOutput {
-        // 1. Mandatory Host-Import Permission Check (Blind Spot 1 Fix):
-        // Regardless of tool name, any WASM guest calling execute_command_with_timeout
-        // MUST pass CoreHost::check_permission first.
+        // 1. Mandatory Host-Import Permission Check:
         if let Some(ref host) = self.core_host {
             let cap = CapabilityRequest::CommandWorkDir {
                 work_dir: self.workspace_root.clone(),
@@ -128,10 +738,6 @@ impl ragent::extension::host::Host for HostState {
         }
 
         // 2. OS Kernel Sandboxed Execution with Multi-Directory Loop & Automatic Retry:
-        // A single command (e.g. `uv run`, `pip install`, or chained `cmd1 && cmd2 && cmd3`)
-        // may require multiple external directories across either the same run or sequential retries.
-        // We loop as long as each retry discovers at least one NEW path not yet covered by `unlocked_paths`,
-        // up to MAX_SANDBOX_ESCALATION_ROUNDS.
         const MAX_SANDBOX_ESCALATION_ROUNDS: usize = 16;
         let mut unlocked_paths: Vec<PathBuf> = Vec::new();
         let mut temporary_once_paths: Vec<PathBuf> = Vec::new();
@@ -156,9 +762,6 @@ impl ragent::extension::host::Host for HostState {
                 break;
             };
 
-            // Filter to violations whose raw_path is not already covered by a previously unlocked directory
-            // (prevents infinite loops if a path is blocked by OS SIP/chmod rather than our sandbox,
-            // while still prompting for sibling directories if the user narrowed `--path` on an earlier round).
             let new_violations: Vec<_> = violations
                 .into_iter()
                 .filter(|v| !unlocked_paths.iter().any(|u| v.raw_path.starts_with(u)))
@@ -247,127 +850,6 @@ impl ragent::extension::host::Host for HostState {
 
         final_output
     }
-
-    async fn http_fetch(
-        &mut self,
-        request: ragent::extension::host::HttpRequest,
-    ) -> ragent::extension::host::HttpResponse {
-        let parsed = match reqwest::Url::parse(&request.url) {
-            Ok(u) => u,
-            Err(err) => return http_error(format!("Invalid URL '{}': {err}", request.url)),
-        };
-
-        let scheme = parsed.scheme().to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
-            return http_error(format!(
-                "Unsupported URL scheme '{scheme}'; only http and https are allowed"
-            ));
-        }
-        let Some(host_str) = parsed.host_str().map(|s| s.to_ascii_lowercase()) else {
-            return http_error(format!("URL '{}' has no host", request.url));
-        };
-        let port = parsed.port_or_known_default();
-        let method_str = if request.method.trim().is_empty() {
-            "GET".to_string()
-        } else {
-            request.method.trim().to_ascii_uppercase()
-        };
-
-        // 1. Mandatory Host-Level HTTP Permission Check
-        if let Some(ref host_cb) = self.core_host {
-            let cap = CapabilityRequest::Http {
-                scheme: scheme.clone(),
-                host: host_str.clone(),
-                port,
-                method: method_str.clone(),
-            };
-            let reason = format!(
-                "WASM extension '{}' requests HTTP {} '{}' (host: '{}')",
-                self.plugin_name, method_str, request.url, host_str
-            );
-            match host_cb
-                .check_permission_with_original_path(
-                    Some(&self.plugin_name),
-                    cap,
-                    Some(PathBuf::from(&request.url)),
-                    Some(reason),
-                )
-                .await
-            {
-                Ok(PermissionOutcome::Allowed {
-                    effective_capability,
-                    ..
-                }) => {
-                    if let Some(CapabilityRequest::Http {
-                        host: ref approved_host,
-                        ..
-                    }) = effective_capability
-                    {
-                        if !host_matches_pattern(approved_host, &host_str) {
-                            return http_error(format!(
-                                "Permission denied: approved host pattern '{approved_host}' does not cover requested host '{host_str}'"
-                            ));
-                        }
-                    }
-                }
-                Ok(PermissionOutcome::Denied { reason }) => {
-                    return http_error(format!("Permission denied for HTTP request: {reason}"));
-                }
-                Err(err) => {
-                    return http_error(format!("Permission check failed: {err}"));
-                }
-            }
-        }
-
-        // 2. Execute HTTP request via reqwest
-        let mut client_builder = reqwest::Client::builder();
-        if request.timeout_ms > 0 {
-            client_builder =
-                client_builder.timeout(std::time::Duration::from_millis(request.timeout_ms));
-        }
-        let client = match client_builder.build() {
-            Ok(c) => c,
-            Err(err) => return http_error(format!("Failed to build HTTP client: {err}")),
-        };
-
-        let method = match reqwest::Method::from_bytes(method_str.as_bytes()) {
-            Ok(m) => m,
-            Err(err) => return http_error(format!("Invalid HTTP method '{method_str}': {err}")),
-        };
-
-        let mut req_builder = client.request(method, parsed);
-        for h in &request.headers {
-            req_builder = req_builder.header(&h.name, &h.value);
-        }
-        if let Some(body) = request.body {
-            req_builder = req_builder.body(body);
-        }
-
-        match req_builder.send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let mut headers = Vec::new();
-                for (k, v) in resp.headers() {
-                    if let Ok(val_str) = v.to_str() {
-                        headers.push(ragent::extension::host::HttpHeader {
-                            name: k.as_str().to_string(),
-                            value: val_str.to_string(),
-                        });
-                    }
-                }
-                match resp.text().await {
-                    Ok(body) => ragent::extension::host::HttpResponse {
-                        status,
-                        headers,
-                        body,
-                        error: None,
-                    },
-                    Err(err) => http_error(format!("Failed to read HTTP response body: {err}")),
-                }
-            }
-            Err(err) => http_error(format!("HTTP request failed: {err}")),
-        }
-    }
 }
 
 fn command_error(error: impl ToString) -> ragent::extension::host::CommandOutput {
@@ -375,15 +857,6 @@ fn command_error(error: impl ToString) -> ragent::extension::host::CommandOutput
         exit_code: -1,
         stdout: String::new(),
         stderr: String::new(),
-        error: Some(error.to_string()),
-    }
-}
-
-fn http_error(error: impl ToString) -> ragent::extension::host::HttpResponse {
-    ragent::extension::host::HttpResponse {
-        status: 0,
-        headers: Vec::new(),
-        body: String::new(),
         error: Some(error.to_string()),
     }
 }
@@ -404,22 +877,28 @@ fn host_matches_pattern(rule: &str, host: &str) -> bool {
     false
 }
 
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            PathComponent::CurDir => {}
+            PathComponent::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
 struct PluginRuntime {
     store: Store<HostState>,
     bindings: Plugin,
-    init_config: Option<String>,
-    mounted_dirs: (Vec<PathBuf>, Vec<PathBuf>),
 }
 
 pub struct WasmPlugin {
     pub name: String,
     metadata: ExtensionMetadata,
-    component: Component,
-    linker: Arc<Linker<HostState>>,
-    workspace_root: PathBuf,
-    preopen_dirs: Vec<PathBuf>,
-    core_host: Option<Arc<dyn CoreHost>>,
-    sandbox_state: Arc<SandboxState>,
     runtime: Mutex<PluginRuntime>,
 }
 
@@ -461,20 +940,120 @@ impl WasmPlugin {
 
         let mut linker = Linker::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(tool_error)?;
-        Plugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |state| state)
-            .map_err(tool_error)?;
-        let linker = Arc::new(linker);
+        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker).map_err(tool_error)?;
 
-        let mounted_dirs = sandbox_state.wasi_preopen_dirs();
-        let wasi_ctx = build_wasi_ctx_with_mounts(workspace_root, preopen_dirs, &mounted_dirs);
+        // Override `wasi:filesystem/preopens` and `wasi:filesystem/types` with our permission-gated
+        // WASI 0.2 HostDescriptor implementation.
+        linker.allow_shadowing(true);
+        wasi_preopens::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |state| state)
+            .map_err(tool_error)?;
+        wasi_fs_types::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |state| state)
+            .map_err(tool_error)?;
+        linker.allow_shadowing(false);
+
+        Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state).map_err(tool_error)?;
+
+        let mut wasi_builder = WasiCtxBuilder::new();
+        wasi_builder.inherit_stdout().inherit_stderr();
+
+        // Map guest "." to workspace_root and set PWD so relative paths inside WASM resolve to workspace_root.
+        // Also preopen "/" so `wasi-libc` delegates all absolute path operations to our
+        // permission-checked `wasi:filesystem/types::HostDescriptor`.
+        let _ = wasi_builder.preopened_dir(workspace_root, ".", DirPerms::all(), FilePerms::all());
+        if let Some(ws_str) = workspace_root.to_str() {
+            wasi_builder.env("PWD", ws_str);
+            let _ = wasi_builder.preopened_dir(
+                workspace_root,
+                ws_str,
+                DirPerms::all(),
+                FilePerms::all(),
+            );
+        }
+        for dir in preopen_dirs {
+            if let Some(dir_str) = dir.to_str() {
+                let _ = wasi_builder.preopened_dir(dir, dir_str, DirPerms::all(), FilePerms::all());
+            }
+        }
+        #[cfg(unix)]
+        {
+            let _ = wasi_builder.preopened_dir("/", "/", DirPerms::all(), FilePerms::all());
+        }
+
+        // Hook WASI 0.2 `wasi:sockets` built-in permission check (`socket_addr_check`)
+        wasi_builder.allow_ip_name_lookup(true);
+        let core_host_for_sock = core_host.clone();
+        let plugin_for_sock = plugin_name.clone();
+        wasi_builder.socket_addr_check(move |addr, addr_use| {
+            let core_host = core_host_for_sock.clone();
+            let plugin_name = plugin_for_sock.clone();
+            Box::pin(async move {
+                let Some(host_cb) = core_host else {
+                    return true;
+                };
+                tokio::spawn(async move {
+                    let scheme = match addr_use {
+                        wasmtime_wasi::sockets::SocketAddrUse::TcpBind
+                        | wasmtime_wasi::sockets::SocketAddrUse::TcpConnect => "tcp",
+                        _ => "udp",
+                    }
+                    .to_string();
+                    let host_str = addr.ip().to_string();
+                    let port = Some(addr.port());
+                    let method_str = format!("{addr_use:?}");
+                    let orig = format!("{scheme}://{addr}");
+                    let cap = CapabilityRequest::Http {
+                        scheme,
+                        host: host_str.clone(),
+                        port,
+                        method: method_str.clone(),
+                    };
+                    let reason = format!(
+                        "WASI 0.2 Socket (`wasi:sockets`) from extension '{plugin_name}': {method_str} {addr}"
+                    );
+                    match host_cb
+                        .check_permission_with_original_path(
+                            Some(&plugin_name),
+                            cap,
+                            Some(PathBuf::from(orig)),
+                            Some(reason),
+                        )
+                        .await
+                    {
+                        Ok(PermissionOutcome::Allowed {
+                            effective_capability,
+                            ..
+                        }) => {
+                            if let Some(CapabilityRequest::Http {
+                                host: ref approved_host,
+                                ..
+                            }) = effective_capability
+                            {
+                                host_matches_pattern(approved_host, &host_str)
+                            } else {
+                                true
+                            }
+                        }
+                        _ => false,
+                    }
+                })
+                .await
+                .unwrap_or(false)
+            })
+        });
 
         let host_state = HostState {
-            wasi_ctx,
+            wasi_ctx: wasi_builder.build(),
+            http_ctx: WasiHttpCtx::new(),
             table: ResourceTable::new(),
             plugin_name: plugin_name.clone(),
             workspace_root: workspace_root.to_path_buf(),
-            core_host: core_host.clone(),
-            sandbox_state: sandbox_state.clone(),
+            core_host,
+            sandbox_state,
+            dir_paths: HashMap::new(),
+            ws_fd_rep: None,
+            root_fd_rep: None,
+            invoke_approved_writes: Vec::new(),
+            invoke_approved_reads: Vec::new(),
         };
 
         let mut store = Store::new(engine, host_state);
@@ -494,18 +1073,7 @@ impl WasmPlugin {
         Ok(Self {
             name: plugin_name,
             metadata,
-            component,
-            linker,
-            workspace_root: workspace_root.to_path_buf(),
-            preopen_dirs: preopen_dirs.to_vec(),
-            core_host,
-            sandbox_state,
-            runtime: Mutex::new(PluginRuntime {
-                store,
-                bindings,
-                init_config: None,
-                mounted_dirs,
-            }),
+            runtime: Mutex::new(PluginRuntime { store, bindings }),
         })
     }
 
@@ -514,429 +1082,87 @@ impl WasmPlugin {
     }
 
     pub async fn initialize(&self, config: &serde_json::Value) -> Result<(), CoreError> {
-        let config_str = serde_json::to_string(config)?;
+        let config = serde_json::to_string(config)?;
         let mut runtime = self.runtime.lock().await;
-        runtime.init_config = Some(config_str.clone());
-        let PluginRuntime {
-            store, bindings, ..
-        } = &mut *runtime;
+        let PluginRuntime { store, bindings } = &mut *runtime;
         bindings
             .ragent_extension_lifecycle()
-            .call_initialize(store, &config_str)
+            .call_initialize(store, &config)
             .await
             .map_err(tool_error)?
             .map_err(|error| CoreError::ToolError(format!("{}: {error}", self.name)))
     }
 
-    async fn ensure_wasi_mounts_up_to_date(
-        &self,
-        runtime: &mut PluginRuntime,
-    ) -> Result<(), CoreError> {
-        let current_dirs = self.sandbox_state.wasi_preopen_dirs();
-        if current_dirs == runtime.mounted_dirs {
-            return Ok(());
-        }
-
-        let engine = global_engine()?;
-        let wasi_ctx =
-            build_wasi_ctx_with_mounts(&self.workspace_root, &self.preopen_dirs, &current_dirs);
-        let host_state = HostState {
-            wasi_ctx,
-            table: ResourceTable::new(),
-            plugin_name: self.name.clone(),
-            workspace_root: self.workspace_root.clone(),
-            core_host: self.core_host.clone(),
-            sandbox_state: self.sandbox_state.clone(),
-        };
-        let mut store = Store::new(engine, host_state);
-        let bindings = Plugin::instantiate_async(&mut store, &self.component, &self.linker)
-            .await
-            .map_err(tool_error)?;
-        if let Some(ref cfg) = runtime.init_config {
-            bindings
-                .ragent_extension_lifecycle()
-                .call_initialize(&mut store, cfg)
-                .await
-                .map_err(tool_error)?
-                .map_err(|error| CoreError::ToolError(format!("{}: {error}", self.name)))?;
-        }
-        runtime.store = store;
-        runtime.bindings = bindings;
-        runtime.mounted_dirs = current_dirs;
-        Ok(())
-    }
-
     pub async fn invoke(&self, request: &HookRequest) -> Result<serde_json::Value, CoreError> {
-        let request_str = serde_json::to_string(request)?;
-        if request.hook != "tools.call" {
-            let mut runtime = self.runtime.lock().await;
-            self.ensure_wasi_mounts_up_to_date(&mut runtime).await?;
-            let PluginRuntime {
-                store, bindings, ..
-            } = &mut *runtime;
-            let response = bindings
-                .ragent_extension_lifecycle()
-                .call_invoke(store, &request_str)
-                .await
-                .map_err(tool_error)?
-                .map_err(|error| CoreError::ToolError(format!("{}: {error}", self.name)))?;
-            return serde_json::from_str(&response).map_err(CoreError::Json);
-        }
-
-        // For `tools.call`, enforce WASM file permissions, dynamically mount approved directories
-        // into WASI, and automatically escalate if a WASI file operation fails on an unmounted path.
-        let mut temporary_once_paths: Vec<PathBuf> = Vec::new();
-        let mut unlocked_paths: Vec<PathBuf> = Vec::new();
-
-        let tool_name = request
-            .payload
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-
-        // 1. Pre-check file capability if the tool call includes a `path` argument
-        if let Some(path_str) = request
-            .payload
-            .get("arguments")
-            .and_then(|a| a.get("path"))
-            .and_then(|v| v.as_str())
-        {
-            let full_path = resolve_against_workspace(&self.workspace_root, path_str);
-            let is_write = matches!(tool_name, "write_file" | "replace_in_file")
-                || tool_name.contains("write")
-                || tool_name.contains("edit")
-                || tool_name.contains("replace");
-
-            if let Some(denied_resp) = self
-                .request_and_unlock_wasm_file_access(
-                    tool_name,
-                    &full_path,
-                    is_write,
-                    &mut unlocked_paths,
-                    &mut temporary_once_paths,
-                )
-                .await?
-            {
-                return Ok(denied_resp);
-            }
-        }
-
-        // 2. Execute inside WASM with automatic WASI file escalation loop (for tools with custom argument names or multi-file access)
-        const MAX_WASM_FILE_ESCALATION_ROUNDS: usize = 8;
-        let mut final_val = serde_json::Value::Null;
-
-        for _round in 0..MAX_WASM_FILE_ESCALATION_ROUNDS {
-            let response_str = {
-                let mut runtime = self.runtime.lock().await;
-                self.ensure_wasi_mounts_up_to_date(&mut runtime).await?;
-                let PluginRuntime {
-                    store, bindings, ..
-                } = &mut *runtime;
-                bindings
-                    .ragent_extension_lifecycle()
-                    .call_invoke(store, &request_str)
-                    .await
-                    .map_err(tool_error)?
-                    .map_err(|error| CoreError::ToolError(format!("{}: {error}", self.name)))?
-            };
-
-            let val: serde_json::Value =
-                serde_json::from_str(&response_str).map_err(CoreError::Json)?;
-            let is_failed = val
-                .get("payload")
-                .and_then(|p| p.get("success"))
-                .and_then(|s| s.as_bool())
-                == Some(false);
-
-            if !is_failed || self.core_host.is_none() {
-                final_val = val;
-                break;
-            }
-
-            let err_text = format!(
-                "{}\n{}",
-                val.get("payload")
-                    .and_then(|p| p.get("output"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default(),
-                val.get("payload")
-                    .and_then(|p| p.get("error"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-            );
-
-            let candidates = extract_wasm_file_error_paths(&err_text, &self.workspace_root);
-            let new_candidates: Vec<(PathBuf, bool)> = candidates
-                .into_iter()
-                .filter(|(p, _)| !unlocked_paths.iter().any(|u| p.starts_with(u)))
-                .collect();
-
-            if new_candidates.is_empty() {
-                final_val = val;
-                break;
-            }
-
-            let mut all_approved = true;
-            for (cand_path, is_write) in new_candidates {
-                if let Some(denied_resp) = self
-                    .request_and_unlock_wasm_file_access(
-                        tool_name,
-                        &cand_path,
-                        is_write,
-                        &mut unlocked_paths,
-                        &mut temporary_once_paths,
-                    )
-                    .await?
-                {
-                    final_val = denied_resp;
-                    all_approved = false;
-                    break;
-                }
-            }
-
-            if !all_approved {
-                break;
-            }
-        }
-
-        // 3. Revoke any `AllowOnce` paths so they are unmounted on subsequent calls
-        for tmp_path in temporary_once_paths {
-            self.sandbox_state.revoke_temporary_path(&tmp_path);
-        }
-
-        Ok(final_val)
-    }
-
-    async fn request_and_unlock_wasm_file_access(
-        &self,
-        tool_name: &str,
-        full_path: &Path,
-        is_write: bool,
-        unlocked_paths: &mut Vec<PathBuf>,
-        temporary_once_paths: &mut Vec<PathBuf>,
-    ) -> Result<Option<serde_json::Value>, CoreError> {
-        let Some(ref host) = self.core_host else {
-            return Ok(None);
-        };
-
-        let in_workspace = full_path.starts_with(&self.workspace_root);
-        let suggested_path = if in_workspace {
-            full_path.to_path_buf()
-        } else {
-            crate::sandbox::normalize_violation_to_request_dir(full_path)
-        };
-
-        let cap = if is_write {
-            CapabilityRequest::FileWrite {
-                path: suggested_path.clone(),
-            }
-        } else {
-            CapabilityRequest::FileRead {
-                path: suggested_path.clone(),
-            }
-        };
-
-        let reason = format!(
-            "WASM tool '{tool_name}' requires {} access to '{}' (suggested path: '{}')",
-            if is_write { "file-write" } else { "file-read" },
-            full_path.display(),
-            suggested_path.display()
-        );
-
-        match host
-            .check_permission_with_original_path(
-                Some(&self.name),
-                cap.clone(),
-                Some(full_path.to_path_buf()),
-                Some(reason),
-            )
-            .await?
-        {
-            PermissionOutcome::Allowed {
-                effective_capability,
-                persist_in_activation,
-            } => {
-                let granted_cap = effective_capability.unwrap_or(cap);
-                let approved_path = granted_cap
-                    .path()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or(suggested_path);
-
-                // Verify that the approved directory/path covers the requested file path
-                let norm_full = crate::sandbox::canonicalize_or_normalize(full_path);
-                let norm_approved = crate::sandbox::canonicalize_or_normalize(&approved_path);
-                if !norm_full.starts_with(&norm_approved) && !full_path.starts_with(&approved_path)
-                {
-                    let msg = format!(
-                        "Permission denied: approved path '{}' does not cover requested file '{}'",
-                        approved_path.display(),
-                        full_path.display()
-                    );
-                    return Ok(Some(serde_json::json!({
-                        "action": "continue",
-                        "payload": {
-                            "success": false,
-                            "output": msg,
-                            "error": msg,
-                        }
-                    })));
-                }
-
-                // For external paths, ensure the directory exists on host (for write) and unlock in SandboxState
-                // so WASI `preopened_dir` mounts it before `call_invoke`.
-                let mount_dir = if approved_path.is_dir() {
-                    approved_path.clone()
-                } else if !in_workspace && is_write && approved_path.extension().is_none() {
-                    let _ = std::fs::create_dir_all(&approved_path);
-                    approved_path.clone()
-                } else {
-                    approved_path
-                        .parent()
-                        .unwrap_or(&self.workspace_root)
-                        .to_path_buf()
-                };
-
-                // Also track the un-canonicalized parent directory (e.g. `/var/...` vs `/private/var/...` on macOS)
-                // so WASI guest path matching succeeds regardless of symlink resolution.
-                let raw_parent = full_path.parent().map(|p| p.to_path_buf());
-
-                if is_write {
-                    if !in_workspace && !mount_dir.exists() {
-                        let _ = std::fs::create_dir_all(&mount_dir);
-                    }
-                    self.sandbox_state.allow_writable_path(mount_dir.clone());
-                    if let Some(ref rp) = raw_parent {
-                        if rp != &mount_dir {
-                            let _ = std::fs::create_dir_all(rp);
-                            self.sandbox_state.allow_writable_path(rp.clone());
-                        }
-                    }
-                } else {
-                    self.sandbox_state.allow_readable_path(mount_dir.clone());
-                    if let Some(ref rp) = raw_parent {
-                        if rp != &mount_dir {
-                            self.sandbox_state.allow_readable_path(rp.clone());
-                        }
-                    }
-                }
-
-                unlocked_paths.push(mount_dir.clone());
-                if let Some(ref rp) = raw_parent {
-                    unlocked_paths.push(rp.clone());
-                }
-                unlocked_paths.push(full_path.to_path_buf());
-                if !persist_in_activation {
-                    temporary_once_paths.push(mount_dir);
-                    if let Some(rp) = raw_parent {
-                        temporary_once_paths.push(rp);
-                    }
-                }
-                Ok(None)
-            }
-            PermissionOutcome::Denied { reason } => {
-                let msg = format!("Permission denied: {reason}");
-                Ok(Some(serde_json::json!({
-                    "action": "continue",
-                    "payload": {
-                        "success": false,
-                        "output": msg,
-                        "error": msg,
-                    }
-                })))
-            }
-        }
+        let request = serde_json::to_string(request)?;
+        let mut runtime = self.runtime.lock().await;
+        let PluginRuntime { store, bindings } = &mut *runtime;
+        store.data_mut().invoke_approved_writes.clear();
+        store.data_mut().invoke_approved_reads.clear();
+        let response = bindings
+            .ragent_extension_lifecycle()
+            .call_invoke(&mut *store, &request)
+            .await
+            .map_err(tool_error)?
+            .map_err(|error| CoreError::ToolError(format!("{}: {error}", self.name)))?;
+        store.data_mut().invoke_approved_writes.clear();
+        store.data_mut().invoke_approved_reads.clear();
+        serde_json::from_str(&response).map_err(CoreError::Json)
     }
 
     pub async fn shutdown(&self) -> Result<(), CoreError> {
         let mut runtime = self.runtime.lock().await;
-        let PluginRuntime {
-            store, bindings, ..
-        } = &mut *runtime;
+        let PluginRuntime { store, bindings } = &mut *runtime;
         bindings
             .ragent_extension_lifecycle()
             .call_shutdown(store)
             .await
             .map_err(tool_error)
     }
-}
 
-fn build_wasi_ctx_with_mounts(
-    workspace_root: &Path,
-    preopen_dirs: &[PathBuf],
-    mounted_dirs: &(Vec<PathBuf>, Vec<PathBuf>),
-) -> WasiCtx {
-    let mut wasi_builder = WasiCtxBuilder::new();
-    wasi_builder.inherit_stdout().inherit_stderr();
-
-    // Map guest "." to workspace_root so relative paths inside WASM resolve to workspace_root
-    let _ = wasi_builder.preopened_dir(workspace_root, ".", DirPerms::all(), FilePerms::all());
-    if let Some(ws_str) = workspace_root.to_str() {
-        let _ =
-            wasi_builder.preopened_dir(workspace_root, ws_str, DirPerms::all(), FilePerms::all());
+    /// Invokes WASI 0.2 `WasiHttpView::send_request` (`wasi:http/outgoing-handler`) directly on this plugin's
+    /// `HostState` to verify WASI 0.2 HTTP permission enforcement without adding custom WIT host imports.
+    pub async fn invoke_wasi_http_for_test(
+        &self,
+        method: &str,
+        url: &str,
+    ) -> Result<(u16, String), CoreError> {
+        use http_body_util::{BodyExt, Empty};
+        let mut runtime = self.runtime.lock().await;
+        let parsed: hyper::Uri = url.parse().map_err(tool_error)?;
+        let use_tls = parsed.scheme_str() == Some("https");
+        let empty_body = Empty::<bytes::Bytes>::new()
+            .map_err(|never| match never {})
+            .boxed();
+        let req = hyper::Request::builder()
+            .method(method)
+            .uri(parsed)
+            .body(empty_body)
+            .map_err(tool_error)?;
+        let cfg = wasmtime_wasi_http::types::OutgoingRequestConfig {
+            use_tls,
+            connect_timeout: std::time::Duration::from_secs(10),
+            first_byte_timeout: std::time::Duration::from_secs(10),
+            between_bytes_timeout: std::time::Duration::from_secs(10),
+        };
+        let mut fut_resp = WasiHttpView::send_request(runtime.store.data_mut(), req, cfg)
+            .map_err(|e| CoreError::ToolError(e.to_string()))?;
+        wasmtime_wasi::p2::Pollable::ready(&mut fut_resp).await;
+        let incoming = fut_resp
+            .unwrap_ready()
+            .map_err(tool_error)?
+            .map_err(|code| CoreError::ToolError(format!("WASI HTTP error: {code:?}")))?;
+        let status = incoming.resp.status().as_u16();
+        let body_bytes = incoming
+            .resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(tool_error)?
+            .to_bytes();
+        let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+        Ok((status, body_str))
     }
-    for dir in preopen_dirs {
-        if dir.exists() {
-            if let Some(dir_str) = dir.to_str() {
-                let _ = wasi_builder.preopened_dir(dir, dir_str, DirPerms::all(), FilePerms::all());
-            }
-        }
-    }
-    for w_dir in &mounted_dirs.0 {
-        if w_dir.exists() {
-            if let Some(dir_str) = w_dir.to_str() {
-                let _ =
-                    wasi_builder.preopened_dir(w_dir, dir_str, DirPerms::all(), FilePerms::all());
-            }
-        }
-    }
-    for r_dir in &mounted_dirs.1 {
-        if r_dir.exists() {
-            if let Some(dir_str) = r_dir.to_str() {
-                let _ = wasi_builder.preopened_dir(r_dir, dir_str, DirPerms::READ, FilePerms::READ);
-            }
-        }
-    }
-    wasi_builder.build()
-}
-
-fn resolve_against_workspace(workspace_root: &Path, raw: &str) -> PathBuf {
-    let p = Path::new(raw);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        workspace_root.join(p)
-    }
-}
-
-fn extract_wasm_file_error_paths(text: &str, workspace_root: &Path) -> Vec<(PathBuf, bool)> {
-    let mut out = Vec::new();
-    let lower = text.to_ascii_lowercase();
-    let is_write = lower.contains("write")
-        || lower.contains("create")
-        || lower.contains("replace")
-        || lower.contains("modify");
-
-    for line in text.lines() {
-        let mut rest = line;
-        while let Some(start) = rest.find('\'') {
-            let after = &rest[start + 1..];
-            if let Some(end) = after.find('\'') {
-                let candidate = &after[..end];
-                if candidate.starts_with('/') {
-                    let p = PathBuf::from(candidate);
-                    if !p.starts_with(workspace_root)
-                        && !out.iter().any(|(existing, _)| existing == &p)
-                    {
-                        out.push((p, is_write));
-                    }
-                }
-                rest = &after[end + 1..];
-            } else {
-                break;
-            }
-        }
-    }
-    out
 }
 
 fn tool_error(error: impl std::fmt::Display) -> CoreError {

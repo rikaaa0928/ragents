@@ -8,28 +8,7 @@ interface host {
         error: option<string>,
     }
 
-    record http-header {
-        name: string,
-        value: string,
-    }
-
-    record http-request {
-        method: string,
-        url: string,
-        headers: list<http-header>,
-        body: option<string>,
-        timeout-ms: u64,
-    }
-
-    record http-response {
-        status: u16,
-        headers: list<http-header>,
-        body: string,
-        error: option<string>,
-    }
-
     execute-command-with-timeout: func(command: string, timeout-ms: u64) -> command-output;
-    http-fetch: func(request: http-request) -> http-response;
 }
 
 interface lifecycle {

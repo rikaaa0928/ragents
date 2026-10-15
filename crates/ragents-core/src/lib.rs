@@ -716,29 +716,16 @@ mod tests {
         let resp2 = make_openresponses_resource(
             "resp_u2",
             "gpt-4.1",
-            vec![
-                Item::FunctionCall {
-                    id: Some("fc_r1".to_string()),
-                    call_id: "call_r1".to_string(),
-                    name: "read_file".to_string(),
-                    arguments: serde_json::json!({
-                        "path": ext_file.to_string_lossy(),
-                    })
-                    .to_string(),
-                    status: None,
-                },
-                Item::FunctionCall {
-                    id: Some("fc_h1".to_string()),
-                    call_id: "call_h1".to_string(),
-                    name: "http_fetch".to_string(),
-                    arguments: serde_json::json!({
-                        "url": http_url,
-                        "method": "GET"
-                    })
-                    .to_string(),
-                    status: None,
-                },
-            ],
+            vec![Item::FunctionCall {
+                id: Some("fc_r1".to_string()),
+                call_id: "call_r1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": ext_file.to_string_lossy(),
+                })
+                .to_string(),
+                status: None,
+            }],
             None,
         );
         let resp3 = make_openresponses_resource(
@@ -776,8 +763,8 @@ mod tests {
         let run_spec = CoreRunSpec {
             session_id: SessionId::new("sess_uni"),
             activation_id: ActivationId::new("act_uni"),
-            workspace_root: ws_root,
-            session_tmp_dir: sess_tmp,
+            workspace_root: ws_root.clone(),
+            session_tmp_dir: sess_tmp.clone(),
             effective_config: cfg,
             effective_permissions: PermissionPolicyLayer::default(),
             model_endpoint: ModelEndpointConfig {
@@ -808,7 +795,31 @@ mod tests {
             "hello from dynamically mounted WASI!"
         );
 
-        // Verify all 3 capability requests (FileWrite, FileRead, Http) were checked with original_path
+        // Also invoke WASI 0.2 `WasiHttpView::send_request` (`wasi:http/outgoing-handler`) on WasmPlugin
+        let sandbox = Arc::new(SandboxState::from_policy(
+            SandboxMode::Auto,
+            &ws_root,
+            &sess_tmp,
+            &PermissionPolicyLayer::default(),
+        ));
+        let plugin = crate::hooks::runtime::WasmPlugin::load_from_file_with_host(
+            "file_editor",
+            &editor_wasm_path,
+            &ws_root,
+            &[sess_tmp],
+            Some(host.clone()),
+            sandbox,
+        )
+        .await
+        .unwrap();
+        let (http_status, http_body) = plugin
+            .invoke_wasi_http_for_test("GET", &http_url)
+            .await
+            .expect("WASI 0.2 HTTP request");
+        assert_eq!(http_status, 200);
+        assert_eq!(http_body, "wasm_http_ok_2026");
+
+        // Verify all 3 capability requests (FileWrite, FileRead, Http) were checked via WASI 0.2 with original_path
         let caps = host.checked_capabilities.lock().unwrap();
         let origs = host.checked_original_paths.lock().unwrap();
         assert_eq!(caps.len(), 3, "caps: {caps:?}");
@@ -817,19 +828,16 @@ mod tests {
         assert!(
             matches!(caps[2], CapabilityRequest::Http { ref host, port: Some(p), .. } if host == "127.0.0.1" && p == addr.port())
         );
-        assert_eq!(origs[0].as_ref(), Some(&ext_file));
+        // `create_directory_at` on `ext_dir` was checked first during `write_file`, then `open_at` on `ext_file` during `read_file`
+        assert_eq!(origs[0].as_ref(), Some(&ext_dir));
         assert_eq!(origs[1].as_ref(), Some(&ext_file));
         assert_eq!(origs[2].as_ref(), Some(&std::path::PathBuf::from(http_url)));
 
-        // Verify tool outputs in context contain the read content and the HTTP response body
+        // Verify tool outputs in context contain the read content
         let items = host.items.lock().unwrap();
         let all_outputs = serde_json::to_string(&*items).unwrap();
         assert!(
             all_outputs.contains("hello from dynamically mounted WASI!"),
-            "all_outputs: {all_outputs}"
-        );
-        assert!(
-            all_outputs.contains("wasm_http_ok_2026"),
             "all_outputs: {all_outputs}"
         );
 

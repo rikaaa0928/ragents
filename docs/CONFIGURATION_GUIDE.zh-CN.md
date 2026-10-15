@@ -173,21 +173,21 @@ config = { inject_thinking_budget = 4096 }
 
 ---
 
-## 4. 三大能力域统一权限审批说明（Shell / WASM 文件 / WASM 网络）
+## 4. 三大能力域统一权限审批说明（Shell / WASI 0.2 文件 / WASI 0.2 网络）
 
-`ragents` 将外部能力统一收敛为三大权限域，所有权限检查均强制收口在 `ragents-core` 的 WASM Runtime / Host Import 层：
+`ragents` 遵循**最小宿主导入原则**：WIT `ragent:extension/host` 仅提供 `execute-command-with-timeout` 一个宿主函数，WASM 内部的文件读写与网络请求全部通过 **WASI 0.2 标准内置权限机制** 管控：
 
 1. **宿主提供的 Shell（`execute-command-with-timeout` + OS 内核沙箱）**：
    - **macOS**：通过 `/usr/bin/sandbox-exec`（Seatbelt）在内核层拦截未授权的 `file-write*` 与被拒的 `file-read-data`。
    - **Linux**：通过 `/usr/bin/bwrap`（Bubblewrap）只读根挂载 + 授权目录读写绑定。
    - **Windows**：不做额外 OS 沙箱限制。
    - 当命令触碰外部目录失败时，自动捕获路径、发起递进审批并在获批后原地重跑命令。
-2. **WASM 文件系统（WASI `preopened_dir` 动态挂载 + `FileRead` / `FileWrite`）**：
-   - 当 `file_editor.wasm`（`read_file` / `write_file` / `replace_in_file`）、`image_viewer.wasm` 或自定义 WASM 插件读写工作区外文件时，自动触发 `FileRead` / `FileWrite` 审批。
-   - 获批后，`WasmPlugin` 自动将批准的目录通过 `WasiCtxBuilder::preopened_dir` 动态挂载进 WASI 容器（读权限挂载为 `DirPerms::READ`，写权限挂载为 `DirPerms::all()`），若为 `allow-once` 则在调用结束后自动卸载。
-3. **WASM 网络请求（WIT `http-fetch` + `CapabilityRequest::Http`）**：
-   - 当 WASM 扩展通过 `http-fetch` 发起 HTTP/HTTPS 请求时，宿主自动解析 URL 的 `scheme`、`host`、`port` 并匹配 `http_hosts` 策略。
-   - 若域名未在 `allow` 列表中，自动触发 `CapabilityRequest::Http` 交互式审批。
+2. **WASI 0.2 文件系统（`wasi:filesystem/types::HostDescriptor`）**：
+   - 直接在 WASI 0.2 `HostDescriptor` 的 `open-at`、`create-directory-at`、`unlink-file-at`、`remove-directory-at`、`rename-at` 等异步调用处拦截权限。
+   - 当任何 WASM 插件通过标准库 `std::fs` 读写工作区外或受限目录的文件时，Wasmtime 在 `open-at` 处自动挂起协程并发起 `FileRead` / `FileWrite` 审批；用户批准后当场完成 `open-at` 并返回文件句柄，无需重启或重试 WASM 函数。
+3. **WASI 0.2 网络请求（`wasi:http/outgoing-handler` & `wasi:sockets`）**：
+   - 通过 Wasmtime WASI 0.2 内置的 `WasiHttpView::send_request` 与 `WasiCtxBuilder::socket_addr_check` 拦截所有出站 HTTP/HTTPS 请求与底层 TCP/UDP Socket 连接。
+   - 若目标域名或地址未在 `http_hosts.allow` 列表中，自动触发 `CapabilityRequest::Http` 交互式审批。
 4. **双路径展示与手动调整（`--path`）**：
    - 触发权限请求时，同时记录并展示：
      - `original_path`：实际触发拦截的具体文件路径（如 `/Users/alice/.cache/uv/sdists-v6/.git`）或完整请求 URL（如 `https://api.example.com/v1/data`）
