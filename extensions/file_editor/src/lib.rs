@@ -46,6 +46,11 @@ struct ToolResult {
 }
 
 #[derive(Deserialize)]
+struct ReadFileArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct WriteFileArgs {
     path: String,
     content: String,
@@ -99,6 +104,22 @@ impl exports::ragent::extension::lifecycle::Guest for FileEditorExtension {
                     .get_mut("tools")
                     .and_then(serde_json::Value::as_array_mut)
                     .ok_or("agent.prepare payload has no tools array")?;
+
+                tools.push(serde_json::json!({
+                    "enabled": true,
+                    "name": "read_file",
+                    "description": "读取指定路径的文本文件内容。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "目标文件路径"
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                }));
 
                 tools.push(serde_json::json!({
                     "enabled": true,
@@ -167,6 +188,25 @@ impl exports::ragent::extension::lifecycle::Guest for FileEditorExtension {
 fn call_tool(payload: serde_json::Value) -> Result<String, String> {
     let call: ToolCallRequest = serde_json::from_value(payload).map_err(|e| e.to_string())?;
     let result = match call.name.as_str() {
+        "read_file" => match serde_json::from_value::<ReadFileArgs>(call.arguments) {
+            Ok(args) => match fs::read_to_string(&args.path) {
+                Ok(content) => ToolResult {
+                    success: true,
+                    output: content,
+                    error: None,
+                },
+                Err(error) => ToolResult {
+                    success: false,
+                    output: format!("failed to read file '{}': {error}", args.path),
+                    error: Some(error.to_string()),
+                },
+            },
+            Err(e) => ToolResult {
+                success: false,
+                output: format!("invalid arguments for read_file: {e}"),
+                error: Some(e.to_string()),
+            },
+        },
         "write_file" => match serde_json::from_value::<WriteFileArgs>(call.arguments) {
             Ok(args) => handle_write_file(&args.path, &args.content),
             Err(e) => ToolResult {

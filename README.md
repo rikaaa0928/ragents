@@ -22,9 +22,11 @@
    - 默认采用 `SubprocessExecutor`：每次 `Activation` 派生独立 OS 子进程（`ragents internal-core-worker`），自动剥离环境变量中的 `RAGENTS_API_KEY`，通过单 Daemon 共享的 Unix Domain Socket（`SharedIpcHub`，不可用时自动回退本地回环 TCP）与父进程通信。
    - Wasmtime 组件预编译缓存（`.cwasm` SHA-256 内容寻址，`< 1ms` 极速加载）。
    - **OS 内核级命令沙箱**：macOS 下自动启用 `/usr/bin/sandbox-exec`（Seatbelt），Linux 下自动启用 `/usr/bin/bwrap`（Bubblewrap），拦截一切未授权的工作区外文件写入与受限目录读取。
-6. **全自动沙箱越界检测、目录微调与 5 级权限审批**
-   - 当 `uv run`、`pip install` 等命令访问工作区外部目录（如 `~/.cache/uv`）被内核沙箱拦截时，系统在**单次工具调用内部**自动捕获受阻路径（支持 `stderr` 快速提取 + macOS 内核沙箱日志兜底），支持单次命令内**多目录循环递进审批**，获批后原地自动解锁沙箱并重跑命令。
-   - 审批时同时展示 `original_path`（原始受阻文件路径）与 `suggested_path`（自动收敛建议目录），支持用户通过 `--path` 手动收窄或放宽授权目录，并提供 **`allow-once` / `allow-activation` / `allow-session` / `allow-workspace` / `allow-node`** 5 级生效周期。
+6. **三大能力边界统一鉴权（Shell + WASM 文件 + WASM 网络）与 5 级权限审批**
+   - **宿主 Shell（`execute-command-with-timeout`）**：当 `uv run`、`pip install` 等命令访问工作区外部目录（如 `~/.cache/uv`）被内核沙箱拦截时，系统在**单次工具调用内部**自动捕获受阻路径（支持 `stderr` 快速提取 + macOS 内核沙箱日志兜底），支持单次命令内**多目录循环递进审批**，获批后原地自动解锁沙箱并重跑命令。
+   - **WASM 文件系统（`read_file` / `write_file` / `replace_in_file` / `view_image`）**：当 WASM 工具访问工作区外部文件时，自动触发 `FileRead` / `FileWrite` 权限申请；一旦用户批准，`WasmPlugin` 在运行时**动态将该外部目录通过 `preopened_dir` 挂载进 WASI 虚拟文件系统**并完成读写（若为 `allow-once` 则在单次调用结束后立即从 WASI 卸载）。
+   - **WASM 网络（`http-fetch`）**：所有 WASM 插件通过受控宿主接口发起 HTTP/HTTPS 请求时，自动解析目标 `scheme`、`host`、`port` 并触发 `CapabilityRequest::Http` 权限校验；对未在白名单中的域名自动挂起并发起交互式审批（支持 `--path "*.example.com"` 域名通配符微调）。
+   - 审批时统一展示 `original_path`（原始受阻文件路径或完整 URL）与 `suggested_path`（自动收敛建议目录或目标域名），支持用户通过 `--path` 手动收窄或放宽范围，并提供 **`allow-once` / `allow-activation` / `allow-session` / `allow-workspace` / `allow-node`** 5 级生效周期。
 7. **`agent-daemon` 与 `api-server` 双驱动扩展体系**
    - 同时支持 **Native Rust Trait**、**WASM 组件（`.wasm`/`.cwasm`）** 与 **HTTP/UDS Webhook（`http://` / `https://` / `unix://`）**。
    - `agent-daemon` 支持拦截并改写模型请求参数（标准字段与供应商私有扩展字段）、注入自定义 Header、动态轮换 `api_key`、后处理模型响应及自定义权限策略。

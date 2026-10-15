@@ -129,8 +129,10 @@ default = "ask"
 # default = "ask"
 
 [default_permissions.http_hosts]
+# 允许直接访问的域名列表（支持 "*"、"api.example.com" 或 "*.example.com" 通配符）
+# 若不配置 allow，默认策略为 "ask"，当 WASM 扩展调用 http-fetch 访问外部域名时会自动弹出交互式权限申请
 allow = ["*"]
-default = "allow"
+default = "ask"
 
 # ============================================================================
 # 5. Daemon 拦截器扩展（支持 WASM 组件与 HTTP/UDS Webhook）
@@ -171,22 +173,29 @@ config = { inject_thinking_budget = 4096 }
 
 ---
 
-## 4. 权限生效周期与动态目录审批说明
+## 4. 三大能力域统一权限审批说明（Shell / WASM 文件 / WASM 网络）
 
-当 Agent 执行工具或外部命令（如 `uv run`、`pip install`）触碰 `workspace_root` 以外的目录时：
+`ragents` 将外部能力统一收敛为三大权限域，所有权限检查均强制收口在 `ragents-core` 的 WASM Runtime / Host Import 层：
 
-1. **OS 内核级沙箱拦截**：
+1. **宿主提供的 Shell（`execute-command-with-timeout` + OS 内核沙箱）**：
    - **macOS**：通过 `/usr/bin/sandbox-exec`（Seatbelt）在内核层拦截未授权的 `file-write*` 与被拒的 `file-read-data`。
    - **Linux**：通过 `/usr/bin/bwrap`（Bubblewrap）只读根挂载 + 授权目录读写绑定。
    - **Windows**：不做额外 OS 沙箱限制。
-2. **双路径展示与手动调整（`--path`）**：
+   - 当命令触碰外部目录失败时，自动捕获路径、发起递进审批并在获批后原地重跑命令。
+2. **WASM 文件系统（WASI `preopened_dir` 动态挂载 + `FileRead` / `FileWrite`）**：
+   - 当 `file_editor.wasm`（`read_file` / `write_file` / `replace_in_file`）、`image_viewer.wasm` 或自定义 WASM 插件读写工作区外文件时，自动触发 `FileRead` / `FileWrite` 审批。
+   - 获批后，`WasmPlugin` 自动将批准的目录通过 `WasiCtxBuilder::preopened_dir` 动态挂载进 WASI 容器（读权限挂载为 `DirPerms::READ`，写权限挂载为 `DirPerms::all()`），若为 `allow-once` 则在调用结束后自动卸载。
+3. **WASM 网络请求（WIT `http-fetch` + `CapabilityRequest::Http`）**：
+   - 当 WASM 扩展通过 `http-fetch` 发起 HTTP/HTTPS 请求时，宿主自动解析 URL 的 `scheme`、`host`、`port` 并匹配 `http_hosts` 策略。
+   - 若域名未在 `allow` 列表中，自动触发 `CapabilityRequest::Http` 交互式审批。
+4. **双路径展示与手动调整（`--path`）**：
    - 触发权限请求时，同时记录并展示：
-     - `original_path`：实际触发拦截的具体文件路径（如 `/Users/alice/.cache/uv/sdists-v6/.git`）
-     - `suggested_path`：系统自动向上收敛后的建议目录（如 `/Users/alice/.cache/uv`）
-   - 用户在执行 `ragents approve` 时，可通过 `--path <custom_dir>` 任意收窄或放宽实际授权目录。
-3. **5 级生效周期（`--decision`）**：
+     - `original_path`：实际触发拦截的具体文件路径（如 `/Users/alice/.cache/uv/sdists-v6/.git`）或完整请求 URL（如 `https://api.example.com/v1/data`）
+     - `suggested_path`：系统自动向上收敛后的建议目录（如 `/Users/alice/.cache/uv`）或目标域名（如 `api.example.com`）
+   - 用户在执行 `ragents approve` 时，可通过 `--path <custom_dir_or_host_pattern>` 任意收窄或放宽实际授权目录或域名通配符（如 `--path "*.example.com"`）。
+5. **5 级生效周期（`--decision`）**：
    - `deny`：拒绝本次权限申请。
-   - `allow-once`：仅对当前单次命令/工具调用生效，该次命令执行完毕后立即从沙箱白名单撤销。
+   - `allow-once`：仅对当前单次命令/工具调用生效，该次命令执行完毕后立即从沙箱/WASI 白名单撤销。
    - `allow-activation`：在当前 `Activation` 的所有 ReAct 轮次内有效。
    - `allow-session`：在当前 `Session` 的所有多轮对话（多个 `Activation`）内有效。
    - `allow-workspace`：在当前节点上所有绑定同一 `workspace_root` 工作目录的 `Session` 间共享有效。

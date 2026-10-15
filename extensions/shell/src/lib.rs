@@ -123,6 +123,40 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
                         "required": ["command"]
                     }
                 }));
+                tools.push(serde_json::json!({
+                    "enabled": true,
+                    "name": "http_fetch",
+                    "description": "通过受权限策略管控的宿主通道发起 HTTP/HTTPS 网络请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "请求的完整 HTTP/HTTPS URL"
+                            },
+                            "method": {
+                                "type": "string",
+                                "default": "GET",
+                                "description": "HTTP 方法（如 GET, POST, PUT, DELETE）"
+                            },
+                            "headers": {
+                                "type": "object",
+                                "description": "可选的 HTTP 请求头键值对"
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "可选的请求体字符串"
+                            },
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 60,
+                                "description": "请求超时时间（秒）"
+                            }
+                        },
+                        "required": ["url"]
+                    }
+                }));
                 Ok(serde_json::json!({"action": "continue", "payload": draft}).to_string())
             }
             TOOLS_CALL_HOOK => call_tool(request.payload),
@@ -135,46 +169,111 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
 
 fn call_tool(payload: serde_json::Value) -> Result<String, String> {
     let call: ToolCallRequest = serde_json::from_value(payload).map_err(|e| e.to_string())?;
-    if call.name != "shell" {
-        return Err(format!("unknown tool: {}", call.name));
+    match call.name.as_str() {
+        "shell" => {
+            let command = call
+                .arguments
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing string argument 'command'")?;
+            let timeout_seconds = match call.arguments.get("timeout_seconds") {
+                Some(value) => value
+                    .as_u64()
+                    .ok_or("'timeout_seconds' must be a non-negative integer")?,
+                None => default_timeout_seconds(),
+            };
+            let timeout_ms = timeout_millis(timeout_seconds)?;
+            let result = ragent::extension::host::execute_command_with_timeout(command, timeout_ms);
+
+            let success = result.exit_code == 0 && result.error.is_none();
+            let output = if let Some(error) = &result.error {
+                format!("failed to execute command: {error}")
+            } else {
+                format!(
+                    "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
+                    result.exit_code, result.stdout, result.stderr
+                )
+            };
+            let error = (!success).then(|| {
+                result
+                    .error
+                    .unwrap_or_else(|| format!("command exited with status {}", result.exit_code))
+            });
+
+            let result = ToolResult {
+                success,
+                output,
+                error,
+            };
+            serde_json::to_string(&serde_json::json!({"action": "continue", "payload": result}))
+                .map_err(|e| e.to_string())
+        }
+        "http_fetch" => {
+            let url = call
+                .arguments
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing string argument 'url'")?
+                .to_string();
+            let method = call
+                .arguments
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("GET")
+                .to_string();
+            let body = call
+                .arguments
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let timeout_seconds = call
+                .arguments
+                .get("timeout_seconds")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(60);
+            let timeout_ms = timeout_millis(timeout_seconds)?;
+            let mut headers = Vec::new();
+            if let Some(obj) = call.arguments.get("headers").and_then(|v| v.as_object()) {
+                for (k, v) in obj {
+                    if let Some(val_str) = v.as_str() {
+                        headers.push(ragent::extension::host::HttpHeader {
+                            name: k.clone(),
+                            value: val_str.to_string(),
+                        });
+                    }
+                }
+            }
+            let req = ragent::extension::host::HttpRequest {
+                method,
+                url,
+                headers,
+                body,
+                timeout_ms,
+            };
+            let resp = ragent::extension::host::http_fetch(&req);
+            let success = resp.error.is_none() && (200..400).contains(&resp.status);
+            let output = if let Some(ref err) = resp.error {
+                format!("HTTP request failed: {err}")
+            } else {
+                format!("status: {}\nbody:\n{}", resp.status, resp.body)
+            };
+            let error = resp.error.or_else(|| {
+                if !success {
+                    Some(format!("HTTP status {}", resp.status))
+                } else {
+                    None
+                }
+            });
+            let result = ToolResult {
+                success,
+                output,
+                error,
+            };
+            serde_json::to_string(&serde_json::json!({"action": "continue", "payload": result}))
+                .map_err(|e| e.to_string())
+        }
+        other => Err(format!("unknown tool: {other}")),
     }
-
-    let command = call
-        .arguments
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("missing string argument 'command'")?;
-    let timeout_seconds = match call.arguments.get("timeout_seconds") {
-        Some(value) => value
-            .as_u64()
-            .ok_or("'timeout_seconds' must be a non-negative integer")?,
-        None => default_timeout_seconds(),
-    };
-    let timeout_ms = timeout_millis(timeout_seconds)?;
-    let result = ragent::extension::host::execute_command_with_timeout(command, timeout_ms);
-
-    let success = result.exit_code == 0 && result.error.is_none();
-    let output = if let Some(error) = &result.error {
-        format!("failed to execute command: {error}")
-    } else {
-        format!(
-            "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
-            result.exit_code, result.stdout, result.stderr
-        )
-    };
-    let error = (!success).then(|| {
-        result
-            .error
-            .unwrap_or_else(|| format!("command exited with status {}", result.exit_code))
-    });
-
-    let result = ToolResult {
-        success,
-        output,
-        error,
-    };
-    serde_json::to_string(&serde_json::json!({"action": "continue", "payload": result}))
-        .map_err(|e| e.to_string())
 }
 
 export!(ShellExtension);

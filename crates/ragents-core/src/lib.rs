@@ -653,4 +653,186 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_tmp);
     }
+
+    #[tokio::test]
+    async fn test_wasm_external_file_dynamic_mount_and_http_fetch_permission_unification() {
+        let shell_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm",
+        );
+        let editor_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+        );
+        if !shell_wasm_path.exists() || !editor_wasm_path.exists() {
+            return;
+        }
+
+        // Spin up a local TCP HTTP responder for `http_fetch`
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nConnection: close\r\n\r\nwasm_http_ok_2026";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let base_tmp =
+            std::env::temp_dir().join(format!("ragents-wasm-uni-{}", uuid::Uuid::now_v7()));
+        let ws_root = base_tmp.join("ws");
+        let sess_tmp = base_tmp.join("tmp");
+        let ext_dir = base_tmp.join("external_wasm_data");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        std::fs::create_dir_all(&sess_tmp).unwrap();
+
+        let ext_file = ext_dir.join("notes_outside.txt");
+        let http_url = format!("http://{}/hello", addr);
+
+        let host = Arc::new(MockCoreHost {
+            items: Mutex::new(vec![Item::user_message(
+                "Write to external file via WASM file_editor, read it back, and fetch HTTP via WASM.",
+            )]),
+            ..Default::default()
+        });
+
+        let resp1 = make_openresponses_resource(
+            "resp_u1",
+            "gpt-4.1",
+            vec![Item::FunctionCall {
+                id: Some("fc_w1".to_string()),
+                call_id: "call_w1".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": ext_file.to_string_lossy(),
+                    "content": "hello from dynamically mounted WASI!"
+                })
+                .to_string(),
+                status: None,
+            }],
+            None,
+        );
+        let resp2 = make_openresponses_resource(
+            "resp_u2",
+            "gpt-4.1",
+            vec![
+                Item::FunctionCall {
+                    id: Some("fc_r1".to_string()),
+                    call_id: "call_r1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": ext_file.to_string_lossy(),
+                    })
+                    .to_string(),
+                    status: None,
+                },
+                Item::FunctionCall {
+                    id: Some("fc_h1".to_string()),
+                    call_id: "call_h1".to_string(),
+                    name: "http_fetch".to_string(),
+                    arguments: serde_json::json!({
+                        "url": http_url,
+                        "method": "GET"
+                    })
+                    .to_string(),
+                    status: None,
+                },
+            ],
+            None,
+        );
+        let resp3 = make_openresponses_resource(
+            "resp_u3",
+            "gpt-4.1",
+            vec![Item::assistant_message(
+                "WASM file and HTTP permissions unified.",
+            )],
+            None,
+        );
+
+        let model_backend = Arc::new(MockModelBackend {
+            responses: Mutex::new(vec![resp1, resp2, resp3]),
+        });
+
+        let cfg = ConfigRevision::new_merged(
+            "You are a coding assistant.".to_string(),
+            ModelRequestSpec::new("gpt-4.1"),
+            vec![
+                ExtensionSpec {
+                    name: "shell".to_string(),
+                    path: shell_wasm_path.to_string_lossy().to_string(),
+                    enabled: true,
+                    config: serde_json::json!({}),
+                },
+                ExtensionSpec {
+                    name: "file_editor".to_string(),
+                    path: editor_wasm_path.to_string_lossy().to_string(),
+                    enabled: true,
+                    config: serde_json::json!({}),
+                },
+            ],
+        );
+
+        let run_spec = CoreRunSpec {
+            session_id: SessionId::new("sess_uni"),
+            activation_id: ActivationId::new("act_uni"),
+            workspace_root: ws_root,
+            session_tmp_dir: sess_tmp,
+            effective_config: cfg,
+            effective_permissions: PermissionPolicyLayer::default(),
+            model_endpoint: ModelEndpointConfig {
+                base_url: "http://127.0.0.1:9999/v1".to_string(),
+                api_key: "sk-local".to_string(),
+                ..Default::default()
+            },
+            max_turns: None,
+        };
+
+        let executor = SubprocessExecutor::new();
+        let summary = executor
+            .execute(
+                run_spec,
+                host.clone(),
+                model_backend,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute unified WASM file & HTTP permission test");
+
+        assert_eq!(
+            summary.final_text,
+            "WASM file and HTTP permissions unified."
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ext_file).unwrap(),
+            "hello from dynamically mounted WASI!"
+        );
+
+        // Verify all 3 capability requests (FileWrite, FileRead, Http) were checked with original_path
+        let caps = host.checked_capabilities.lock().unwrap();
+        let origs = host.checked_original_paths.lock().unwrap();
+        assert_eq!(caps.len(), 3, "caps: {caps:?}");
+        assert!(matches!(caps[0], CapabilityRequest::FileWrite { .. }));
+        assert!(matches!(caps[1], CapabilityRequest::FileRead { .. }));
+        assert!(
+            matches!(caps[2], CapabilityRequest::Http { ref host, port: Some(p), .. } if host == "127.0.0.1" && p == addr.port())
+        );
+        assert_eq!(origs[0].as_ref(), Some(&ext_file));
+        assert_eq!(origs[1].as_ref(), Some(&ext_file));
+        assert_eq!(origs[2].as_ref(), Some(&std::path::PathBuf::from(http_url)));
+
+        // Verify tool outputs in context contain the read content and the HTTP response body
+        let items = host.items.lock().unwrap();
+        let all_outputs = serde_json::to_string(&*items).unwrap();
+        assert!(
+            all_outputs.contains("hello from dynamically mounted WASI!"),
+            "all_outputs: {all_outputs}"
+        );
+        assert!(
+            all_outputs.contains("wasm_http_ok_2026"),
+            "all_outputs: {all_outputs}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
+    }
 }

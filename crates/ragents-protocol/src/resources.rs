@@ -508,12 +508,12 @@ impl CapabilityRequest {
             },
             Self::Http {
                 scheme,
-                host,
+                host: _,
                 port,
                 method,
             } => Self::Http {
                 scheme: scheme.clone(),
-                host: host.clone(),
+                host: p.to_string_lossy().to_string(),
                 port: *port,
                 method: method.clone(),
             },
@@ -524,7 +524,7 @@ impl CapabilityRequest {
         match self {
             Self::FileRead { path } | Self::FileWrite { path } => Some(path.as_path()),
             Self::CommandWorkDir { work_dir } => Some(work_dir.as_path()),
-            Self::Http { .. } => None,
+            Self::Http { host, .. } => Some(std::path::Path::new(host.as_str())),
         }
     }
 }

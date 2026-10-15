@@ -515,46 +515,6 @@ async fn execute_tool_call(
         .as_deref()
         .ok_or_else(|| CoreError::ToolError("Tool has no owner".into()))?;
 
-    // Check required capabilities before invoking tool action (INV-013)
-    let required_caps = infer_capabilities_for_tool_call(run_spec, &call_req);
-    for (cap, reason) in required_caps {
-        match host
-            .check_permission(Some(owner), cap.clone(), Some(reason))
-            .await?
-        {
-            PermissionOutcome::Allowed {
-                effective_capability,
-                persist_in_activation,
-            } => {
-                if persist_in_activation {
-                    let granted_cap = effective_capability.unwrap_or(cap);
-                    match granted_cap {
-                        CapabilityRequest::FileWrite { path } => {
-                            sandbox_state.allow_writable_path(path);
-                        }
-                        CapabilityRequest::CommandWorkDir { work_dir } => {
-                            sandbox_state.allow_writable_path(work_dir);
-                        }
-                        CapabilityRequest::FileRead { path } => {
-                            sandbox_state.allow_readable_path(path);
-                        }
-                        CapabilityRequest::Http { .. } => {}
-                    }
-                }
-            }
-            PermissionOutcome::Denied { reason } => {
-                let denied_res = ToolResult::err(format!("Permission denied: {reason}"));
-                let output_item = Item::FunctionCallOutput {
-                    id: None,
-                    call_id: call.call_id.clone(),
-                    output: denied_res.output.to_function_output(),
-                    status: None,
-                };
-                return Ok((output_item, false));
-            }
-        }
-    }
-
     let action_result = hook_manager
         .action(
             HOOK_TOOLS_CALL,
@@ -591,52 +551,6 @@ async fn execute_tool_call(
     };
 
     Ok((output_item, success))
-}
-
-fn infer_capabilities_for_tool_call(
-    run_spec: &CoreRunSpec,
-    call_req: &ToolCallRequest,
-) -> Vec<(CapabilityRequest, String)> {
-    let mut caps = Vec::new();
-    let resolve_path = |raw: &str| {
-        let p = Path::new(raw);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            run_spec.workspace_root.join(p)
-        }
-    };
-
-    if let Some(path_str) = call_req.arguments.get("path").and_then(|v| v.as_str()) {
-        let full_path = resolve_path(path_str);
-        if call_req.name == "write_file" || call_req.name == "replace_in_file" {
-            caps.push((
-                CapabilityRequest::FileWrite { path: full_path },
-                format!("Tool '{}' writing file '{}'", call_req.name, path_str),
-            ));
-        } else if call_req.name == "view_image" || call_req.name == "read_file" {
-            caps.push((
-                CapabilityRequest::FileRead { path: full_path },
-                format!("Tool '{}' reading file '{}'", call_req.name, path_str),
-            ));
-        }
-    }
-
-    // Note: Standard shell command execution (`execute_command_with_timeout`) is now
-    // mandatorily checked inside the WASM Host Import layer (`runtime.rs`).
-    // Here we only pre-check if the tool call arguments explicitly request an alternate `work_dir`.
-    if let Some(work_dir_str) = call_req.arguments.get("work_dir").and_then(|v| v.as_str()) {
-        let work_dir = resolve_path(work_dir_str);
-        caps.push((
-            CapabilityRequest::CommandWorkDir { work_dir },
-            format!(
-                "Tool '{}' requesting custom work_dir '{}'",
-                call_req.name, work_dir_str
-            ),
-        ));
-    }
-
-    caps
 }
 
 async fn execute_builtin_request_permission(

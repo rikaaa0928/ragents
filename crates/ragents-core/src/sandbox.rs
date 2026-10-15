@@ -343,6 +343,123 @@ impl SandboxState {
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
+
+    pub fn is_path_writable(&self, target: &Path) -> bool {
+        let norm_target = canonicalize_or_normalize(target);
+        let denied = self
+            .denied_write_paths
+            .lock()
+            .expect("denied_write_paths poisoned")
+            .clone();
+        for d in &denied {
+            let norm_d = canonicalize_or_normalize(d);
+            if norm_target.starts_with(&norm_d) {
+                return false;
+            }
+        }
+        let writable = self
+            .writable_paths
+            .lock()
+            .expect("writable_paths poisoned")
+            .clone();
+        for w in &writable {
+            let norm_w = canonicalize_or_normalize(w);
+            if norm_target.starts_with(&norm_w) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn is_path_readable(&self, target: &Path) -> bool {
+        let norm_target = canonicalize_or_normalize(target);
+        let allowed_read = self
+            .allowed_read_paths
+            .lock()
+            .expect("allowed_read_paths poisoned")
+            .clone();
+        for a in &allowed_read {
+            let norm_a = canonicalize_or_normalize(a);
+            if norm_target.starts_with(&norm_a) {
+                return true;
+            }
+        }
+        let denied_read = self
+            .denied_read_paths
+            .lock()
+            .expect("denied_read_paths poisoned")
+            .clone();
+        for d in &denied_read {
+            let norm_d = canonicalize_or_normalize(d);
+            if norm_target.starts_with(&norm_d) {
+                return false;
+            }
+        }
+        let writable = self
+            .writable_paths
+            .lock()
+            .expect("writable_paths poisoned")
+            .clone();
+        for w in &writable {
+            let norm_w = canonicalize_or_normalize(w);
+            if norm_target.starts_with(&norm_w) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns `(writable_dirs, readable_dirs)` currently unlocked in `SandboxState`,
+    /// resolved to existing directories suitable for Wasmtime `WasiCtxBuilder::preopened_dir`.
+    pub fn wasi_preopen_dirs(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let writable = self
+            .writable_paths
+            .lock()
+            .expect("writable_paths poisoned")
+            .clone();
+        let allowed_read = self
+            .allowed_read_paths
+            .lock()
+            .expect("allowed_read_paths poisoned")
+            .clone();
+
+        let mut w_dirs = Vec::new();
+        for p in writable {
+            if let Some(dir) = closest_existing_dir(&p) {
+                if !w_dirs.contains(&dir) {
+                    w_dirs.push(dir);
+                }
+            }
+        }
+        w_dirs.sort();
+
+        let mut r_dirs = Vec::new();
+        for p in allowed_read {
+            if let Some(dir) = closest_existing_dir(&p) {
+                if !w_dirs.contains(&dir) && !r_dirs.contains(&dir) {
+                    r_dirs.push(dir);
+                }
+            }
+        }
+        r_dirs.sort();
+
+        (w_dirs, r_dirs)
+    }
+}
+
+fn closest_existing_dir(path: &Path) -> Option<PathBuf> {
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        if p.exists() && p.is_dir() {
+            return Some(p.to_path_buf());
+        }
+        cur = p.parent();
+    }
+    None
+}
+
+pub fn canonicalize_or_normalize(path: &Path) -> PathBuf {
+    canonicalize_with_nonexistent_tail(path).unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Normalizes a specific violated file path (such as `/Users/alice/.cache/uv/sdists-v6/.git`)

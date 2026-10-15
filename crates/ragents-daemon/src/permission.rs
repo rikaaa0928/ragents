@@ -45,13 +45,14 @@ pub fn evaluate_capability_policy(
                         return PolicyEvalResult::Allow;
                     }
                 }
-                match rules.default.unwrap_or(DefaultPermissionDecision::Deny) {
+                match rules.default.unwrap_or(DefaultPermissionDecision::Ask) {
                     DefaultPermissionDecision::Allow => PolicyEvalResult::Allow,
                     DefaultPermissionDecision::Deny => PolicyEvalResult::Deny,
                     DefaultPermissionDecision::Ask => PolicyEvalResult::Ask,
                 }
             } else {
-                PolicyEvalResult::Deny
+                // Default to Ask so WASM HTTP requests to unconfigured hosts trigger interactive approval
+                PolicyEvalResult::Ask
             }
         }
     }
@@ -121,12 +122,27 @@ pub fn capability_covered_by(
             let norm_r = normalize_path(r, workspace_root);
             norm_r.starts_with(&norm_g)
         }
+        (CapabilityRequest::Http { host: g, .. }, CapabilityRequest::Http { host: r, .. }) => {
+            host_matches(g, r)
+        }
         _ => false,
     }
 }
 
-fn host_matches(rule: &str, host: &str) -> bool {
-    rule == "*" || rule.eq_ignore_ascii_case(host)
+pub fn host_matches(rule: &str, host: &str) -> bool {
+    let rule = rule.trim();
+    let host = host.trim();
+    if rule == "*" || rule.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    if let Some(suffix) = rule.strip_prefix("*.") {
+        if host.eq_ignore_ascii_case(suffix) {
+            return true;
+        }
+        let dot_suffix = format!(".{}", suffix.to_ascii_lowercase());
+        return host.to_ascii_lowercase().ends_with(&dot_suffix);
+    }
+    false
 }
 
 fn normalize_path(path: &Path, base: &Path) -> PathBuf {
