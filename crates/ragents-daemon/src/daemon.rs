@@ -1,5 +1,5 @@
 use crate::config::{DaemonConfig, ExecutorMode};
-use crate::permission::{evaluate_capability_policy, PolicyEvalResult};
+use crate::permission::{capability_covered_by, evaluate_capability_policy, PolicyEvalResult};
 use async_trait::async_trait;
 use chrono::Utc;
 use openresponses_rust::{Item, Usage};
@@ -32,6 +32,7 @@ pub struct AgentDaemon {
     config: Arc<DaemonConfig>,
     executor: Arc<dyn CoreExecutor>,
     model_backend: Arc<dyn ModelBackend>,
+    session_grants: Arc<Mutex<HashMap<SessionId, Vec<CapabilityRequest>>>>,
 }
 
 impl AgentDaemon {
@@ -44,6 +45,7 @@ impl AgentDaemon {
             config: Arc::new(config),
             executor,
             model_backend: Arc::new(OpenResponsesModelBackend),
+            session_grants: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -260,14 +262,56 @@ impl AgentDaemon {
                 return;
             }
 
+            let prior_grants = daemon
+                .session_grants
+                .lock()
+                .expect("session_grants mutex poisoned")
+                .get(&sess_id)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut runtime_permissions = effective_permission.effective_policy.clone();
+            for g in &prior_grants {
+                match g {
+                    CapabilityRequest::FileWrite { path } => {
+                        let rule_set = runtime_permissions
+                            .file_write
+                            .get_or_insert_with(Default::default);
+                        rule_set
+                            .allow
+                            .get_or_insert_with(Vec::new)
+                            .push(path.to_string_lossy().to_string());
+                    }
+                    CapabilityRequest::FileRead { path } => {
+                        let rule_set = runtime_permissions
+                            .file_read
+                            .get_or_insert_with(Default::default);
+                        rule_set
+                            .allow
+                            .get_or_insert_with(Vec::new)
+                            .push(path.to_string_lossy().to_string());
+                    }
+                    CapabilityRequest::CommandWorkDir { work_dir } => {
+                        let rule_set = runtime_permissions
+                            .command_work_dir
+                            .get_or_insert_with(Default::default);
+                        rule_set
+                            .allow
+                            .get_or_insert_with(Vec::new)
+                            .push(work_dir.to_string_lossy().to_string());
+                    }
+                    CapabilityRequest::Http { .. } => {}
+                }
+            }
+
             let host = Arc::new(DaemonCoreHost {
                 session_id: sess_id.clone(),
                 activation_id: act_id.clone(),
                 lease_epoch,
                 workspace_root: workspace_root.clone(),
                 session_tmp_dir: session_tmp_dir.clone(),
-                effective_policy: effective_permission.effective_policy.clone(),
-                session_allowed_caps: Mutex::new(Vec::new()),
+                effective_policy: runtime_permissions.clone(),
+                session_grants: daemon.session_grants.clone(),
                 tunnel: tunnel.clone(),
                 permission_waiters,
                 cancellation: task_cancel.clone(),
@@ -279,6 +323,7 @@ impl AgentDaemon {
                 workspace_root,
                 session_tmp_dir,
                 effective_config,
+                effective_permissions: runtime_permissions,
                 model_endpoint,
                 max_turns: daemon.config.max_turns,
             };
@@ -344,7 +389,7 @@ struct DaemonCoreHost {
     workspace_root: PathBuf,
     session_tmp_dir: PathBuf,
     effective_policy: PermissionPolicyLayer,
-    session_allowed_caps: Mutex<Vec<CapabilityRequest>>,
+    session_grants: Arc<Mutex<HashMap<SessionId, Vec<CapabilityRequest>>>>,
     tunnel: DaemonTunnelHandle,
     permission_waiters:
         Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionDecision>>>>,
@@ -436,10 +481,16 @@ impl CoreHost for DaemonCoreHost {
         reason: Option<String>,
     ) -> Result<PermissionOutcome, CoreError> {
         if self
-            .session_allowed_caps
+            .session_grants
             .lock()
-            .expect("caps mutex poisoned")
-            .contains(&capability)
+            .expect("session_grants mutex poisoned")
+            .get(&self.session_id)
+            .map(|grants| {
+                grants
+                    .iter()
+                    .any(|g| capability_covered_by(g, &capability, &self.workspace_root))
+            })
+            .unwrap_or(false)
         {
             return Ok(PermissionOutcome::Allowed);
         }
@@ -498,9 +549,11 @@ impl CoreHost for DaemonCoreHost {
                     PermissionDecision::AllowSession
                     | PermissionDecision::AllowProject
                     | PermissionDecision::AllowAlways => {
-                        self.session_allowed_caps
+                        self.session_grants
                             .lock()
-                            .expect("caps mutex poisoned")
+                            .expect("session_grants mutex poisoned")
+                            .entry(self.session_id.clone())
+                            .or_default()
                             .push(capability);
                         Ok(PermissionOutcome::Allowed)
                     }

@@ -30,6 +30,8 @@ pub struct CoreRunSpec {
     pub workspace_root: PathBuf,
     pub session_tmp_dir: PathBuf,
     pub effective_config: ConfigRevision,
+    #[serde(default)]
+    pub effective_permissions: PermissionPolicyLayer,
     pub model_endpoint: ModelEndpointConfig,
     pub max_turns: Option<usize>,
 }

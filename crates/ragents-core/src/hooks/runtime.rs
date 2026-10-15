@@ -1,9 +1,11 @@
 use crate::error::CoreError;
 use crate::hooks::protocol::{ExtensionMetadata, HookRequest};
+use crate::host::{CoreHost, PermissionOutcome};
+use crate::sandbox::{SandboxMode, SandboxState};
+use ragents_protocol::{CapabilityRequest, PermissionPolicyLayer};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
@@ -79,7 +81,10 @@ wasmtime::component::bindgen!({
 struct HostState {
     wasi_ctx: WasiCtx,
     table: ResourceTable,
+    plugin_name: String,
     workspace_root: PathBuf,
+    core_host: Option<Arc<dyn CoreHost>>,
+    sandbox_state: Arc<SandboxState>,
 }
 
 impl WasiView for HostState {
@@ -97,37 +102,35 @@ impl ragent::extension::host::Host for HostState {
         command: String,
         timeout_ms: u64,
     ) -> ragent::extension::host::CommandOutput {
-        run_command_in_dir(&self.workspace_root, command, timeout_ms).await
-    }
-}
-
-async fn run_command_in_dir(
-    workspace_root: &Path,
-    command: String,
-    timeout_ms: u64,
-) -> ragent::extension::host::CommandOutput {
-    let mut child = tokio::process::Command::new("sh");
-    child
-        .current_dir(workspace_root)
-        .arg("-c")
-        .arg(command)
-        .kill_on_drop(true);
-    let output = if timeout_ms == 0 {
-        child.output().await
-    } else {
-        match tokio::time::timeout(Duration::from_millis(timeout_ms), child.output()).await {
-            Ok(result) => result,
-            Err(_) => return command_error(format!("command timed out after {timeout_ms} ms")),
+        // 1. Mandatory Host-Import Permission Check (Blind Spot 1 Fix):
+        // Regardless of tool name, any WASM guest calling execute_command_with_timeout
+        // MUST pass CoreHost::check_permission first.
+        if let Some(ref host) = self.core_host {
+            let cap = CapabilityRequest::CommandWorkDir {
+                work_dir: self.workspace_root.clone(),
+            };
+            let reason = format!(
+                "Extension '{}' executing shell command: {}",
+                self.plugin_name, command
+            );
+            match host
+                .check_permission(Some(&self.plugin_name), cap, Some(reason))
+                .await
+            {
+                Ok(PermissionOutcome::Allowed) => {}
+                Ok(PermissionOutcome::Denied { reason }) => {
+                    return command_error(format!("Permission denied: {reason}"));
+                }
+                Err(err) => {
+                    return command_error(format!("Permission check error: {err}"));
+                }
+            }
         }
-    };
-    match output {
-        Ok(output) => ragent::extension::host::CommandOutput {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            error: None,
-        },
-        Err(error) => command_error(error),
+
+        // 2. OS Kernel Sandboxed Execution (macOS Seatbelt / Linux bwrap + Hermetic TMPDIR/XDG_CACHE_HOME)
+        self.sandbox_state
+            .execute_command(&self.workspace_root, &command, timeout_ms)
+            .await
     }
 }
 
@@ -158,6 +161,32 @@ impl WasmPlugin {
         workspace_root: &Path,
         preopen_dirs: &[PathBuf],
     ) -> Result<Self, CoreError> {
+        let default_sandbox = Arc::new(SandboxState::from_policy(
+            SandboxMode::Auto,
+            workspace_root,
+            workspace_root,
+            &PermissionPolicyLayer::default(),
+        ));
+        Self::load_from_file_with_host(
+            name,
+            path,
+            workspace_root,
+            preopen_dirs,
+            None,
+            default_sandbox,
+        )
+        .await
+    }
+
+    pub async fn load_from_file_with_host(
+        name: impl Into<String>,
+        path: &Path,
+        workspace_root: &Path,
+        preopen_dirs: &[PathBuf],
+        core_host: Option<Arc<dyn CoreHost>>,
+        sandbox_state: Arc<SandboxState>,
+    ) -> Result<Self, CoreError> {
+        let plugin_name = name.into();
         let engine = global_engine()?;
         let component = load_or_precompile_component(engine, path)?;
 
@@ -188,7 +217,10 @@ impl WasmPlugin {
         let host_state = HostState {
             wasi_ctx: wasi_builder.build(),
             table: ResourceTable::new(),
+            plugin_name: plugin_name.clone(),
             workspace_root: workspace_root.to_path_buf(),
+            core_host,
+            sandbox_state,
         };
 
         let mut store = Store::new(engine, host_state);
@@ -206,7 +238,7 @@ impl WasmPlugin {
             })?;
 
         Ok(Self {
-            name: name.into(),
+            name: plugin_name,
             metadata,
             runtime: Mutex::new(PluginRuntime { store, bindings }),
         })

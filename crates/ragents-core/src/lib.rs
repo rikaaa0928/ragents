@@ -4,6 +4,7 @@ pub mod hooks;
 pub mod host;
 pub mod model;
 pub mod runner;
+pub mod sandbox;
 pub mod subprocess;
 
 pub use context::*;
@@ -13,6 +14,7 @@ pub use host::*;
 pub use model::*;
 pub use ragents_protocol;
 pub use runner::*;
+pub use sandbox::*;
 pub use subprocess::*;
 
 #[cfg(test)]
@@ -139,6 +141,7 @@ mod tests {
             workspace_root: tmp.path().join("ws"),
             session_tmp_dir: tmp.path().join("tmp"),
             effective_config: cfg,
+            effective_permissions: PermissionPolicyLayer::default(),
             model_endpoint: ModelEndpointConfig {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local".to_string(),
@@ -222,6 +225,7 @@ mod tests {
             workspace_root: ws_root.clone(),
             session_tmp_dir: tmp.path().join("tmp"),
             effective_config: cfg,
+            effective_permissions: PermissionPolicyLayer::default(),
             model_endpoint: ModelEndpointConfig {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local".to_string(),
@@ -307,6 +311,7 @@ mod tests {
             workspace_root: ws_root.clone(),
             session_tmp_dir: tmp.path().join("tmp_subproc"),
             effective_config: cfg,
+            effective_permissions: PermissionPolicyLayer::default(),
             model_endpoint: ModelEndpointConfig {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local-secret".to_string(),
@@ -380,5 +385,102 @@ mod tests {
             .await
             .expect("execute subprocess over TCP fallback");
         assert_eq!(tcp_summary.final_text, "TCP fallback ok.");
+    }
+
+    #[tokio::test]
+    async fn test_os_kernel_sandbox_blocks_outside_writes_and_denied_reads_and_allows_dynamic_unlock(
+    ) {
+        let base_tmp =
+            std::env::temp_dir().join(format!("ragents-sb-unit-{}", uuid::Uuid::now_v7()));
+        let ws_root = base_tmp.join("workspace");
+        let sess_tmp = base_tmp.join("session_tmp");
+        let outside_dir = base_tmp.join("outside_unauthorized");
+        let secret_dir = base_tmp.join("secret_ssh");
+
+        std::fs::create_dir_all(&ws_root).unwrap();
+        std::fs::create_dir_all(&sess_tmp).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let secret_file = secret_dir.join("id_rsa");
+        std::fs::write(&secret_file, "PRIVATE_KEY_MATERIAL").unwrap();
+
+        let policy = PermissionPolicyLayer {
+            file_read: Some(RuleSet {
+                allow: None,
+                deny: Some(vec![secret_dir.to_string_lossy().to_string()]),
+                default: Some(DefaultPermissionDecision::Allow),
+            }),
+            file_write: None,
+            command_work_dir: None,
+            http_hosts: None,
+        };
+
+        let sandbox = SandboxState::from_policy(SandboxMode::Auto, &ws_root, &sess_tmp, &policy);
+
+        // 1. Writing inside workspace_root and $TMPDIR must succeed
+        let ok_out = sandbox
+            .execute_command(
+                &ws_root,
+                "echo inside_ws > allowed.txt && echo tmp_ok > \"$TMPDIR/cache.txt\"",
+                5000,
+            )
+            .await;
+        assert_eq!(ok_out.exit_code, 0, "stderr: {}", ok_out.stderr);
+        assert!(ws_root.join("allowed.txt").exists());
+        assert!(sess_tmp.join("tmp").join("cache.txt").exists());
+
+        #[cfg(target_os = "macos")]
+        {
+            // 2. Writing outside workspace_root (e.g. simulating `pip install` writing to global/user dir)
+            // must be blocked by the macOS kernel sandbox (`Operation not permitted`)
+            let outside_file = outside_dir.join("pwned.txt");
+            let blocked_write = sandbox
+                .execute_command(
+                    &ws_root,
+                    &format!("echo pwned > '{}'", outside_file.display()),
+                    5000,
+                )
+                .await;
+            assert_ne!(
+                blocked_write.exit_code, 0,
+                "OS sandbox must block writes outside workspace_root"
+            );
+            assert!(
+                !outside_file.exists(),
+                "outside file must not be created by sandboxed command"
+            );
+
+            // 3. Reading a denied path (`file_read.deny`) must be blocked by the OS kernel sandbox
+            let blocked_read = sandbox
+                .execute_command(&ws_root, &format!("cat '{}'", secret_file.display()), 5000)
+                .await;
+            assert_ne!(
+                blocked_read.exit_code, 0,
+                "OS sandbox must block reading denied paths"
+            );
+            assert!(!blocked_read.stdout.contains("PRIVATE_KEY_MATERIAL"));
+
+            // 4. Dynamically unlocking `outside_dir` (simulating user `AllowSession` approval)
+            // must immediately allow subsequent commands to write to `outside_dir`
+            sandbox.allow_writable_path(&outside_dir);
+            let unlocked_write = sandbox
+                .execute_command(
+                    &ws_root,
+                    &format!("echo approved_write > '{}'", outside_file.display()),
+                    5000,
+                )
+                .await;
+            assert_eq!(
+                unlocked_write.exit_code, 0,
+                "stderr: {}",
+                unlocked_write.stderr
+            );
+            assert_eq!(
+                std::fs::read_to_string(&outside_file).unwrap().trim(),
+                "approved_write"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
     }
 }

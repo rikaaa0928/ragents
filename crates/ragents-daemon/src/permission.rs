@@ -93,11 +93,35 @@ fn evaluate_path_rules(
         }
     }
 
-    // Default safe boundary: allow paths inside workspace_root or session_tmp_dir
+    // Default safe boundary: allow paths inside workspace_root or session_tmp_dir;
+    // paths outside workspace_root default to Ask so the user can interactively approve or deny.
     if norm_target.starts_with(&norm_ws) || norm_target.starts_with(&norm_tmp) {
         PolicyEvalResult::Allow
     } else {
-        PolicyEvalResult::Deny
+        PolicyEvalResult::Ask
+    }
+}
+
+pub fn capability_covered_by(
+    granted: &CapabilityRequest,
+    requested: &CapabilityRequest,
+    workspace_root: &Path,
+) -> bool {
+    if granted == requested {
+        return true;
+    }
+    match (granted, requested) {
+        (CapabilityRequest::FileWrite { path: g }, CapabilityRequest::FileWrite { path: r })
+        | (CapabilityRequest::FileRead { path: g }, CapabilityRequest::FileRead { path: r })
+        | (
+            CapabilityRequest::CommandWorkDir { work_dir: g },
+            CapabilityRequest::CommandWorkDir { work_dir: r },
+        ) => {
+            let norm_g = normalize_path(g, workspace_root);
+            let norm_r = normalize_path(r, workspace_root);
+            norm_r.starts_with(&norm_g)
+        }
+        _ => false,
     }
 }
 

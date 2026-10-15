@@ -721,8 +721,18 @@ pub async fn watch_activation_to_completion(
             }
             SessionEvent::PermissionRequested { request } => {
                 println!(
-                    "[permission required] request_id={} capability={:?}\n  Approve with: ragents approve {} {} --decision allow-once",
-                    request.id, request.capability, activation_id, request.id
+                    "[permission required] request_id={} capability={:?} reason={:?}\n  Approve with: ragents --server <url> approve {} {} --decision allow-session",
+                    request.id, request.capability, request.reason, activation_id, request.id
+                );
+            }
+            SessionEvent::PermissionResolved {
+                request_id,
+                decision,
+                ..
+            } => {
+                println!(
+                    "[event] permission resolved: request_id={} decision={:?}",
+                    request_id, decision
                 );
             }
             SessionEvent::ActivationCompleted { .. } => {
