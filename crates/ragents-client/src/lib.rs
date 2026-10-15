@@ -48,6 +48,19 @@ impl RagentsClient {
         }
     }
 
+    pub fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
+        if let Some(tok) = auth_token {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {tok}")) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+                if let Ok(client) = Client::builder().default_headers(headers).build() {
+                    self.http = client;
+                }
+            }
+        }
+        self
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -593,7 +606,24 @@ impl DaemonTunnelHandle {
 pub async fn connect_daemon_tunnel(
     ws_url: &str,
 ) -> Result<(DaemonTunnelHandle, mpsc::UnboundedReceiver<DaemonPushEvent>), ClientError> {
-    let (ws_stream, _) = connect_async(ws_url)
+    connect_daemon_tunnel_with_token(ws_url, None).await
+}
+
+pub async fn connect_daemon_tunnel_with_token(
+    ws_url: &str,
+    auth_token: Option<&str>,
+) -> Result<(DaemonTunnelHandle, mpsc::UnboundedReceiver<DaemonPushEvent>), ClientError> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut req = ws_url
+        .into_client_request()
+        .map_err(|e| ClientError::WebSocket(Box::new(e)))?;
+    if let Some(tok) = auth_token {
+        if let Ok(val) = format!("Bearer {tok}").parse() {
+            req.headers_mut().insert("Authorization", val);
+        }
+    }
+    let (ws_stream, _) = connect_async(req)
         .await
         .map_err(|e| ClientError::WebSocket(Box::new(e)))?;
     let (mut ws_sink, mut ws_source) = ws_stream.split();

@@ -143,6 +143,7 @@ impl SqliteStore {
                 bound_node_id    TEXT,
                 created_at       TEXT NOT NULL,
                 updated_at       TEXT NOT NULL,
+                labels_json      TEXT NOT NULL DEFAULT '{}',
                 spec_json        TEXT NOT NULL,
                 status_json      TEXT NOT NULL
             );
@@ -751,8 +752,8 @@ impl SqliteStore {
             tx.execute(
                 "INSERT INTO sessions (
                     session_id, generation, resource_version, scheduling_mode, bound_node_id,
-                    created_at, updated_at, spec_json, status_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    created_at, updated_at, labels_json, spec_json, status_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     session_id.as_str(),
                     session.metadata.generation.value() as i64,
@@ -761,6 +762,7 @@ impl SqliteStore {
                     bound_node_id.as_ref().map(|n| n.as_str()),
                     session.metadata.created_at.to_rfc3339(),
                     session.metadata.updated_at.to_rfc3339(),
+                    serde_json::to_string(&session.metadata.labels)?,
                     serde_json::to_string(&session.spec)?,
                     serde_json::to_string(&session.status)?,
                 ],
@@ -843,7 +845,7 @@ impl SqliteStore {
     pub fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT session_id, generation, resource_version, created_at, updated_at, spec_json, status_json
+            "SELECT session_id, generation, resource_version, created_at, updated_at, labels_json, spec_json, status_json
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -855,12 +857,15 @@ impl SqliteStore {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
 
         let mut sessions = Vec::new();
         for r in rows {
-            let (id, gen, rv, created_str, updated_str, spec_json, status_json) = r?;
+            let (id, gen, rv, created_str, updated_str, labels_json, spec_json, status_json) = r?;
+            let labels: BTreeMap<String, String> =
+                serde_json::from_str(&labels_json).unwrap_or_default();
             let spec: SessionSpec = serde_json::from_str(&spec_json)?;
             let status: SessionStatus = serde_json::from_str(&status_json)?;
             sessions.push(Session {
@@ -874,7 +879,7 @@ impl SqliteStore {
                     updated_at: DateTime::parse_from_rfc3339(&updated_str)
                         .map(|d| d.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
-                    labels: BTreeMap::new(),
+                    labels,
                 },
                 spec,
                 status,
@@ -1972,9 +1977,9 @@ impl SqliteStore {
         conn: &Connection,
         session_id: &SessionId,
     ) -> Result<Option<Session>, StoreError> {
-        let row: Option<(i64, i64, String, String, String, String)> = conn
+        let row: Option<(i64, i64, String, String, String, String, String)> = conn
             .query_row(
-                "SELECT generation, resource_version, created_at, updated_at, spec_json, status_json
+                "SELECT generation, resource_version, created_at, updated_at, labels_json, spec_json, status_json
                  FROM sessions WHERE session_id = ?1",
                 params![session_id.as_str()],
                 |r| {
@@ -1985,12 +1990,15 @@ impl SqliteStore {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )
             .optional()?;
         match row {
-            Some((gen, rv, created_str, updated_str, spec_json, status_json)) => {
+            Some((gen, rv, created_str, updated_str, labels_json, spec_json, status_json)) => {
+                let labels: BTreeMap<String, String> =
+                    serde_json::from_str(&labels_json).unwrap_or_default();
                 Ok(Some(Session {
                     metadata: ObjectMeta {
                         id: session_id.to_string(),
@@ -2002,7 +2010,7 @@ impl SqliteStore {
                         updated_at: DateTime::parse_from_rfc3339(&updated_str)
                             .map(|d| d.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now()),
-                        labels: BTreeMap::new(),
+                        labels,
                     },
                     spec: serde_json::from_str(&spec_json)?,
                     status: serde_json::from_str(&status_json)?,
@@ -2025,14 +2033,16 @@ impl SqliteStore {
                 resource_version = ?2,
                 bound_node_id = ?3,
                 updated_at = ?4,
-                spec_json = ?5,
-                status_json = ?6
-             WHERE session_id = ?7",
+                labels_json = ?5,
+                spec_json = ?6,
+                status_json = ?7
+             WHERE session_id = ?8",
             params![
                 session.metadata.generation.value() as i64,
                 rv.value() as i64,
                 session.status.bound_node_id.as_ref().map(|n| n.as_str()),
                 session.metadata.updated_at.to_rfc3339(),
+                serde_json::to_string(&session.metadata.labels)?,
                 serde_json::to_string(&session.spec)?,
                 serde_json::to_string(&session.status)?,
                 session.metadata.id,

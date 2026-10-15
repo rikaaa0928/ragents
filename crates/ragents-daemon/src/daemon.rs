@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use openresponses_rust::{Item, Usage};
 use ragents_client::{
-    connect_daemon_tunnel, ClientError, DaemonPushEvent, DaemonTunnelHandle, RagentsClient,
+    connect_daemon_tunnel_with_token, ClientError, DaemonPushEvent, DaemonTunnelHandle,
+    RagentsClient,
 };
 use ragents_core::{
     CoreError, CoreExecutor, CoreHost, CoreRunSpec, InProcessExecutor, ModelBackend,
@@ -81,9 +82,11 @@ impl AgentDaemon {
 
     /// Connects to `api-server`, registers the node, starts heartbeat and reconcile loop in the background.
     pub async fn start(&self, shutdown: CancellationToken) -> Result<(), ClientError> {
-        let client = RagentsClient::new(&self.config.server_url);
+        let client = RagentsClient::new(&self.config.server_url)
+            .with_auth_token(self.config.auth_token.clone());
         let ws_url = client.ws_tunnel_url();
-        let (tunnel, mut push_rx) = connect_daemon_tunnel(&ws_url).await?;
+        let (tunnel, mut push_rx) =
+            connect_daemon_tunnel_with_token(&ws_url, self.config.auth_token.as_deref()).await?;
 
         let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
         let os = std::env::consts::OS.to_string();

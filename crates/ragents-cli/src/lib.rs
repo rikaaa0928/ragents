@@ -23,6 +23,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub server: Option<String>,
 
+    /// Optional Bearer auth token for API server authentication (overrides RAGENTS_AUTH_TOKEN env var)
+    #[arg(long, global = true)]
+    pub auth_token: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -232,7 +236,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     let server_url = explicit_server
         .clone()
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-    let client = RagentsClient::new(&server_url);
+    let auth_token = cli
+        .auth_token
+        .or_else(|| std::env::var("RAGENTS_AUTH_TOKEN").ok());
+    let client = RagentsClient::new(&server_url).with_auth_token(auth_token.clone());
 
     match cli.command {
         Commands::Up {
@@ -343,6 +350,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             };
             if let Some(ref exp_srv) = explicit_server {
                 d_cfg.server_url = exp_srv.clone();
+            }
+            if auth_token.is_some() {
+                d_cfg.auth_token = auth_token;
             }
             let cancel = CancellationToken::new();
             let daemon = AgentDaemon::new(d_cfg);
