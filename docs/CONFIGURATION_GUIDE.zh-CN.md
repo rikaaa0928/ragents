@@ -150,6 +150,17 @@ timeout_ms = 2000
 # fail_closed（默认，插件失败则拒绝调用） | fail_open（插件失败则忽略并继续，适合可观测上报）
 fail_policy = "fail_open"
 config = { inject_thinking_budget = 4096 }
+
+# 若使用 driver = "wasm"（同样适用于 api-server 的 Authn/Authz/Admission WASM 插件）：
+# - 网络权限（wasi:http / wasi:sockets）默认全部放开；
+# - 文件权限严禁挂载宿主机根目录 "/"，仅默认挂载插件专属临时目录，以及通过 `allowed_dirs` 显式授权的目录：
+# [[interceptors]]
+# id = "local-wasm-audit"
+# driver = "wasm"
+# path = "/etc/ragents/plugins/audit_hook.wasm"
+# allowed_dirs = ["/var/log/ragents-audit", "/etc/ragents/certs"]
+# hooks = ["after_model_response"]
+# fail_policy = "fail_open"
 ```
 
 ---

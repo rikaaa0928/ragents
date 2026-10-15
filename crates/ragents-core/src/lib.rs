@@ -843,4 +843,120 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_tmp);
     }
+
+    #[tokio::test]
+    async fn test_control_plane_wasm_plugin_allows_network_and_configured_dirs_while_blocking_host_root(
+    ) {
+        let editor_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+        );
+        if !editor_wasm_path.exists() {
+            return;
+        }
+
+        // Spin up a local TCP HTTP responder for WASI 0.2 HTTP
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\ncontrol_http_ok";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let base_tmp =
+            std::env::temp_dir().join(format!("ragents-ctrl-wasm-{}", uuid::Uuid::now_v7()));
+        let allowed_dir = base_tmp.join("plugin_allowed_data");
+        let forbidden_dir = base_tmp.join("host_secret_dir");
+        std::fs::create_dir_all(&allowed_dir).unwrap();
+        std::fs::create_dir_all(&forbidden_dir).unwrap();
+
+        let allowed_file = allowed_dir.join("audit.log");
+        let forbidden_file = forbidden_dir.join("daemon_secret.toml");
+        std::fs::write(&forbidden_file, "api_key = 'sk-super-secret'").unwrap();
+
+        let runner = crate::ControlPluginRunner::new();
+        let driver = ExtensionDriverConfig::Wasm {
+            path: editor_wasm_path.clone(),
+            allowed_dirs: vec![allowed_dir.clone()],
+        };
+
+        // 1. Writing inside configured `allowed_dirs` succeeds
+        let res_allowed = runner
+            .invoke(
+                "audit-wasm-plugin",
+                &driver,
+                5000,
+                &ControlHookInvocation {
+                    hook_name: "tools.call".to_string(),
+                    plugin_config: serde_json::json!({}),
+                    payload: serde_json::json!({
+                        "name": "write_file",
+                        "arguments": {
+                            "path": allowed_file.to_string_lossy(),
+                            "content": "audit entry 1"
+                        }
+                    }),
+                },
+            )
+            .await
+            .expect("invoke allowed write");
+        assert_eq!(
+            res_allowed.output.get("success"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&allowed_file).unwrap(),
+            "audit entry 1"
+        );
+
+        // 2. Reading `forbidden_dir/daemon_secret.toml` (outside `allowed_dirs`) is blocked by WASI 0.2
+        let res_forbidden = runner
+            .invoke(
+                "audit-wasm-plugin",
+                &driver,
+                5000,
+                &ControlHookInvocation {
+                    hook_name: "tools.call".to_string(),
+                    plugin_config: serde_json::json!({}),
+                    payload: serde_json::json!({
+                        "name": "read_file",
+                        "arguments": {
+                            "path": forbidden_file.to_string_lossy()
+                        }
+                    }),
+                },
+            )
+            .await
+            .expect("invoke forbidden read");
+        assert_eq!(
+            res_forbidden.output.get("success"),
+            Some(&serde_json::json!(false)),
+            "control-plane WASM plugin must not access host files outside allowed_dirs: {:?}",
+            res_forbidden.output
+        );
+
+        // 3. Outgoing WASI 0.2 HTTP request (`core_host == None`) is allowed by default
+        let work_dir = base_tmp.join("work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let ctrl_plugin = crate::hooks::runtime::WasmPlugin::load_from_file_with_workspace(
+            "audit-wasm-plugin",
+            &editor_wasm_path,
+            &work_dir,
+            &[allowed_dir],
+        )
+        .await
+        .unwrap();
+        let (status, body) = ctrl_plugin
+            .invoke_wasi_http_for_test("GET", &format!("http://{}/jwks", addr))
+            .await
+            .expect("control plugin WASI HTTP allowed by default");
+        assert_eq!(status, 200);
+        assert_eq!(body, "control_http_ok");
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
+    }
 }

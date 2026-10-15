@@ -2,7 +2,7 @@ use crate::error::CoreError;
 use crate::hooks::protocol::HookRequest;
 use crate::hooks::runtime::WasmPlugin;
 use ragents_protocol::{ControlHookInvocation, ControlHookResult, ExtensionDriverConfig};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -35,8 +35,9 @@ impl ControlPluginRunner {
                 ExtensionDriverConfig::Webhook { endpoint } => {
                     self.invoke_webhook(endpoint, invocation).await
                 }
-                ExtensionDriverConfig::Wasm { path } => {
-                    self.invoke_wasm(plugin_id, path, invocation).await
+                ExtensionDriverConfig::Wasm { path, allowed_dirs } => {
+                    self.invoke_wasm(plugin_id, path, allowed_dirs, invocation)
+                        .await
                 }
             }
         };
@@ -96,13 +97,32 @@ impl ControlPluginRunner {
         &self,
         plugin_id: &str,
         path: &Path,
+        allowed_dirs: &[PathBuf],
         invocation: &ControlHookInvocation,
     ) -> Result<ControlHookResult, CoreError> {
-        let work_dir = std::env::temp_dir().join("ragents-control-wasm-work");
+        let safe_id: String = plugin_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let work_dir =
+            std::env::temp_dir()
+                .join("ragents-control-wasm-work")
+                .join(if safe_id.is_empty() {
+                    "default"
+                } else {
+                    &safe_id
+                });
         let _ = std::fs::create_dir_all(&work_dir);
 
         let plugin =
-            WasmPlugin::load_from_file_with_workspace(plugin_id, path, &work_dir, &[]).await?;
+            WasmPlugin::load_from_file_with_workspace(plugin_id, path, &work_dir, allowed_dirs)
+                .await?;
         plugin.initialize(&invocation.plugin_config).await?;
 
         let hook_req = HookRequest {

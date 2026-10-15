@@ -22,8 +22,14 @@ pub enum ExtensionFailPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "driver", rename_all = "snake_case")]
 pub enum ExtensionDriverConfig {
-    /// In-process WebAssembly component (`wasm32-wasip2`, `.wasm` or `.cwasm`)
-    Wasm { path: PathBuf },
+    /// In-process WebAssembly component (`wasm32-wasip2`, `.wasm` or `.cwasm`).
+    /// For `api-server` and `agent-daemon` control plugins, network is open by default,
+    /// while filesystem access is restricted to `allowed_dirs` (plus a plugin-private work dir).
+    Wasm {
+        path: PathBuf,
+        #[serde(default)]
+        allowed_dirs: Vec<PathBuf>,
+    },
     /// Out-of-process HTTP (`http://`, `https://`) or Unix Domain Socket (`unix:///path/to.sock`) webhook
     Webhook { endpoint: String },
 }

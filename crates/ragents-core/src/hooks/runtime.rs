@@ -89,6 +89,7 @@ struct HostState {
     table: ResourceTable,
     plugin_name: String,
     workspace_root: PathBuf,
+    preopen_dirs: Vec<PathBuf>,
     core_host: Option<Arc<dyn CoreHost>>,
     sandbox_state: Arc<SandboxState>,
     /// Tracks the resolved host `PathBuf` for each WASI 0.2 `wasi:filesystem/types.descriptor` resource rep.
@@ -239,14 +240,27 @@ impl HostState {
         is_write: bool,
         op_name: &str,
     ) -> FsResult<()> {
-        let Some(ref host) = self.core_host else {
-            return Ok(());
-        };
-
         let norm_ws = crate::sandbox::canonicalize_or_normalize(&self.workspace_root);
         let norm_target = crate::sandbox::canonicalize_or_normalize(full_path);
         let in_workspace =
             full_path.starts_with(&self.workspace_root) || norm_target.starts_with(&norm_ws);
+
+        // When `core_host` is None (control-plane WASM plugins in `api-server` or `agent-daemon`),
+        // there is no interactive approval channel: strictly restrict filesystem access to
+        // `workspace_root` (the plugin's private work_dir) and explicitly configured `preopen_dirs` (`allowed_dirs`).
+        let Some(ref host) = self.core_host else {
+            if in_workspace {
+                return Ok(());
+            }
+            let in_allowed = self.preopen_dirs.iter().any(|dir| {
+                let norm_dir = crate::sandbox::canonicalize_or_normalize(dir);
+                full_path.starts_with(dir) || norm_target.starts_with(&norm_dir)
+            });
+            if in_allowed {
+                return Ok(());
+            }
+            return Err(wasi_fs_types::ErrorCode::NotPermitted.into());
+        };
 
         // If already approved earlier within this same `invoke` call (e.g. `create_directory_at` right before `open_at`),
         // skip duplicate permission check.
@@ -970,12 +984,29 @@ impl WasmPlugin {
             );
         }
         for dir in preopen_dirs {
-            if let Some(dir_str) = dir.to_str() {
-                let _ = wasi_builder.preopened_dir(dir, dir_str, DirPerms::all(), FilePerms::all());
+            if dir.exists() {
+                if let Some(dir_str) = dir.to_str() {
+                    let _ =
+                        wasi_builder.preopened_dir(dir, dir_str, DirPerms::all(), FilePerms::all());
+                }
+                if let Ok(canon) = dir.canonicalize() {
+                    if canon != *dir {
+                        if let Some(canon_str) = canon.to_str() {
+                            let _ = wasi_builder.preopened_dir(
+                                &canon,
+                                canon_str,
+                                DirPerms::all(),
+                                FilePerms::all(),
+                            );
+                        }
+                    }
+                }
             }
         }
+        // Only preopen "/" when `core_host` is present (agent-core tool plugins with interactive permission gating).
+        // Control-plane WASM plugins (`core_host.is_none()`) never mount "/" and can only see `workspace_root` and `preopen_dirs`.
         #[cfg(unix)]
-        {
+        if core_host.is_some() {
             let _ = wasi_builder.preopened_dir("/", "/", DirPerms::all(), FilePerms::all());
         }
 
@@ -1047,6 +1078,7 @@ impl WasmPlugin {
             table: ResourceTable::new(),
             plugin_name: plugin_name.clone(),
             workspace_root: workspace_root.to_path_buf(),
+            preopen_dirs: preopen_dirs.to_vec(),
             core_host,
             sandbox_state,
             dir_paths: HashMap::new(),
