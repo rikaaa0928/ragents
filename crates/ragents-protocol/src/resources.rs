@@ -490,6 +490,45 @@ pub enum CapabilityRequest {
     },
 }
 
+impl CapabilityRequest {
+    /// Returns a copy of this `CapabilityRequest` with its filesystem path replaced by `override_path` if provided.
+    pub fn with_override_path(&self, override_path: Option<&std::path::Path>) -> Self {
+        let Some(p) = override_path else {
+            return self.clone();
+        };
+        match self {
+            Self::FileRead { .. } => Self::FileRead {
+                path: p.to_path_buf(),
+            },
+            Self::FileWrite { .. } => Self::FileWrite {
+                path: p.to_path_buf(),
+            },
+            Self::CommandWorkDir { .. } => Self::CommandWorkDir {
+                work_dir: p.to_path_buf(),
+            },
+            Self::Http {
+                scheme,
+                host,
+                port,
+                method,
+            } => Self::Http {
+                scheme: scheme.clone(),
+                host: host.clone(),
+                port: *port,
+                method: method.clone(),
+            },
+        }
+    }
+
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::FileRead { path } | Self::FileWrite { path } => Some(path.as_path()),
+            Self::CommandWorkDir { work_dir } => Some(work_dir.as_path()),
+            Self::Http { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultPermissionDecision {
@@ -525,10 +564,18 @@ pub struct PermissionPolicyLayer {
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
     Deny,
+    /// Effective for this single check/command execution only
     AllowOnce,
+    /// Effective for all turns within the current Activation
+    AllowActivation,
+    /// Effective for all Activations within the current Session
     AllowSession,
-    AllowProject,
-    AllowAlways,
+    /// Effective for all Sessions sharing the same workspace_root directory on the node
+    #[serde(alias = "allow_project")]
+    AllowWorkspace,
+    /// Effective for all tasks across the entire Node (agent-daemon)
+    #[serde(alias = "allow_always")]
+    AllowNode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -538,7 +585,11 @@ pub struct PermissionRequest {
     pub activation_id: ActivationId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension_id: Option<String>,
+    /// Suggested / auto-optimized directory capability (e.g. `/Users/alice/.cache/uv`)
     pub capability: CapabilityRequest,
+    /// Raw path that originally triggered the violation (e.g. `/Users/alice/.cache/uv/sdists-v6/.git`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -547,6 +598,9 @@ pub struct PermissionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionResolutionSpec {
     pub decision: PermissionDecision,
+    /// Optional user-adjusted directory/file path overriding the suggested path in `PermissionRequest.capability`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_path: Option<PathBuf>,
     pub responded_at: DateTime<Utc>,
 }
 

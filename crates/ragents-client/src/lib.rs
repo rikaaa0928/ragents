@@ -206,11 +206,23 @@ impl RagentsClient {
         request_id: PermissionRequestId,
         decision: PermissionDecision,
     ) -> Result<Activation, ClientError> {
+        self.respond_permission_with_path(activation_id, request_id, decision, None)
+            .await
+    }
+
+    pub async fn respond_permission_with_path(
+        &self,
+        activation_id: &ActivationId,
+        request_id: PermissionRequestId,
+        decision: PermissionDecision,
+        override_path: Option<std::path::PathBuf>,
+    ) -> Result<Activation, ClientError> {
         let mut interaction_responses = BTreeMap::new();
         interaction_responses.insert(
             request_id,
             PermissionResolutionSpec {
                 decision,
+                override_path,
                 responded_at: Utc::now(),
             },
         );

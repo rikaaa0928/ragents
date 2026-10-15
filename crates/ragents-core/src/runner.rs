@@ -508,18 +508,26 @@ async fn execute_tool_call(
             .check_permission(Some(owner), cap.clone(), Some(reason))
             .await?
         {
-            PermissionOutcome::Allowed => match cap {
-                CapabilityRequest::FileWrite { path } => {
-                    sandbox_state.allow_writable_path(path);
+            PermissionOutcome::Allowed {
+                effective_capability,
+                persist_in_activation,
+            } => {
+                if persist_in_activation {
+                    let granted_cap = effective_capability.unwrap_or(cap);
+                    match granted_cap {
+                        CapabilityRequest::FileWrite { path } => {
+                            sandbox_state.allow_writable_path(path);
+                        }
+                        CapabilityRequest::CommandWorkDir { work_dir } => {
+                            sandbox_state.allow_writable_path(work_dir);
+                        }
+                        CapabilityRequest::FileRead { path } => {
+                            sandbox_state.allow_readable_path(path);
+                        }
+                        CapabilityRequest::Http { .. } => {}
+                    }
                 }
-                CapabilityRequest::CommandWorkDir { work_dir } => {
-                    sandbox_state.allow_writable_path(work_dir);
-                }
-                CapabilityRequest::FileRead { path } => {
-                    sandbox_state.allow_readable_path(path);
-                }
-                CapabilityRequest::Http { .. } => {}
-            },
+            }
             PermissionOutcome::Denied { reason } => {
                 let denied_res = ToolResult::err(format!("Permission denied: {reason}"));
                 let output_item = Item::FunctionCallOutput {
@@ -678,19 +686,31 @@ async fn execute_builtin_request_permission(
         )
         .await?
     {
-        PermissionOutcome::Allowed => {
-            match cap {
-                CapabilityRequest::FileWrite { path } => sandbox_state.allow_writable_path(path),
-                CapabilityRequest::CommandWorkDir { work_dir } => {
-                    sandbox_state.allow_writable_path(work_dir)
+        PermissionOutcome::Allowed {
+            effective_capability,
+            persist_in_activation,
+        } => {
+            let granted_cap = effective_capability.unwrap_or(cap);
+            let final_path_str = granted_cap
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| resolved_path.display().to_string());
+            if persist_in_activation {
+                match granted_cap {
+                    CapabilityRequest::FileWrite { path } => {
+                        sandbox_state.allow_writable_path(path)
+                    }
+                    CapabilityRequest::CommandWorkDir { work_dir } => {
+                        sandbox_state.allow_writable_path(work_dir)
+                    }
+                    CapabilityRequest::FileRead { path } => sandbox_state.allow_readable_path(path),
+                    CapabilityRequest::Http { .. } => {}
                 }
-                CapabilityRequest::FileRead { path } => sandbox_state.allow_readable_path(path),
-                CapabilityRequest::Http { .. } => {}
             }
             let ok_res = ToolResult::ok(format!(
                 "Permission GRANTED for '{}' on '{}'. The OS kernel sandbox has unlocked this path; you may now retry your command.",
                 cap_kind,
-                resolved_path.display()
+                final_path_str
             ));
             Ok((
                 Item::FunctionCallOutput {

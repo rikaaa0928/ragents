@@ -11,8 +11,35 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum PermissionOutcome {
-    Allowed,
-    Denied { reason: String },
+    Allowed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_capability: Option<CapabilityRequest>,
+        #[serde(default = "default_persist_true")]
+        persist_in_activation: bool,
+    },
+    Denied {
+        reason: String,
+    },
+}
+
+fn default_persist_true() -> bool {
+    true
+}
+
+impl PermissionOutcome {
+    pub fn allowed() -> Self {
+        Self::Allowed {
+            effective_capability: None,
+            persist_in_activation: true,
+        }
+    }
+
+    pub fn allowed_with(cap: CapabilityRequest, persist_in_activation: bool) -> Self {
+        Self::Allowed {
+            effective_capability: Some(cap),
+            persist_in_activation,
+        }
+    }
 }
 
 /// Node-local OpenResponses endpoint credentials injected by `agent-daemon`.
@@ -79,6 +106,18 @@ pub trait CoreHost: Send + Sync {
         capability: CapabilityRequest,
         reason: Option<String>,
     ) -> Result<PermissionOutcome, CoreError>;
+
+    async fn check_permission_with_original_path(
+        &self,
+        extension_id: Option<&str>,
+        capability: CapabilityRequest,
+        original_path: Option<PathBuf>,
+        reason: Option<String>,
+    ) -> Result<PermissionOutcome, CoreError> {
+        let _ = original_path;
+        self.check_permission(extension_id, capability, reason)
+            .await
+    }
 
     async fn spawn_child_session(
         &self,

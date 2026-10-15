@@ -122,6 +122,8 @@ pub enum SessionEvent {
     PermissionResolved {
         request_id: PermissionRequestId,
         decision: PermissionDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        override_path: Option<std::path::PathBuf>,
         resulting_snapshot_ref: PermissionSnapshotRef,
     },
 

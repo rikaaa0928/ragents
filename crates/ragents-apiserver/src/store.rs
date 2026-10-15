@@ -1746,6 +1746,7 @@ impl SqliteStore {
                         SessionEvent::PermissionResolved {
                             request_id: req_id,
                             decision: res_spec.decision,
+                            override_path: res_spec.override_path.clone(),
                             resulting_snapshot_ref: snap.permission_snapshot_ref,
                         },
                     )?;

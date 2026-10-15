@@ -149,6 +149,27 @@ impl SandboxState {
             .push(p);
     }
 
+    /// Revokes a temporary path that was unlocked only for a single `AllowOnce` command execution.
+    pub fn revoke_temporary_path(&self, path: &Path) {
+        let mut w_guard = self.writable_paths.lock().expect("writable_paths poisoned");
+        w_guard.retain(|p| p != path);
+        if !path.is_dir() {
+            if let Some(parent) = path.parent() {
+                // Only remove parent if it isn't workspace_root or session_tmp_dir
+                if parent != self.workspace_root && parent != self.session_tmp_dir {
+                    w_guard.retain(|p| p != parent);
+                }
+            }
+        }
+        drop(w_guard);
+
+        let mut r_guard = self
+            .allowed_read_paths
+            .lock()
+            .expect("allowed_read_paths poisoned");
+        r_guard.retain(|p| p != path);
+    }
+
     pub async fn execute_command(
         &self,
         work_dir: &Path,

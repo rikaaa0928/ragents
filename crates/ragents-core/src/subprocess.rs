@@ -38,13 +38,13 @@ impl IpcListener {
     async fn bind(prefer_uds: bool) -> Result<(Self, String), CoreError> {
         #[cfg(unix)]
         if prefer_uds {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static HUB_SEQ: AtomicU64 = AtomicU64::new(1);
+
             let ipc_dir = PathBuf::from("/tmp/ragents-ipc");
             if std::fs::create_dir_all(&ipc_dir).is_ok() {
-                let sock_path = ipc_dir.join(format!(
-                    "daemon_{}_{}.sock",
-                    std::process::id(),
-                    &Uuid::now_v7().simple().to_string()[..8]
-                ));
+                let seq = HUB_SEQ.fetch_add(1, Ordering::Relaxed);
+                let sock_path = ipc_dir.join(format!("d_{}_{}.sock", std::process::id(), seq));
                 let _ = std::fs::remove_file(&sock_path);
                 if let Ok(listener) = tokio::net::UnixListener::bind(&sock_path) {
                     let addr_str = format!("unix:{}", sock_path.to_string_lossy());
@@ -228,6 +228,8 @@ pub enum WorkerToParentMessage {
     CheckPermission {
         extension_id: Option<String>,
         capability: CapabilityRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_path: Option<PathBuf>,
         reason: Option<String>,
     },
     SpawnChildSession {
@@ -514,10 +516,11 @@ impl CoreExecutor for SubprocessExecutor {
                     WorkerToParentMessage::CheckPermission {
                         extension_id,
                         capability,
+                        original_path,
                         reason,
                     } => {
                         let res = tokio::select! {
-                            r = host.check_permission(extension_id.as_deref(), capability, reason) => r.map_err(|e| e.to_string()),
+                            r = host.check_permission_with_original_path(extension_id.as_deref(), capability, original_path, reason) => r.map_err(|e| e.to_string()),
                             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
                         };
                         send_jsonl(
@@ -752,11 +755,23 @@ impl CoreHost for IpcCoreHostProxy {
         capability: CapabilityRequest,
         reason: Option<String>,
     ) -> Result<PermissionOutcome, CoreError> {
+        self.check_permission_with_original_path(extension_id, capability, None, reason)
+            .await
+    }
+
+    async fn check_permission_with_original_path(
+        &self,
+        extension_id: Option<&str>,
+        capability: CapabilityRequest,
+        original_path: Option<PathBuf>,
+        reason: Option<String>,
+    ) -> Result<PermissionOutcome, CoreError> {
         let mut ch = self.channel.lock().await;
         match ch
             .call(&WorkerToParentMessage::CheckPermission {
                 extension_id: extension_id.map(String::from),
                 capability,
+                original_path,
                 reason,
             })
             .await?

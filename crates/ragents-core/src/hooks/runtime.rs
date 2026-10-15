@@ -117,7 +117,7 @@ impl ragent::extension::host::Host for HostState {
                 .check_permission(Some(&self.plugin_name), cap, Some(reason))
                 .await
             {
-                Ok(PermissionOutcome::Allowed) => {}
+                Ok(PermissionOutcome::Allowed { .. }) => {}
                 Ok(PermissionOutcome::Denied { reason }) => {
                     return command_error(format!("Permission denied: {reason}"));
                 }
@@ -130,10 +130,15 @@ impl ragent::extension::host::Host for HostState {
         // 2. OS Kernel Sandboxed Execution with Multi-Directory Loop & Automatic Retry:
         // A single command (e.g. `uv run`, `pip install`, or chained `cmd1 && cmd2 && cmd3`)
         // may require multiple external directories across either the same run or sequential retries.
-        // We loop as long as each retry discovers at least one NEW directory capability to request,
+        // We loop as long as each retry discovers at least one NEW path not yet covered by `unlocked_paths`,
         // up to MAX_SANDBOX_ESCALATION_ROUNDS.
         const MAX_SANDBOX_ESCALATION_ROUNDS: usize = 16;
-        let mut requested_caps: Vec<CapabilityRequest> = Vec::new();
+        let mut unlocked_paths: Vec<PathBuf> = Vec::new();
+        let mut temporary_once_paths: Vec<PathBuf> = Vec::new();
+
+        let mut final_output = command_error(
+            "sandbox multi-directory permission escalation loop exceeded maximum rounds",
+        );
 
         for _round in 0..MAX_SANDBOX_ESCALATION_ROUNDS {
             let (mut output, violations) = self
@@ -142,39 +147,63 @@ impl ragent::extension::host::Host for HostState {
                 .await;
 
             if output.exit_code == 0 || violations.is_empty() {
-                return output;
+                final_output = output;
+                break;
             }
 
             let Some(ref host) = self.core_host else {
-                return output;
+                final_output = output;
+                break;
             };
 
-            // Filter to violations that have not already been requested & unlocked in an earlier round
-            // (prevents infinite loops if a path is blocked by OS SIP/chmod rather than our sandbox).
+            // Filter to violations whose raw_path is not already covered by a previously unlocked directory
+            // (prevents infinite loops if a path is blocked by OS SIP/chmod rather than our sandbox,
+            // while still prompting for sibling directories if the user narrowed `--path` on an earlier round).
             let new_violations: Vec<_> = violations
                 .into_iter()
-                .filter(|v| !requested_caps.contains(&v.capability))
+                .filter(|v| !unlocked_paths.iter().any(|u| v.raw_path.starts_with(u)))
                 .collect();
 
             if new_violations.is_empty() {
-                return output;
+                final_output = output;
+                break;
             }
 
             let mut all_approved = true;
             for v in new_violations {
                 let reason = format!(
-                    "Command `{}` requires {} access to '{}' (normalized directory scope)",
+                    "Command `{}` requires {} access to '{}' (suggested directory: '{}')",
                     command,
                     v.operation,
-                    v.raw_path.display()
+                    v.raw_path.display(),
+                    v.capability
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
                 );
                 match host
-                    .check_permission(Some(&self.plugin_name), v.capability.clone(), Some(reason))
+                    .check_permission_with_original_path(
+                        Some(&self.plugin_name),
+                        v.capability.clone(),
+                        Some(v.raw_path.clone()),
+                        Some(reason),
+                    )
                     .await
                 {
-                    Ok(PermissionOutcome::Allowed) => {
-                        requested_caps.push(v.capability.clone());
-                        match v.capability {
+                    Ok(PermissionOutcome::Allowed {
+                        effective_capability,
+                        persist_in_activation,
+                    }) => {
+                        let granted_cap =
+                            effective_capability.unwrap_or_else(|| v.capability.clone());
+                        if let Some(p) = granted_cap.path() {
+                            unlocked_paths.push(p.to_path_buf());
+                            if !persist_in_activation {
+                                temporary_once_paths.push(p.to_path_buf());
+                            }
+                        }
+                        unlocked_paths.push(v.raw_path.clone());
+                        match granted_cap {
                             CapabilityRequest::FileWrite { path } => {
                                 self.sandbox_state.allow_writable_path(path);
                             }
@@ -206,11 +235,17 @@ impl ragent::extension::host::Host for HostState {
             }
 
             if !all_approved {
-                return output;
+                final_output = output;
+                break;
             }
         }
 
-        command_error("sandbox multi-directory permission escalation loop exceeded maximum rounds")
+        // Revoke any paths that were approved with `AllowOnce` so they don't carry over to future commands
+        for tmp_path in temporary_once_paths {
+            self.sandbox_state.revoke_temporary_path(&tmp_path);
+        }
+
+        final_output
     }
 }
 

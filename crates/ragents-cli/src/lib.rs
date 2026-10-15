@@ -111,6 +111,9 @@ pub enum Commands {
         request_id: String,
         #[arg(long, value_enum, default_value_t = CliPermissionDecision::AllowOnce)]
         decision: CliPermissionDecision,
+        /// Optional custom directory/file path to approve instead of the suggested directory
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Watch real-time cluster or session events via SSE
     Watch {
@@ -184,9 +187,12 @@ pub enum SessionSubcommand {
 pub enum CliPermissionDecision {
     Deny,
     AllowOnce,
+    AllowActivation,
     AllowSession,
-    AllowProject,
-    AllowAlways,
+    #[value(alias = "allow-project")]
+    AllowWorkspace,
+    #[value(alias = "allow-always")]
+    AllowNode,
 }
 
 impl From<CliPermissionDecision> for PermissionDecision {
@@ -194,9 +200,10 @@ impl From<CliPermissionDecision> for PermissionDecision {
         match value {
             CliPermissionDecision::Deny => PermissionDecision::Deny,
             CliPermissionDecision::AllowOnce => PermissionDecision::AllowOnce,
+            CliPermissionDecision::AllowActivation => PermissionDecision::AllowActivation,
             CliPermissionDecision::AllowSession => PermissionDecision::AllowSession,
-            CliPermissionDecision::AllowProject => PermissionDecision::AllowProject,
-            CliPermissionDecision::AllowAlways => PermissionDecision::AllowAlways,
+            CliPermissionDecision::AllowWorkspace => PermissionDecision::AllowWorkspace,
+            CliPermissionDecision::AllowNode => PermissionDecision::AllowNode,
         }
     }
 }
@@ -565,17 +572,19 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             activation_id,
             request_id,
             decision,
+            path,
         } => {
             let act = client
-                .respond_permission(
+                .respond_permission_with_path(
                     &ActivationId::new(&activation_id),
                     PermissionRequestId::new(&request_id),
                     decision.into(),
+                    path.clone(),
                 )
                 .await?;
             println!(
-                "Activation {} permission {} resolved ({:?}), status.phase={:?}",
-                act.metadata.id, request_id, decision, act.status.phase
+                "Activation {} permission {} resolved (decision={:?}, override_path={:?}), status.phase={:?}",
+                act.metadata.id, request_id, decision, path, act.status.phase
             );
             Ok(())
         }
@@ -724,19 +733,38 @@ pub async fn watch_activation_to_completion(
                 println!("[event] tool call finished: {name} (success={success}, {duration_ms}ms)");
             }
             SessionEvent::PermissionRequested { request } => {
+                let suggested = request
+                    .capability
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| format!("{:?}", request.capability));
+                let orig = request
+                    .original_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| suggested.clone());
                 println!(
-                    "[permission required] request_id={} capability={:?} reason={:?}\n  Approve with: ragents --server <url> approve {} {} --decision allow-session",
-                    request.id, request.capability, request.reason, activation_id, request.id
+                    "[permission required] request_id={}\n  original_path : {}\n  suggested_path: {} ({:?})\n  reason        : {:?}\n  Approve default : ragents --server <url> approve {} {} --decision allow-session\n  Approve custom  : ragents --server <url> approve {} {} --decision <allow-once|allow-activation|allow-session|allow-workspace|allow-node> --path <custom_dir>",
+                    request.id,
+                    orig,
+                    suggested,
+                    request.capability,
+                    request.reason,
+                    activation_id,
+                    request.id,
+                    activation_id,
+                    request.id
                 );
             }
             SessionEvent::PermissionResolved {
                 request_id,
                 decision,
+                override_path,
                 ..
             } => {
                 println!(
-                    "[event] permission resolved: request_id={} decision={:?}",
-                    request_id, decision
+                    "[event] permission resolved: request_id={} decision={:?} override_path={:?}",
+                    request_id, decision, override_path
                 );
             }
             SessionEvent::ActivationCompleted { .. } => {

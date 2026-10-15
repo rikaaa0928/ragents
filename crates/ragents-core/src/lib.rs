@@ -50,6 +50,8 @@ mod tests {
         items: Mutex<Vec<Item>>,
         events: Mutex<Vec<SessionEvent>>,
         checked_capabilities: Mutex<Vec<CapabilityRequest>>,
+        checked_original_paths: Mutex<Vec<Option<std::path::PathBuf>>>,
+        override_path_on_approve: Mutex<Option<std::path::PathBuf>>,
     }
 
     #[async_trait]
@@ -93,12 +95,32 @@ mod tests {
 
         async fn check_permission(
             &self,
+            extension_id: Option<&str>,
+            capability: CapabilityRequest,
+            reason: Option<String>,
+        ) -> Result<PermissionOutcome, CoreError> {
+            self.check_permission_with_original_path(extension_id, capability, None, reason)
+                .await
+        }
+
+        async fn check_permission_with_original_path(
+            &self,
             _extension_id: Option<&str>,
             capability: CapabilityRequest,
+            original_path: Option<std::path::PathBuf>,
             _reason: Option<String>,
         ) -> Result<PermissionOutcome, CoreError> {
-            self.checked_capabilities.lock().unwrap().push(capability);
-            Ok(PermissionOutcome::Allowed)
+            self.checked_capabilities
+                .lock()
+                .unwrap()
+                .push(capability.clone());
+            self.checked_original_paths
+                .lock()
+                .unwrap()
+                .push(original_path);
+            let override_p = self.override_path_on_approve.lock().unwrap().clone();
+            let effective = capability.with_override_path(override_p.as_deref());
+            Ok(PermissionOutcome::allowed_with(effective, true))
         }
 
         async fn spawn_child_session(
@@ -608,8 +630,19 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             let caps = host.checked_capabilities.lock().unwrap();
+            let origs = host.checked_original_paths.lock().unwrap();
             // 1 initial CommandWorkDir check + 4 sequential FileWrite directory approvals
             assert_eq!(caps.len(), 5, "caps: {caps:?}");
+            assert!(origs[0].is_none());
+            assert!(
+                origs[1]
+                    .as_ref()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("ext1/a.txt"),
+                "original_path must preserve exact raw file path: {:?}",
+                origs[1]
+            );
         }
 
         let _ = std::fs::remove_dir_all(&base_tmp);

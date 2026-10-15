@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 struct ActiveActivationControl {
     cancel: CancellationToken,
     permission_waiters:
-        Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionDecision>>>>,
+        Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionResolutionSpec>>>>,
 }
 
 #[derive(Clone)]
@@ -32,7 +32,12 @@ pub struct AgentDaemon {
     config: Arc<DaemonConfig>,
     executor: Arc<dyn CoreExecutor>,
     model_backend: Arc<dyn ModelBackend>,
+    /// Session-scoped permission grants (`AllowSession`)
     session_grants: Arc<Mutex<HashMap<SessionId, Vec<CapabilityRequest>>>>,
+    /// Workspace-scoped permission grants (`AllowWorkspace`, keyed by canonicalized `workspace_root`)
+    workspace_grants: Arc<Mutex<HashMap<PathBuf, Vec<CapabilityRequest>>>>,
+    /// Node/Daemon-scoped permission grants (`AllowNode`)
+    node_grants: Arc<Mutex<Vec<CapabilityRequest>>>,
 }
 
 impl AgentDaemon {
@@ -46,6 +51,8 @@ impl AgentDaemon {
             executor,
             model_backend: Arc::new(OpenResponsesModelBackend),
             session_grants: Arc::new(Mutex::new(HashMap::new())),
+            workspace_grants: Arc::new(Mutex::new(HashMap::new())),
+            node_grants: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -155,7 +162,7 @@ impl AgentDaemon {
                                             .expect("waiters mutex poisoned")
                                             .remove(&req_id)
                                         {
-                                            let _ = tx.send(res_spec.decision);
+                                            let _ = tx.send(res_spec);
                                         }
                                     }
                                 }
@@ -228,7 +235,7 @@ impl AgentDaemon {
             }
 
             let permission_waiters: Arc<
-                Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionDecision>>>,
+                Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionResolutionSpec>>>,
             > = Arc::new(Mutex::new(HashMap::new()));
 
             active_tasks
@@ -262,13 +269,33 @@ impl AgentDaemon {
                 return;
             }
 
-            let prior_grants = daemon
+            let norm_ws_key = workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.clone());
+
+            let mut prior_grants = daemon
                 .session_grants
                 .lock()
                 .expect("session_grants mutex poisoned")
                 .get(&sess_id)
                 .cloned()
                 .unwrap_or_default();
+            if let Some(ws_list) = daemon
+                .workspace_grants
+                .lock()
+                .expect("workspace_grants mutex poisoned")
+                .get(&norm_ws_key)
+            {
+                prior_grants.extend(ws_list.iter().cloned());
+            }
+            prior_grants.extend(
+                daemon
+                    .node_grants
+                    .lock()
+                    .expect("node_grants mutex poisoned")
+                    .iter()
+                    .cloned(),
+            );
 
             let mut runtime_permissions = effective_permission.effective_policy.clone();
             for g in &prior_grants {
@@ -309,9 +336,13 @@ impl AgentDaemon {
                 activation_id: act_id.clone(),
                 lease_epoch,
                 workspace_root: workspace_root.clone(),
+                norm_workspace_key: norm_ws_key,
                 session_tmp_dir: session_tmp_dir.clone(),
                 effective_policy: runtime_permissions.clone(),
+                activation_grants: Mutex::new(Vec::new()),
                 session_grants: daemon.session_grants.clone(),
+                workspace_grants: daemon.workspace_grants.clone(),
+                node_grants: daemon.node_grants.clone(),
                 tunnel: tunnel.clone(),
                 permission_waiters,
                 cancellation: task_cancel.clone(),
@@ -387,13 +418,69 @@ struct DaemonCoreHost {
     activation_id: ActivationId,
     lease_epoch: LeaseEpoch,
     workspace_root: PathBuf,
+    norm_workspace_key: PathBuf,
     session_tmp_dir: PathBuf,
     effective_policy: PermissionPolicyLayer,
+    activation_grants: Mutex<Vec<CapabilityRequest>>,
     session_grants: Arc<Mutex<HashMap<SessionId, Vec<CapabilityRequest>>>>,
+    workspace_grants: Arc<Mutex<HashMap<PathBuf, Vec<CapabilityRequest>>>>,
+    node_grants: Arc<Mutex<Vec<CapabilityRequest>>>,
     tunnel: DaemonTunnelHandle,
     permission_waiters:
-        Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionDecision>>>>,
+        Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionResolutionSpec>>>>,
     cancellation: CancellationToken,
+}
+
+impl DaemonCoreHost {
+    fn is_covered_by_grants(&self, capability: &CapabilityRequest) -> bool {
+        if self
+            .activation_grants
+            .lock()
+            .expect("activation_grants mutex poisoned")
+            .iter()
+            .any(|g| capability_covered_by(g, capability, &self.workspace_root))
+        {
+            return true;
+        }
+        if self
+            .session_grants
+            .lock()
+            .expect("session_grants mutex poisoned")
+            .get(&self.session_id)
+            .map(|grants| {
+                grants
+                    .iter()
+                    .any(|g| capability_covered_by(g, capability, &self.workspace_root))
+            })
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if self
+            .workspace_grants
+            .lock()
+            .expect("workspace_grants mutex poisoned")
+            .get(&self.norm_workspace_key)
+            .map(|grants| {
+                grants
+                    .iter()
+                    .any(|g| capability_covered_by(g, capability, &self.workspace_root))
+            })
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if self
+            .node_grants
+            .lock()
+            .expect("node_grants mutex poisoned")
+            .iter()
+            .any(|g| capability_covered_by(g, capability, &self.workspace_root))
+        {
+            return true;
+        }
+        false
+    }
 }
 
 #[async_trait]
@@ -480,19 +567,19 @@ impl CoreHost for DaemonCoreHost {
         capability: CapabilityRequest,
         reason: Option<String>,
     ) -> Result<PermissionOutcome, CoreError> {
-        if self
-            .session_grants
-            .lock()
-            .expect("session_grants mutex poisoned")
-            .get(&self.session_id)
-            .map(|grants| {
-                grants
-                    .iter()
-                    .any(|g| capability_covered_by(g, &capability, &self.workspace_root))
-            })
-            .unwrap_or(false)
-        {
-            return Ok(PermissionOutcome::Allowed);
+        self.check_permission_with_original_path(extension_id, capability, None, reason)
+            .await
+    }
+
+    async fn check_permission_with_original_path(
+        &self,
+        extension_id: Option<&str>,
+        capability: CapabilityRequest,
+        original_path: Option<PathBuf>,
+        reason: Option<String>,
+    ) -> Result<PermissionOutcome, CoreError> {
+        if self.is_covered_by_grants(&capability) {
+            return Ok(PermissionOutcome::allowed());
         }
 
         let eval = evaluate_capability_policy(
@@ -503,7 +590,7 @@ impl CoreHost for DaemonCoreHost {
         );
 
         match eval {
-            PolicyEvalResult::Allow => Ok(PermissionOutcome::Allowed),
+            PolicyEvalResult::Allow => Ok(PermissionOutcome::allowed()),
             PolicyEvalResult::Deny => Ok(PermissionOutcome::Denied {
                 reason: format!("Denied by permission policy for {capability:?}"),
             }),
@@ -521,6 +608,7 @@ impl CoreHost for DaemonCoreHost {
                     activation_id: self.activation_id.clone(),
                     extension_id: extension_id.map(String::from),
                     capability: capability.clone(),
+                    original_path,
                     reason,
                     created_at: Utc::now(),
                 };
@@ -536,26 +624,52 @@ impl CoreHost for DaemonCoreHost {
                     .await
                     .map_err(|e| CoreError::HostError(e.to_string()))?;
 
-                let decision = tokio::select! {
+                let res_spec = tokio::select! {
                     res = rx => res.map_err(|_| CoreError::Cancelled)?,
                     _ = self.cancellation.cancelled() => return Err(CoreError::Cancelled),
                 };
 
-                match decision {
+                let effective_cap =
+                    capability.with_override_path(res_spec.override_path.as_deref());
+
+                match res_spec.decision {
                     PermissionDecision::Deny => Ok(PermissionOutcome::Denied {
                         reason: "Denied by user interaction".to_string(),
                     }),
-                    PermissionDecision::AllowOnce => Ok(PermissionOutcome::Allowed),
-                    PermissionDecision::AllowSession
-                    | PermissionDecision::AllowProject
-                    | PermissionDecision::AllowAlways => {
+                    PermissionDecision::AllowOnce => {
+                        Ok(PermissionOutcome::allowed_with(effective_cap, false))
+                    }
+                    PermissionDecision::AllowActivation => {
+                        self.activation_grants
+                            .lock()
+                            .expect("activation_grants mutex poisoned")
+                            .push(effective_cap.clone());
+                        Ok(PermissionOutcome::allowed_with(effective_cap, true))
+                    }
+                    PermissionDecision::AllowSession => {
                         self.session_grants
                             .lock()
                             .expect("session_grants mutex poisoned")
                             .entry(self.session_id.clone())
                             .or_default()
-                            .push(capability);
-                        Ok(PermissionOutcome::Allowed)
+                            .push(effective_cap.clone());
+                        Ok(PermissionOutcome::allowed_with(effective_cap, true))
+                    }
+                    PermissionDecision::AllowWorkspace => {
+                        self.workspace_grants
+                            .lock()
+                            .expect("workspace_grants mutex poisoned")
+                            .entry(self.norm_workspace_key.clone())
+                            .or_default()
+                            .push(effective_cap.clone());
+                        Ok(PermissionOutcome::allowed_with(effective_cap, true))
+                    }
+                    PermissionDecision::AllowNode => {
+                        self.node_grants
+                            .lock()
+                            .expect("node_grants mutex poisoned")
+                            .push(effective_cap.clone());
+                        Ok(PermissionOutcome::allowed_with(effective_cap, true))
                     }
                 }
             }
