@@ -127,10 +127,72 @@ impl ragent::extension::host::Host for HostState {
             }
         }
 
-        // 2. OS Kernel Sandboxed Execution (macOS Seatbelt / Linux bwrap + Hermetic TMPDIR/XDG_CACHE_HOME)
-        self.sandbox_state
-            .execute_command(&self.workspace_root, &command, timeout_ms)
-            .await
+        // 2. OS Kernel Sandboxed Execution with Automatic Permission Escalation & Retry:
+        // If a command (such as `uv run` or `pip install`) fails because the OS kernel sandbox
+        // blocked writing/reading an external directory (e.g. `~/.cache/uv`), the host automatically
+        // initiates `check_permission` for that directory and retries once approved!
+        for attempt in 0..3 {
+            let (mut output, violations) = self
+                .sandbox_state
+                .execute_command_with_violations(&self.workspace_root, &command, timeout_ms)
+                .await;
+
+            if output.exit_code == 0 || violations.is_empty() || attempt == 2 {
+                return output;
+            }
+
+            let Some(ref host) = self.core_host else {
+                return output;
+            };
+
+            let mut all_approved = true;
+            for v in violations {
+                let reason = format!(
+                    "Command `{}` requires {} access to '{}' (normalized directory scope)",
+                    command,
+                    v.operation,
+                    v.raw_path.display()
+                );
+                match host
+                    .check_permission(Some(&self.plugin_name), v.capability.clone(), Some(reason))
+                    .await
+                {
+                    Ok(PermissionOutcome::Allowed) => match v.capability {
+                        CapabilityRequest::FileWrite { path } => {
+                            self.sandbox_state.allow_writable_path(path);
+                        }
+                        CapabilityRequest::CommandWorkDir { work_dir } => {
+                            self.sandbox_state.allow_writable_path(work_dir);
+                        }
+                        CapabilityRequest::FileRead { path } => {
+                            self.sandbox_state.allow_readable_path(path);
+                        }
+                        CapabilityRequest::Http { .. } => {}
+                    },
+                    Ok(PermissionOutcome::Denied { reason }) => {
+                        output.stderr.push_str(&format!(
+                            "\n[RAGENTS_SANDBOX_DENIED] Permission denied for {:?}: {reason}",
+                            v.capability
+                        ));
+                        all_approved = false;
+                        break;
+                    }
+                    Err(err) => {
+                        output.stderr.push_str(&format!(
+                            "\n[RAGENTS_SANDBOX_ERROR] Permission request failed: {err}"
+                        ));
+                        all_approved = false;
+                        break;
+                    }
+                }
+            }
+
+            if !all_approved {
+                return output;
+            }
+        }
+
+        command_error("sandbox retry loop exhausted")
     }
 }
 

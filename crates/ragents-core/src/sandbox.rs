@@ -1,11 +1,12 @@
 use crate::hooks::runtime::ragent::extension::host::CommandOutput;
 use crate::host::CoreRunSpec;
-use ragents_protocol::PermissionPolicyLayer;
+use ragents_protocol::{CapabilityRequest, PermissionPolicyLayer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// OS Kernel Sandbox enforcement mode for external commands executed by WASM extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -16,8 +17,15 @@ pub enum SandboxMode {
     Auto,
     /// Strictly require OS kernel sandbox; fail command execution if the OS sandbox binary is unavailable.
     Enforce,
-    /// Disable OS kernel sandbox (still applies hermetic `TMPDIR` / `XDG_CACHE_HOME` environment isolation).
+    /// Disable OS kernel sandbox (still applies hermetic `TMPDIR` environment isolation).
     Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxViolation {
+    pub capability: CapabilityRequest,
+    pub raw_path: PathBuf,
+    pub operation: String,
 }
 
 /// Shared, dynamically updatable sandbox policy state for a single activation.
@@ -147,20 +155,40 @@ impl SandboxState {
         command: &str,
         timeout_ms: u64,
     ) -> CommandOutput {
+        self.execute_command_with_violations(work_dir, command, timeout_ms)
+            .await
+            .0
+    }
+
+    /// Executes the command inside the OS sandbox and, if it fails with non-zero exit code,
+    /// returns any detected OS sandbox violations (from fast stderr parsing and macOS kernel logs).
+    pub async fn execute_command_with_violations(
+        &self,
+        work_dir: &Path,
+        command: &str,
+        timeout_ms: u64,
+    ) -> (CommandOutput, Vec<SandboxViolation>) {
         let hermetic_tmp = self.session_tmp_dir.join("tmp");
         let _ = std::fs::create_dir_all(&hermetic_tmp);
+        let trace_tag = format!("RAGENTS_SB_{}", Uuid::now_v7().simple());
 
-        let mut child = match self.build_sandboxed_command(work_dir, command, &hermetic_tmp) {
-            Ok(cmd) => cmd,
-            Err(err) => return command_error(err),
-        };
+        let mut child =
+            match self.build_sandboxed_command(work_dir, command, &hermetic_tmp, &trace_tag) {
+                Ok(cmd) => cmd,
+                Err(err) => return (command_error(err), Vec::new()),
+            };
 
         let output = if timeout_ms == 0 {
             child.output().await
         } else {
             match tokio::time::timeout(Duration::from_millis(timeout_ms), child.output()).await {
                 Ok(result) => result,
-                Err(_) => return command_error(format!("command timed out after {timeout_ms} ms")),
+                Err(_) => {
+                    return (
+                        command_error(format!("command timed out after {timeout_ms} ms")),
+                        Vec::new(),
+                    )
+                }
             }
         };
 
@@ -168,23 +196,60 @@ impl SandboxState {
             Ok(output) => {
                 let exit_code = output.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                if exit_code != 0
-                    && (stderr.contains("Operation not permitted")
-                        || stdout.contains("Operation not permitted"))
-                {
-                    stderr.push_str(
-                        "\n[RAGENTS_SANDBOX_HINT] Command failed with 'Operation not permitted' because the OS kernel sandbox blocks writing to directories outside workspace_root by default. If this command needs write access to an external directory (e.g. a package manager cache root like ~/.cache/uv), call the `request_permission` tool with capability='file_write' and the top-level directory path (e.g. '/Users/.../.cache/uv'), wait for user approval, and then retry the command.",
-                    );
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let mut violations = Vec::new();
+
+                if exit_code != 0 && self.mode != SandboxMode::Disabled {
+                    // 1. Fast path: parse `Operation not permitted` paths directly from stderr/stdout
+                    let combined = format!("{stderr}\n{stdout}");
+                    for raw_path in extract_eperm_paths_from_text(&combined) {
+                        let req_dir = normalize_violation_to_request_dir(&raw_path);
+                        let cap = CapabilityRequest::FileWrite { path: req_dir };
+                        if !violations
+                            .iter()
+                            .any(|v: &SandboxViolation| v.capability == cap)
+                        {
+                            violations.push(SandboxViolation {
+                                capability: cap,
+                                raw_path,
+                                operation: "file-write".to_string(),
+                            });
+                        }
+                    }
+
+                    // 2. Kernel fallback path on macOS: if child process swallowed the path in stderr,
+                    // query macOS Unified Log by `trace_tag`
+                    if violations.is_empty() && cfg!(target_os = "macos") {
+                        for (op, raw_path_str) in query_macos_sandbox_violations(&trace_tag).await {
+                            let raw_path = PathBuf::from(&raw_path_str);
+                            let req_dir = normalize_violation_to_request_dir(&raw_path);
+                            let cap = if op.starts_with("file-read") {
+                                CapabilityRequest::FileRead { path: req_dir }
+                            } else {
+                                CapabilityRequest::FileWrite { path: req_dir }
+                            };
+                            if !violations.iter().any(|v| v.capability == cap) {
+                                violations.push(SandboxViolation {
+                                    capability: cap,
+                                    raw_path,
+                                    operation: op,
+                                });
+                            }
+                        }
+                    }
                 }
-                CommandOutput {
-                    exit_code,
-                    stdout,
-                    stderr,
-                    error: None,
-                }
+
+                (
+                    CommandOutput {
+                        exit_code,
+                        stdout,
+                        stderr,
+                        error: None,
+                    },
+                    violations,
+                )
             }
-            Err(error) => command_error(error),
+            Err(error) => (command_error(error), Vec::new()),
         }
     }
 
@@ -193,6 +258,7 @@ impl SandboxState {
         work_dir: &Path,
         command: &str,
         hermetic_tmp: &Path,
+        trace_tag: &str,
     ) -> Result<tokio::process::Command, String> {
         let writable = self
             .writable_paths
@@ -220,8 +286,13 @@ impl SandboxState {
             c.arg("-c").arg(command);
             c
         } else if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists() {
-            let profile =
-                build_macos_seatbelt_profile(&writable, &denied_write, &denied_read, &allowed_read);
+            let profile = build_macos_seatbelt_profile(
+                &writable,
+                &denied_write,
+                &denied_read,
+                &allowed_read,
+                trace_tag,
+            );
             let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
             c.arg("-p").arg(profile).arg("sh").arg("-c").arg(command);
             c
@@ -253,6 +324,86 @@ impl SandboxState {
     }
 }
 
+/// Normalizes a specific violated file path (such as `/Users/alice/.cache/uv/sdists-v6/.git`)
+/// to its logical parent directory scope (such as `/Users/alice/.cache/uv`) so that a single
+/// user approval unlocks the tool's working directory rather[], prompting for every internal lockfile.
+pub fn normalize_violation_to_request_dir(raw_path: &Path) -> PathBuf {
+    let comps: Vec<Component<'_>> = raw_path.components().collect();
+
+    // 1. Check well-known multi-subdirectory cache/data roots:
+    //    `.../.cache/<tool>/...` -> `.../.cache/<tool>`
+    //    `.../Library/Caches/<tool>/...` -> `.../Library/Caches/<tool>`
+    //    `.../.local/share/<tool>/...` -> `.../.local/share/<tool>`
+    for i in 0..comps.len() {
+        let seg = comps[i].as_os_str().to_string_lossy();
+        if (seg == ".cache" || seg == "Caches") && i + 1 < comps.len() {
+            return comps[..=i + 1].iter().collect();
+        }
+        if seg == ".local" && i + 2 < comps.len() {
+            let next_seg = comps[i + 1].as_os_str().to_string_lossy();
+            if next_seg == "share" || next_seg == "state" {
+                return comps[..=i + 2].iter().collect();
+            }
+        }
+        if matches!(seg.as_ref(), ".cargo" | ".npm" | ".rustup" | ".uv") {
+            return comps[..=i].iter().collect();
+        }
+    }
+
+    // 2. Otherwise, if it's already an existing directory, return it; if it's a file, return its parent directory
+    if raw_path.exists() && raw_path.is_dir() {
+        raw_path.to_path_buf()
+    } else if let Some(parent) = raw_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            return parent.to_path_buf();
+        }
+        raw_path.to_path_buf()
+    } else {
+        raw_path.to_path_buf()
+    }
+}
+
+/// Fast-path extraction of absolute paths from error lines containing `Operation not permitted` / `os error 1`.
+fn extract_eperm_paths_from_text(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if !line.contains("Operation not permitted") && !line.contains("os error 1") {
+            continue;
+        }
+        // Extract absolute path tokens delimited by backticks, single/double quotes, or colons/whitespace
+        for candidate in split_path_candidates(line) {
+            if candidate.starts_with('/') && candidate.len() > 1 && !candidate.starts_with("//") {
+                let p = PathBuf::from(candidate);
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn split_path_candidates(line: &str) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    for part in line.split(['`', '\'', '"']) {
+        let trimmed = part.trim().trim_end_matches(':');
+        if trimmed.starts_with('/') {
+            candidates.push(trimmed);
+        }
+    }
+    if candidates.is_empty() {
+        for token in line.split_whitespace() {
+            let trimmed = token
+                .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ':' | '(' | ')' | ','))
+                .trim_end_matches(':');
+            if trimmed.starts_with('/') {
+                candidates.push(trimmed);
+            }
+        }
+    }
+    candidates
+}
+
 /// Generates a macOS Seatbelt (`sandbox-exec`) SBPL profile that restricts file writes to
 /// `writable_paths` while enforcing `denied_write_paths` and `denied_read_paths`.
 pub fn build_macos_seatbelt_profile(
@@ -260,18 +411,21 @@ pub fn build_macos_seatbelt_profile(
     denied_write_paths: &[PathBuf],
     denied_read_paths: &[PathBuf],
     allowed_read_paths: &[PathBuf],
+    trace_tag: &str,
 ) -> String {
-    let mut profile = String::from(
+    let tag = escape_sbpl(trace_tag);
+    let mut profile = format!(
         "(version 1)\n\
          (allow default)\n\
-         (deny file-write*)\n\
+         (deny file-write* (with message \"{tag}\"))\n\
          (allow file-write*\n\
            (literal \"/dev/null\")\n\
            (literal \"/dev/zero\")\n\
            (literal \"/dev/random\")\n\
            (literal \"/dev/urandom\")\n\
            (literal \"/dev/tty\")\n\
-           (subpath \"/dev/fd\")\n",
+           (literal \"/dev/dtracehelper\")\n\
+           (subpath \"/dev/fd\")\n"
     );
 
     for p in expand_canonical_paths(writable_paths) {
@@ -281,7 +435,7 @@ pub fn build_macos_seatbelt_profile(
 
     let expanded_denied_write = expand_canonical_paths(denied_write_paths);
     if !expanded_denied_write.is_empty() {
-        profile.push_str("(deny file-write*\n");
+        profile.push_str(&format!("(deny file-write* (with message \"{tag}\")\n"));
         for p in expanded_denied_write {
             profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(&p)));
         }
@@ -290,7 +444,7 @@ pub fn build_macos_seatbelt_profile(
 
     let expanded_denied_read = expand_canonical_paths(denied_read_paths);
     if !expanded_denied_read.is_empty() {
-        profile.push_str("(deny file-read-data\n");
+        profile.push_str(&format!("(deny file-read-data (with message \"{tag}\")\n"));
         for p in expanded_denied_read {
             profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(&p)));
         }
@@ -307,6 +461,48 @@ pub fn build_macos_seatbelt_profile(
     }
 
     profile
+}
+
+/// Queries the macOS Unified Log for kernel sandbox violations tagged with `trace_tag`,
+/// extracting `(operation, denied_path)` even when the child process swallowed the path in stderr.
+async fn query_macos_sandbox_violations(trace_tag: &str) -> Vec<(String, String)> {
+    let predicate = format!("sender == \"Sandbox\" AND eventMessage CONTAINS \"{trace_tag}\"");
+    let mut cmd = tokio::process::Command::new("/usr/bin/log");
+    cmd.arg("show")
+        .arg("--last")
+        .arg("10s")
+        .arg("--style")
+        .arg("compact")
+        .arg("--predicate")
+        .arg(predicate)
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(Duration::from_millis(1500), cmd.output()).await {
+        Ok(Ok(out)) => out,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut results = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in text.lines() {
+        if let Some(sb_idx) = line.find("Sandbox: ") {
+            let after_sb = &line[sb_idx + "Sandbox: ".len()..];
+            if let Some(deny_idx) = after_sb.find(") deny(") {
+                let after_deny = &after_sb[deny_idx + ") deny(".len()..];
+                if let Some(close_paren) = after_deny.find(") ") {
+                    let op_and_path = after_deny[close_paren + 2..].trim();
+                    if let Some((op, path)) = op_and_path.split_once(' ') {
+                        let key = format!("{op}:{path}");
+                        if seen.insert(key) {
+                            results.push((op.to_string(), path.trim().to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    results
 }
 
 fn build_linux_bwrap_command(
@@ -371,7 +567,6 @@ fn expand_canonical_paths(paths: &[PathBuf]) -> BTreeSet<String> {
 fn clean_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
-        use std::path::Component;
         match comp {
             Component::CurDir => {}
             Component::ParentDir => {
