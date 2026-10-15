@@ -1,4 +1,5 @@
 pub mod context;
+pub mod control_plugin;
 pub mod error;
 pub mod hooks;
 pub mod host;
@@ -8,6 +9,7 @@ pub mod sandbox;
 pub mod subprocess;
 
 pub use context::*;
+pub use control_plugin::*;
 pub use error::*;
 pub use hooks::*;
 pub use host::*;
@@ -170,6 +172,7 @@ mod tests {
             model_endpoint: ModelEndpointConfig {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local".to_string(),
+                ..Default::default()
             },
             max_turns: None,
         };
@@ -255,6 +258,7 @@ mod tests {
             model_endpoint: ModelEndpointConfig {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local".to_string(),
+                ..Default::default()
             },
             max_turns: None,
         };
@@ -342,6 +346,7 @@ mod tests {
             model_endpoint: ModelEndpointConfig {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local-secret".to_string(),
+                ..Default::default()
             },
             max_turns: None,
         };
@@ -593,6 +598,7 @@ mod tests {
             model_endpoint: ModelEndpointConfig {
                 base_url: "http://127.0.0.1:9999/v1".to_string(),
                 api_key: "sk-local".to_string(),
+                ..Default::default()
             },
             max_turns: None,
         };

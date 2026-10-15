@@ -1,4 +1,5 @@
 use crate::config::{DaemonConfig, ExecutorMode};
+use crate::interceptors::{DaemonInterceptor, DaemonInterceptorChain, InterceptedModelBackend};
 use crate::permission::{capability_covered_by, evaluate_capability_policy, PolicyEvalResult};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -32,6 +33,7 @@ pub struct AgentDaemon {
     config: Arc<DaemonConfig>,
     executor: Arc<dyn CoreExecutor>,
     model_backend: Arc<dyn ModelBackend>,
+    interceptor_chain: DaemonInterceptorChain,
     /// Session-scoped permission grants (`AllowSession`)
     session_grants: Arc<Mutex<HashMap<SessionId, Vec<CapabilityRequest>>>>,
     /// Workspace-scoped permission grants (`AllowWorkspace`, keyed by canonicalized `workspace_root`)
@@ -46,10 +48,12 @@ impl AgentDaemon {
             ExecutorMode::Subprocess => Arc::new(SubprocessExecutor::new()),
             ExecutorMode::InProcess => Arc::new(InProcessExecutor),
         };
+        let interceptor_chain = DaemonInterceptorChain::from_specs(&config.interceptors);
         Self {
             config: Arc::new(config),
             executor,
             model_backend: Arc::new(OpenResponsesModelBackend),
+            interceptor_chain,
             session_grants: Arc::new(Mutex::new(HashMap::new())),
             workspace_grants: Arc::new(Mutex::new(HashMap::new())),
             node_grants: Arc::new(Mutex::new(Vec::new())),
@@ -63,6 +67,11 @@ impl AgentDaemon {
 
     pub fn with_model_backend(mut self, model_backend: Arc<dyn ModelBackend>) -> Self {
         self.model_backend = model_backend;
+        self
+    }
+
+    pub fn with_interceptor(mut self, interceptor: Arc<dyn DaemonInterceptor>) -> Self {
+        self.interceptor_chain.push(interceptor);
         self
     }
 
@@ -332,6 +341,7 @@ impl AgentDaemon {
             }
 
             let host = Arc::new(DaemonCoreHost {
+                node_id: daemon.config.node_id.clone(),
                 session_id: sess_id.clone(),
                 activation_id: act_id.clone(),
                 lease_epoch,
@@ -339,6 +349,7 @@ impl AgentDaemon {
                 norm_workspace_key: norm_ws_key,
                 session_tmp_dir: session_tmp_dir.clone(),
                 effective_policy: runtime_permissions.clone(),
+                interceptor_chain: daemon.interceptor_chain.clone(),
                 activation_grants: Mutex::new(Vec::new()),
                 session_grants: daemon.session_grants.clone(),
                 workspace_grants: daemon.workspace_grants.clone(),
@@ -359,9 +370,23 @@ impl AgentDaemon {
                 max_turns: daemon.config.max_turns,
             };
 
+            let effective_model_backend: Arc<dyn ModelBackend> =
+                if daemon.interceptor_chain.is_empty() {
+                    daemon.model_backend.clone()
+                } else {
+                    Arc::new(InterceptedModelBackend {
+                        node_id: daemon.config.node_id.clone(),
+                        session_id: sess_id.clone(),
+                        activation_id: act_id.clone(),
+                        session_labels: session.metadata.labels.clone(),
+                        chain: daemon.interceptor_chain.clone(),
+                        inner: daemon.model_backend.clone(),
+                    })
+                };
+
             let exec_res = daemon
                 .executor
-                .execute(run_spec, host, daemon.model_backend.clone(), task_cancel)
+                .execute(run_spec, host, effective_model_backend, task_cancel)
                 .await;
 
             active_runners.fetch_sub(1, Ordering::Relaxed);
@@ -414,6 +439,7 @@ impl AgentDaemon {
 }
 
 struct DaemonCoreHost {
+    node_id: NodeId,
     session_id: SessionId,
     activation_id: ActivationId,
     lease_epoch: LeaseEpoch,
@@ -421,6 +447,7 @@ struct DaemonCoreHost {
     norm_workspace_key: PathBuf,
     session_tmp_dir: PathBuf,
     effective_policy: PermissionPolicyLayer,
+    interceptor_chain: DaemonInterceptorChain,
     activation_grants: Mutex<Vec<CapabilityRequest>>,
     session_grants: Arc<Mutex<HashMap<SessionId, Vec<CapabilityRequest>>>>,
     workspace_grants: Arc<Mutex<HashMap<PathBuf, Vec<CapabilityRequest>>>>,
@@ -574,7 +601,7 @@ impl CoreHost for DaemonCoreHost {
     async fn check_permission_with_original_path(
         &self,
         extension_id: Option<&str>,
-        capability: CapabilityRequest,
+        mut capability: CapabilityRequest,
         original_path: Option<PathBuf>,
         reason: Option<String>,
     ) -> Result<PermissionOutcome, CoreError> {
@@ -582,12 +609,43 @@ impl CoreHost for DaemonCoreHost {
             return Ok(PermissionOutcome::allowed());
         }
 
-        let eval = evaluate_capability_policy(
-            &self.effective_policy,
-            &self.workspace_root,
-            &self.session_tmp_dir,
-            &capability,
-        );
+        // Run custom daemon permission interceptors before static policy evaluation
+        let mut forced_eval: Option<PolicyEvalResult> = None;
+        if !self.interceptor_chain.is_empty() {
+            let p_input = PermissionInterceptInput {
+                node_id: self.node_id.clone(),
+                session_id: self.session_id.clone(),
+                activation_id: self.activation_id.clone(),
+                extension_id: extension_id.map(String::from),
+                capability: capability.clone(),
+                original_path: original_path.clone(),
+                reason: reason.clone(),
+                workspace_root: self.workspace_root.clone(),
+            };
+            match self.interceptor_chain.evaluate_permission(&p_input).await? {
+                PermissionInterceptOutcome::Abstain => {}
+                PermissionInterceptOutcome::Allow { override_path } => {
+                    let effective = capability.with_override_path(override_path.as_deref());
+                    return Ok(PermissionOutcome::allowed_with(effective, true));
+                }
+                PermissionInterceptOutcome::Deny { reason } => {
+                    return Ok(PermissionOutcome::Denied { reason });
+                }
+                PermissionInterceptOutcome::Ask { suggested_path } => {
+                    capability = capability.with_override_path(suggested_path.as_deref());
+                    forced_eval = Some(PolicyEvalResult::Ask);
+                }
+            }
+        }
+
+        let eval = forced_eval.unwrap_or_else(|| {
+            evaluate_capability_policy(
+                &self.effective_policy,
+                &self.workspace_root,
+                &self.session_tmp_dir,
+                &capability,
+            )
+        });
 
         match eval {
             PolicyEvalResult::Allow => Ok(PermissionOutcome::allowed()),

@@ -22,6 +22,7 @@ wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

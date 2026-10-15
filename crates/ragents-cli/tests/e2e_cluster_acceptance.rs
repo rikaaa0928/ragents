@@ -126,6 +126,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
             base_url: llm_base_url,
             api_key: Some("sk-local-node-secret".to_string()),
             api_key_env: None,
+            extra_headers: BTreeMap::new(),
             default_temperature: Some(0.0),
             default_max_output_tokens: Some(1024),
         },
@@ -134,6 +135,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
     let daemon_cfg = DaemonConfig {
         node_id: NodeId::new("node_dev_mac"),
         server_url: server_url.clone(),
+        auth_token: None,
         executor_mode: ExecutorMode::Subprocess,
         max_concurrent_runners: 4,
         max_turns: None,
@@ -148,6 +150,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
             enabled: true,
             config: serde_json::json!({}),
         }],
+        interceptors: vec![],
         default_permissions: PermissionPolicyLayer::default(),
     };
 

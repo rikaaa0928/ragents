@@ -12,6 +12,17 @@ pub trait ModelBackend: Send + Sync {
         endpoint: &ModelEndpointConfig,
         request: CreateResponseBody,
     ) -> Result<ResponseResource, CoreError>;
+
+    /// Invokes the OpenResponses endpoint with a raw/mutated JSON payload (supporting vendor-specific
+    /// fields injected by `agent-daemon` interceptors) and custom headers (`endpoint.extra_headers`).
+    async fn create_response_raw(
+        &self,
+        endpoint: &ModelEndpointConfig,
+        request_json: serde_json::Value,
+    ) -> Result<ResponseResource, CoreError> {
+        let req: CreateResponseBody = serde_json::from_value(request_json)?;
+        self.create_response(endpoint, req).await
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -24,11 +35,50 @@ impl ModelBackend for OpenResponsesModelBackend {
         endpoint: &ModelEndpointConfig,
         request: CreateResponseBody,
     ) -> Result<ResponseResource, CoreError> {
-        let client = Client::with_base_url(endpoint.api_key.clone(), endpoint.base_url.clone());
-        client
-            .create_response(request)
+        if endpoint.extra_headers.is_empty() {
+            let client = Client::with_base_url(endpoint.api_key.clone(), endpoint.base_url.clone());
+            return client
+                .create_response(request)
+                .await
+                .map_err(CoreError::from);
+        }
+        let raw = serde_json::to_value(&request)?;
+        self.create_response_raw(endpoint, raw).await
+    }
+
+    async fn create_response_raw(
+        &self,
+        endpoint: &ModelEndpointConfig,
+        request_json: serde_json::Value,
+    ) -> Result<ResponseResource, CoreError> {
+        let url = format!("{}/responses", endpoint.base_url.trim_end_matches('/'));
+        let http = reqwest::Client::new();
+        let mut req_builder = http
+            .post(&url)
+            .bearer_auth(&endpoint.api_key)
+            .json(&request_json);
+
+        for (k, v) in &endpoint.extra_headers {
+            req_builder = req_builder.header(k, v);
+        }
+
+        let resp = req_builder
+            .send()
             .await
-            .map_err(CoreError::from)
+            .map_err(|e| CoreError::ResponseFailed(format!("HTTP transport error: {e}")))?;
+        let status = resp.status();
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| CoreError::ResponseFailed(format!("HTTP read body error: {e}")))?;
+
+        if !status.is_success() {
+            return Err(CoreError::ResponseFailed(format!(
+                "OpenResponses HTTP {status}: {body_text}"
+            )));
+        }
+
+        serde_json::from_str(&body_text).map_err(CoreError::Json)
     }
 }
 

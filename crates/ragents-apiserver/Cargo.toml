@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 ragents-protocol.workspace = true
+ragents-core.workspace = true
 openresponses-rust.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true

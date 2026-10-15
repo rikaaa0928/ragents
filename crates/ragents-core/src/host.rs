@@ -44,10 +44,12 @@ impl PermissionOutcome {
 
 /// Node-local OpenResponses endpoint credentials injected by `agent-daemon`.
 /// Never serialized into `ConfigRevision` or sent to `api-server`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ModelEndpointConfig {
     pub base_url: String,
     pub api_key: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extra_headers: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -33,6 +33,8 @@ pub struct LocalModelConfig {
     #[serde(default)]
     pub api_key_env: Option<String>,
     #[serde(default)]
+    pub extra_headers: BTreeMap<String, String>,
+    #[serde(default)]
     pub default_temperature: Option<f64>,
     #[serde(default)]
     pub default_max_output_tokens: Option<i32>,
@@ -75,6 +77,8 @@ pub struct DaemonConfig {
     #[serde(default = "default_server_url")]
     pub server_url: String,
     #[serde(default)]
+    pub auth_token: Option<String>,
+    #[serde(default)]
     pub executor_mode: ExecutorMode,
     #[serde(default = "default_max_concurrent_runners")]
     pub max_concurrent_runners: u32,
@@ -92,6 +96,8 @@ pub struct DaemonConfig {
     pub models: BTreeMap<String, LocalModelConfig>,
     #[serde(default)]
     pub extensions: Vec<ExtensionSpec>,
+    #[serde(default)]
+    pub interceptors: Vec<DaemonInterceptorSpec>,
     #[serde(default)]
     pub default_permissions: PermissionPolicyLayer,
 }
@@ -133,6 +139,7 @@ impl DaemonConfig {
                 base_url,
                 api_key: Some(api_key),
                 api_key_env: None,
+                extra_headers: BTreeMap::new(),
                 default_temperature: None,
                 default_max_output_tokens: None,
             },
@@ -141,6 +148,7 @@ impl DaemonConfig {
         Self {
             node_id: node_id.into(),
             server_url: server_url.into(),
+            auth_token: std::env::var("RAGENTS_AUTH_TOKEN").ok(),
             executor_mode: ExecutorMode::Subprocess,
             max_concurrent_runners: default_max_concurrent_runners(),
             max_turns: None,
@@ -150,6 +158,7 @@ impl DaemonConfig {
             labels: BTreeMap::new(),
             models,
             extensions: Vec::new(),
+            interceptors: Vec::new(),
             default_permissions: PermissionPolicyLayer::default(),
         }
     }
@@ -197,6 +206,7 @@ impl DaemonConfig {
         let endpoint = ModelEndpointConfig {
             base_url: local_model.base_url.clone(),
             api_key,
+            extra_headers: local_model.extra_headers.clone(),
         };
 
         let temperature = activation
