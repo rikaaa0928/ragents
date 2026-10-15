@@ -127,17 +127,21 @@ impl ragent::extension::host::Host for HostState {
             }
         }
 
-        // 2. OS Kernel Sandboxed Execution with Automatic Permission Escalation & Retry:
-        // If a command (such as `uv run` or `pip install`) fails because the OS kernel sandbox
-        // blocked writing/reading an external directory (e.g. `~/.cache/uv`), the host automatically
-        // initiates `check_permission` for that directory and retries once approved!
-        for attempt in 0..3 {
+        // 2. OS Kernel Sandboxed Execution with Multi-Directory Loop & Automatic Retry:
+        // A single command (e.g. `uv run`, `pip install`, or chained `cmd1 && cmd2 && cmd3`)
+        // may require multiple external directories across either the same run or sequential retries.
+        // We loop as long as each retry discovers at least one NEW directory capability to request,
+        // up to MAX_SANDBOX_ESCALATION_ROUNDS.
+        const MAX_SANDBOX_ESCALATION_ROUNDS: usize = 16;
+        let mut requested_caps: Vec<CapabilityRequest> = Vec::new();
+
+        for _round in 0..MAX_SANDBOX_ESCALATION_ROUNDS {
             let (mut output, violations) = self
                 .sandbox_state
                 .execute_command_with_violations(&self.workspace_root, &command, timeout_ms)
                 .await;
 
-            if output.exit_code == 0 || violations.is_empty() || attempt == 2 {
+            if output.exit_code == 0 || violations.is_empty() {
                 return output;
             }
 
@@ -145,8 +149,19 @@ impl ragent::extension::host::Host for HostState {
                 return output;
             };
 
+            // Filter to violations that have not already been requested & unlocked in an earlier round
+            // (prevents infinite loops if a path is blocked by OS SIP/chmod rather than our sandbox).
+            let new_violations: Vec<_> = violations
+                .into_iter()
+                .filter(|v| !requested_caps.contains(&v.capability))
+                .collect();
+
+            if new_violations.is_empty() {
+                return output;
+            }
+
             let mut all_approved = true;
-            for v in violations {
+            for v in new_violations {
                 let reason = format!(
                     "Command `{}` requires {} access to '{}' (normalized directory scope)",
                     command,
@@ -157,18 +172,21 @@ impl ragent::extension::host::Host for HostState {
                     .check_permission(Some(&self.plugin_name), v.capability.clone(), Some(reason))
                     .await
                 {
-                    Ok(PermissionOutcome::Allowed) => match v.capability {
-                        CapabilityRequest::FileWrite { path } => {
-                            self.sandbox_state.allow_writable_path(path);
+                    Ok(PermissionOutcome::Allowed) => {
+                        requested_caps.push(v.capability.clone());
+                        match v.capability {
+                            CapabilityRequest::FileWrite { path } => {
+                                self.sandbox_state.allow_writable_path(path);
+                            }
+                            CapabilityRequest::CommandWorkDir { work_dir } => {
+                                self.sandbox_state.allow_writable_path(work_dir);
+                            }
+                            CapabilityRequest::FileRead { path } => {
+                                self.sandbox_state.allow_readable_path(path);
+                            }
+                            CapabilityRequest::Http { .. } => {}
                         }
-                        CapabilityRequest::CommandWorkDir { work_dir } => {
-                            self.sandbox_state.allow_writable_path(work_dir);
-                        }
-                        CapabilityRequest::FileRead { path } => {
-                            self.sandbox_state.allow_readable_path(path);
-                        }
-                        CapabilityRequest::Http { .. } => {}
-                    },
+                    }
                     Ok(PermissionOutcome::Denied { reason }) => {
                         output.stderr.push_str(&format!(
                             "\n[RAGENTS_SANDBOX_DENIED] Permission denied for {:?}: {reason}",
@@ -192,7 +210,7 @@ impl ragent::extension::host::Host for HostState {
             }
         }
 
-        command_error("sandbox retry loop exhausted")
+        command_error("sandbox multi-directory permission escalation loop exceeded maximum rounds")
     }
 }
 

@@ -49,6 +49,7 @@ mod tests {
     struct MockCoreHost {
         items: Mutex<Vec<Item>>,
         events: Mutex<Vec<SessionEvent>>,
+        checked_capabilities: Mutex<Vec<CapabilityRequest>>,
     }
 
     #[async_trait]
@@ -93,9 +94,10 @@ mod tests {
         async fn check_permission(
             &self,
             _extension_id: Option<&str>,
-            _capability: CapabilityRequest,
+            capability: CapabilityRequest,
             _reason: Option<String>,
         ) -> Result<PermissionOutcome, CoreError> {
+            self.checked_capabilities.lock().unwrap().push(capability);
             Ok(PermissionOutcome::Allowed)
         }
 
@@ -116,6 +118,7 @@ mod tests {
         let host = Arc::new(MockCoreHost {
             items: Mutex::new(vec![Item::user_message("what is 2+2?")]),
             events: Mutex::new(vec![]),
+            ..Default::default()
         });
 
         let resp = make_openresponses_resource(
@@ -182,6 +185,7 @@ mod tests {
         let host = Arc::new(MockCoreHost {
             items: Mutex::new(vec![Item::user_message("create hello.txt")]),
             events: Mutex::new(vec![]),
+            ..Default::default()
         });
 
         let fc_item = Item::FunctionCall {
@@ -266,6 +270,7 @@ mod tests {
         let host = Arc::new(MockCoreHost {
             items: Mutex::new(vec![Item::user_message("create subproc.txt")]),
             events: Mutex::new(vec![]),
+            ..Default::default()
         });
 
         let fc_item = Item::FunctionCall {
@@ -479,6 +484,132 @@ mod tests {
                 std::fs::read_to_string(&outside_file).unwrap().trim(),
                 "approved_write"
             );
+        }
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
+    }
+
+    #[tokio::test]
+    async fn test_multi_directory_auto_permission_escalation_loop_in_single_shell_call() {
+        let shell_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm",
+        );
+        if !shell_wasm_path.exists() {
+            return;
+        }
+
+        let base_tmp =
+            std::env::temp_dir().join(format!("ragents-multi-dir-{}", uuid::Uuid::now_v7()));
+        let ws_root = base_tmp.join("ws");
+        let sess_tmp = base_tmp.join("tmp");
+        let ext1 = base_tmp.join("ext1");
+        let ext2 = base_tmp.join("ext2");
+        let ext3 = base_tmp.join("ext3");
+        let ext4 = base_tmp.join("ext4");
+        for d in [&ws_root, &sess_tmp, &ext1, &ext2, &ext3, &ext4] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // Single command that sequentially writes to 4 different external directories via `&&`
+        let chained_cmd = format!(
+            "echo d1 > '{}/a.txt' && echo d2 > '{}/b.txt' && echo d3 > '{}/c.txt' && echo d4 > '{}/d.txt'",
+            ext1.display(),
+            ext2.display(),
+            ext3.display(),
+            ext4.display()
+        );
+
+        let host = Arc::new(MockCoreHost {
+            items: Mutex::new(vec![Item::user_message("run chained multi-dir command")]),
+            ..Default::default()
+        });
+
+        let fc_item = Item::FunctionCall {
+            id: Some("fc_multi".to_string()),
+            call_id: "call_multi_1".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({
+                "command": chained_cmd,
+                "timeout_seconds": 10
+            })
+            .to_string(),
+            status: None,
+        };
+
+        let resp1 = make_openresponses_resource("resp_m1", "gpt-4.1", vec![fc_item], None);
+        let resp2 = make_openresponses_resource(
+            "resp_m2",
+            "gpt-4.1",
+            vec![Item::assistant_message(
+                "All 4 external directories written.",
+            )],
+            None,
+        );
+
+        let model_backend = Arc::new(MockModelBackend {
+            responses: Mutex::new(vec![resp1, resp2]),
+        });
+
+        let cfg = ConfigRevision::new_merged(
+            "You are a coding assistant.".to_string(),
+            ModelRequestSpec::new("gpt-4.1"),
+            vec![ExtensionSpec {
+                name: "shell".to_string(),
+                path: shell_wasm_path.to_string_lossy().to_string(),
+                enabled: true,
+                config: serde_json::json!({}),
+            }],
+        );
+
+        let run_spec = CoreRunSpec {
+            session_id: SessionId::new("sess_multi"),
+            activation_id: ActivationId::new("act_multi"),
+            workspace_root: ws_root,
+            session_tmp_dir: sess_tmp,
+            effective_config: cfg,
+            effective_permissions: PermissionPolicyLayer::default(),
+            model_endpoint: ModelEndpointConfig {
+                base_url: "http://127.0.0.1:9999/v1".to_string(),
+                api_key: "sk-local".to_string(),
+            },
+            max_turns: None,
+        };
+
+        let executor = SubprocessExecutor::new();
+        let summary = executor
+            .execute(
+                run_spec,
+                host.clone(),
+                model_backend,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute multi-directory auto permission loop");
+
+        assert_eq!(summary.final_text, "All 4 external directories written.");
+        assert_eq!(summary.turns_executed, 2);
+        assert_eq!(
+            std::fs::read_to_string(ext1.join("a.txt")).unwrap().trim(),
+            "d1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ext2.join("b.txt")).unwrap().trim(),
+            "d2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ext3.join("c.txt")).unwrap().trim(),
+            "d3"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ext4.join("d.txt")).unwrap().trim(),
+            "d4"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let caps = host.checked_capabilities.lock().unwrap();
+            // 1 initial CommandWorkDir check + 4 sequential FileWrite directory approvals
+            assert_eq!(caps.len(), 5, "caps: {caps:?}");
         }
 
         let _ = std::fs::remove_dir_all(&base_tmp);

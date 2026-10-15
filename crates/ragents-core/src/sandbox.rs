@@ -337,30 +337,36 @@ pub fn normalize_violation_to_request_dir(raw_path: &Path) -> PathBuf {
     for i in 0..comps.len() {
         let seg = comps[i].as_os_str().to_string_lossy();
         if (seg == ".cache" || seg == "Caches") && i + 1 < comps.len() {
-            return comps[..=i + 1].iter().collect();
+            let dir: PathBuf = comps[..=i + 1].iter().collect();
+            return canonicalize_with_nonexistent_tail(&dir).unwrap_or(dir);
         }
         if seg == ".local" && i + 2 < comps.len() {
             let next_seg = comps[i + 1].as_os_str().to_string_lossy();
             if next_seg == "share" || next_seg == "state" {
-                return comps[..=i + 2].iter().collect();
+                let dir: PathBuf = comps[..=i + 2].iter().collect();
+                return canonicalize_with_nonexistent_tail(&dir).unwrap_or(dir);
             }
         }
         if matches!(seg.as_ref(), ".cargo" | ".npm" | ".rustup" | ".uv") {
-            return comps[..=i].iter().collect();
+            let dir: PathBuf = comps[..=i].iter().collect();
+            return canonicalize_with_nonexistent_tail(&dir).unwrap_or(dir);
         }
     }
 
     // 2. Otherwise, if it's already an existing directory, return it; if it's a file, return its parent directory
-    if raw_path.exists() && raw_path.is_dir() {
+    let dir = if raw_path.exists() && raw_path.is_dir() {
         raw_path.to_path_buf()
     } else if let Some(parent) = raw_path.parent() {
         if !parent.as_os_str().is_empty() {
-            return parent.to_path_buf();
+            parent.to_path_buf()
+        } else {
+            raw_path.to_path_buf()
         }
-        raw_path.to_path_buf()
     } else {
         raw_path.to_path_buf()
-    }
+    };
+
+    canonicalize_with_nonexistent_tail(&dir).unwrap_or(dir)
 }
 
 /// Fast-path extraction of absolute paths from error lines containing `Operation not permitted` / `os error 1`.
