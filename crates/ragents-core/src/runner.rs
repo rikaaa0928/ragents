@@ -315,7 +315,6 @@ impl CoreExecutor for InProcessExecutor {
             &hook_manager,
             host.as_ref(),
             model_backend.as_ref(),
-            &sandbox_state,
             &cancellation,
         )
         .await;
@@ -356,7 +355,6 @@ async fn run_react_loop(
     hook_manager: &HookManager,
     host: &dyn CoreHost,
     model_backend: &dyn ModelBackend,
-    sandbox_state: &SandboxState,
     cancellation: &CancellationToken,
 ) -> Result<CoreRunSummary, CoreError> {
     let cfg = &run_spec.effective_config;
@@ -396,7 +394,7 @@ async fn run_react_loop(
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut request_tools = active_tools
+    let request_tools = active_tools
         .iter()
         .map(|t| {
             Tool::function(t.definition.name.clone())
@@ -404,40 +402,6 @@ async fn run_react_loop(
                 .with_parameters(t.definition.parameters.clone())
         })
         .collect::<Vec<_>>();
-
-    if !active_tools.is_empty()
-        && !request_tools.iter().any(|t| match t {
-            Tool::Function { name, .. } => name == "request_permission",
-            _ => false,
-        })
-    {
-        request_tools.push(
-            Tool::function("request_permission".to_string())
-                .with_description(
-                    "Request user permission to read/write an external directory or file outside workspace_root (e.g., when a shell command fails with 'Operation not permitted' because a tool like uv/pip/npm needs write access to ~/.cache/uv)."
-                        .to_string(),
-                )
-                .with_parameters(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "capability": {
-                            "type": "string",
-                            "enum": ["file_write", "file_read", "command_work_dir"],
-                            "description": "Capability type to request (usually 'file_write' for external caches/directories)."
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Absolute path of the directory or file to unlock (prefer the top-level directory such as '/Users/.../.cache/uv' rather than an internal lockfile)."
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Explanation shown to the user for why this permission is needed."
-                        }
-                    },
-                    "required": ["capability", "path", "reason"]
-                })),
-        );
-    }
 
     let mut iteration = 0usize;
     let mut final_text = String::new();
@@ -589,12 +553,10 @@ async fn run_react_loop(
                 let started_at = Instant::now();
                 let (tool_output_item, success) = tokio::select! {
                     res = execute_tool_call(
-                        run_spec,
                         call,
                         &active_tools,
                         hook_manager,
                         host,
-                        sandbox_state,
                         iteration,
                     ) => res?,
                     _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
@@ -733,18 +695,12 @@ async fn apply_context_append_hook(
 }
 
 async fn execute_tool_call(
-    run_spec: &CoreRunSpec,
     call: &AgentFunctionCall,
     active_tools: &[ToolEntry],
     hook_manager: &HookManager,
     host: &dyn CoreHost,
-    sandbox_state: &SandboxState,
     iteration: usize,
 ) -> Result<(Item, bool), CoreError> {
-    if call.name == "request_permission" {
-        return execute_builtin_request_permission(run_spec, call, host, sandbox_state).await;
-    }
-
     let tool = match active_tools.iter().find(|t| t.definition.name == call.name) {
         Some(t) => t,
         None => {
@@ -861,118 +817,6 @@ async fn execute_tool_call(
     };
 
     Ok((output_item, success))
-}
-
-async fn execute_builtin_request_permission(
-    run_spec: &CoreRunSpec,
-    call: &AgentFunctionCall,
-    host: &dyn CoreHost,
-    sandbox_state: &SandboxState,
-) -> Result<(Item, bool), CoreError> {
-    let args: serde_json::Value = serde_json::from_str(&call.arguments)
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    let cap_kind = args
-        .get("capability")
-        .and_then(|v| v.as_str())
-        .unwrap_or("file_write");
-    let raw_path = match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) if !p.trim().is_empty() => p.trim(),
-        _ => {
-            let err_item = Item::FunctionCallOutput {
-                id: None,
-                call_id: call.call_id.clone(),
-                output: ToolResult::err("Missing required string argument 'path'".to_string())
-                    .output
-                    .to_function_output(),
-                status: None,
-            };
-            return Ok((err_item, false));
-        }
-    };
-    let reason = args
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Agent requested external path access")
-        .to_string();
-
-    let resolved_path = {
-        let p = Path::new(raw_path);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            run_spec.workspace_root.join(p)
-        }
-    };
-
-    let cap = match cap_kind {
-        "file_read" => CapabilityRequest::FileRead {
-            path: resolved_path.clone(),
-        },
-        "command_work_dir" => CapabilityRequest::CommandWorkDir {
-            work_dir: resolved_path.clone(),
-        },
-        _ => CapabilityRequest::FileWrite {
-            path: resolved_path.clone(),
-        },
-    };
-
-    match host
-        .check_permission(
-            Some("builtin:request_permission"),
-            cap.clone(),
-            Some(reason),
-        )
-        .await?
-    {
-        PermissionOutcome::Allowed {
-            effective_capability,
-            persist_in_activation,
-        } => {
-            let granted_cap = effective_capability.unwrap_or(cap);
-            let final_path_str = granted_cap
-                .path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| resolved_path.display().to_string());
-            if persist_in_activation {
-                match granted_cap {
-                    CapabilityRequest::FileWrite { path } => {
-                        sandbox_state.allow_writable_path(path)
-                    }
-                    CapabilityRequest::CommandWorkDir { work_dir } => {
-                        sandbox_state.allow_writable_path(work_dir)
-                    }
-                    CapabilityRequest::FileRead { path } => sandbox_state.allow_readable_path(path),
-                    CapabilityRequest::Http { .. } => {}
-                }
-            }
-            let ok_res = ToolResult::ok(format!(
-                "Permission GRANTED for '{}' on '{}'. The OS kernel sandbox has unlocked this path; you may now retry your command.",
-                cap_kind,
-                final_path_str
-            ));
-            Ok((
-                Item::FunctionCallOutput {
-                    id: None,
-                    call_id: call.call_id.clone(),
-                    output: ok_res.output.to_function_output(),
-                    status: None,
-                },
-                true,
-            ))
-        }
-        PermissionOutcome::Denied { reason } => {
-            let err_res = ToolResult::err(format!("Permission DENIED: {reason}"));
-            Ok((
-                Item::FunctionCallOutput {
-                    id: None,
-                    call_id: call.call_id.clone(),
-                    output: err_res.output.to_function_output(),
-                    status: None,
-                },
-                false,
-            ))
-        }
-    }
 }
 
 pub fn add_usage(a: &Usage, b: &Usage) -> Usage {

@@ -223,32 +223,6 @@ impl CoreHost for IpcCoreHostProxy {
         }
     }
 
-    async fn spawn_child_session(
-        &self,
-        request: CreateSessionRequest,
-        turn_id: Option<TurnId>,
-        call_id: Option<String>,
-        command_id: CommandId,
-    ) -> Result<SessionId, CoreError> {
-        let mut ch = self.channel.lock().await;
-        match ch
-            .call(&WorkerToParentMessage::SpawnChildSession {
-                request: Box::new(request),
-                turn_id,
-                call_id,
-                command_id,
-            })
-            .await?
-        {
-            ParentToWorkerMessage::SpawnChildSessionReply { result } => {
-                result.map_err(CoreError::HostError)
-            }
-            other => Err(CoreError::HostError(format!(
-                "unexpected reply to SpawnChildSession: {other:?}"
-            ))),
-        }
-    }
-
     async fn drain_realtime_messages(
         &self,
         turn_id: Option<TurnId>,

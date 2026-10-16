@@ -423,22 +423,6 @@ impl CoreExecutor for SubprocessExecutor {
                         )
                         .await?;
                     }
-                    WorkerToParentMessage::SpawnChildSession {
-                        request,
-                        turn_id,
-                        call_id,
-                        command_id,
-                    } => {
-                        let res = tokio::select! {
-                            r = host.spawn_child_session(*request, turn_id, call_id, command_id) => r.map_err(|e| e.to_string()),
-                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-                        };
-                        send_jsonl(
-                            &mut writer,
-                            &ParentToWorkerMessage::SpawnChildSessionReply { result: res },
-                        )
-                        .await?;
-                    }
                     WorkerToParentMessage::DrainRealtimeMessages { turn_id } => {
                         let res = tokio::select! {
                             r = host.drain_realtime_messages(turn_id) => r.map_err(|e| e.to_string()),

@@ -291,39 +291,6 @@ fn handle_daemon_message(
                 });
             }
         },
-        DaemonToServerMessage::SpawnChildSession {
-            request_id,
-            parent_session_id,
-            parent_activation_id,
-            parent_turn_id,
-            call_id,
-            command_id,
-            mut child_request,
-        } => {
-            child_request.spec.producer = Some(ProducerRef {
-                session_id: parent_session_id,
-                activation_id: parent_activation_id,
-                turn_id: parent_turn_id,
-                call_id,
-                command_id,
-            });
-            match state.store.create_session(*child_request) {
-                Ok((created, _)) => {
-                    let child_id = SessionId::new(created.session.metadata.id);
-                    let _ = out_tx.send(ServerToDaemonMessage::Ack {
-                        request_id,
-                        ok: true,
-                        resource_version: Some(created.session.metadata.resource_version),
-                        batch_seq: None,
-                        spawned_session_id: Some(child_id),
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    send_ack_err(out_tx, request_id, e.to_string());
-                }
-            }
-        }
         DaemonToServerMessage::CompleteActivation {
             request_id,
             session_id,

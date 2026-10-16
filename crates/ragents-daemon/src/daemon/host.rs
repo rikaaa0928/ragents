@@ -375,26 +375,6 @@ impl CoreHost for DaemonCoreHost {
         }
     }
 
-    async fn spawn_child_session(
-        &self,
-        request: CreateSessionRequest,
-        turn_id: Option<TurnId>,
-        call_id: Option<String>,
-        command_id: CommandId,
-    ) -> Result<SessionId, CoreError> {
-        self.tunnel
-            .spawn_child_session(
-                self.session_id.clone(),
-                self.activation_id.clone(),
-                turn_id,
-                call_id,
-                command_id,
-                request,
-            )
-            .await
-            .map_err(|e| CoreError::HostError(e.to_string()))
-    }
-
     async fn drain_realtime_messages(
         &self,
         turn_id: Option<TurnId>,

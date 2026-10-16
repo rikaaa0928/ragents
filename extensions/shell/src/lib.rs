@@ -10,9 +10,14 @@ const AGENT_PREPARE_HOOK: &str = "agent.prepare";
 const TOOLS_CALL_HOOK: &str = "tools.call";
 const FALLBACK_TIMEOUT_SECONDS: u64 = 0;
 const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
+const DEFAULT_MAX_LINES: usize = 2000;
+const DEFAULT_MAX_BYTES: usize = 50 * 1024; // 50KB
 
 thread_local! {
     static DEFAULT_TIMEOUT_SECONDS: Cell<u64> = const { Cell::new(FALLBACK_TIMEOUT_SECONDS) };
+    static MAX_OUTPUT_LINES: Cell<usize> = const { Cell::new(DEFAULT_MAX_LINES) };
+    static MAX_OUTPUT_BYTES: Cell<usize> = const { Cell::new(DEFAULT_MAX_BYTES) };
+    static SPILL_SEQ: Cell<u64> = const { Cell::new(1) };
 }
 
 struct ShellExtension;
@@ -54,6 +59,8 @@ struct ToolResult {
 #[derive(Default, Deserialize)]
 struct ShellConfig {
     default_timeout_seconds: Option<u64>,
+    max_output_lines: Option<usize>,
+    max_output_bytes: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +110,8 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
             .unwrap_or(FALLBACK_TIMEOUT_SECONDS);
         timeout_millis(timeout)?;
         DEFAULT_TIMEOUT_SECONDS.with(|current| current.set(timeout));
+        MAX_OUTPUT_LINES.with(|c| c.set(config.max_output_lines.unwrap_or(DEFAULT_MAX_LINES)));
+        MAX_OUTPUT_BYTES.with(|c| c.set(config.max_output_bytes.unwrap_or(DEFAULT_MAX_BYTES)));
         Ok(())
     }
 
@@ -293,8 +302,10 @@ fn handle_shell(args: &serde_json::Value) -> Result<ToolResult, String> {
 
     if wait {
         let exit_code = resp.exit_code.unwrap_or(-1);
-        let stdout = resp.stdout.unwrap_or_default();
-        let stderr = resp.stderr.unwrap_or_default();
+        let raw_stdout = resp.stdout.unwrap_or_default();
+        let raw_stderr = resp.stderr.unwrap_or_default();
+        let stdout = truncate_tail_stream(&raw_stdout, "stdout");
+        let stderr = truncate_tail_stream(&raw_stderr, "stderr");
         let success = resp.ok && exit_code == 0 && resp.error.is_none();
         let output = if let Some(ref error) = resp.error {
             format!("exit_code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}\nerror: {error}")
@@ -453,4 +464,112 @@ fn timeout_millis(seconds: u64) -> Result<u64, String> {
     seconds
         .checked_mul(1_000)
         .ok_or_else(|| "timeout is too large".into())
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn split_lines_for_counting(content: &str) -> Vec<&str> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    if content.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+}
+
+fn truncate_str_to_bytes_from_end(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+fn truncate_tail_stream(content: &str, stream_label: &str) -> String {
+    let max_lines = MAX_OUTPUT_LINES.with(Cell::get);
+    let max_bytes = MAX_OUTPUT_BYTES.with(Cell::get);
+    let total_bytes = content.len();
+    let lines = split_lines_for_counting(content);
+    let total_lines = lines.len();
+
+    if total_lines <= max_lines && total_bytes <= max_bytes {
+        return content.to_string();
+    }
+
+    let seq = SPILL_SEQ.with(|c| {
+        let cur = c.get();
+        c.set(cur + 1);
+        cur
+    });
+    let spill_dir = std::path::Path::new(".ragents-tmp");
+    let _ = std::fs::create_dir_all(spill_dir);
+    let spill_rel = format!(".ragents-tmp/shell-{stream_label}-{seq}.log");
+    let _ = std::fs::write(&spill_rel, content);
+
+    let mut output_lines_rev: Vec<&str> = Vec::new();
+    let mut output_bytes_count = 0usize;
+    let mut truncated_by_lines = false;
+    let mut last_line_partial = false;
+
+    for &line in lines.iter().rev() {
+        if output_lines_rev.len() >= max_lines {
+            truncated_by_lines = true;
+            break;
+        }
+        let line_bytes = line.len() + usize::from(!output_lines_rev.is_empty());
+        if output_bytes_count + line_bytes > max_bytes {
+            truncated_by_lines = false;
+            if output_lines_rev.is_empty() {
+                let partial = truncate_str_to_bytes_from_end(line, max_bytes);
+                output_lines_rev.push(partial);
+                output_bytes_count = partial.len();
+                last_line_partial = true;
+            }
+            break;
+        }
+        output_lines_rev.push(line);
+        output_bytes_count += line_bytes;
+    }
+
+    if output_lines_rev.len() >= max_lines && output_bytes_count <= max_bytes {
+        truncated_by_lines = true;
+    }
+
+    output_lines_rev.reverse();
+    let output_lines_count = output_lines_rev.len();
+    let mut text = output_lines_rev.join("\n");
+    let start_line = total_lines.saturating_sub(output_lines_count) + 1;
+    let end_line = total_lines;
+
+    if last_line_partial {
+        let last_line_size = format_size(lines.last().map(|l| l.len()).unwrap_or(0));
+        let shown_size = format_size(output_bytes_count);
+        text.push_str(&format!(
+            "\n\n[Showing last {shown_size} of line {end_line} (line is {last_line_size}). Full output: {spill_rel}]"
+        ));
+    } else if truncated_by_lines {
+        text.push_str(&format!(
+            "\n\n[Showing lines {start_line}-{end_line} of {total_lines}. Full output: {spill_rel}]"
+        ));
+    } else {
+        let limit_str = format_size(max_bytes);
+        text.push_str(&format!(
+            "\n\n[Showing lines {start_line}-{end_line} of {total_lines} ({limit_str} limit). Full output: {spill_rel}]"
+        ));
+    }
+
+    text
 }

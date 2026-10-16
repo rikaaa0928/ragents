@@ -103,16 +103,6 @@ impl CoreHost for MockCoreHost {
         let effective = capability.with_override_path(override_p.as_deref());
         Ok(PermissionOutcome::allowed_with(effective, true))
     }
-
-    async fn spawn_child_session(
-        &self,
-        _request: CreateSessionRequest,
-        _turn_id: Option<TurnId>,
-        _call_id: Option<String>,
-        _command_id: CommandId,
-    ) -> Result<SessionId, CoreError> {
-        Ok(SessionId::generate())
-    }
 }
 
 #[tokio::test]

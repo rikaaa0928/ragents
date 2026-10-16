@@ -11,9 +11,8 @@ use crate::sandbox::{
 use async_trait::async_trait;
 use chrono::Utc;
 use entry::{
-    apply_synchronous_output_truncation, format_exit_notification,
-    request_sandbox_violation_approval, ManagedProcessEntry, EARLY_SANDBOX_CHECK_WINDOW_MS,
-    MAX_SANDBOX_ESCALATION_ROUNDS,
+    format_exit_notification, request_sandbox_violation_approval, ManagedProcessEntry,
+    EARLY_SANDBOX_CHECK_WINDOW_MS, MAX_SANDBOX_ESCALATION_ROUNDS,
 };
 use openresponses_rust::MessageContent;
 use ragents_protocol::*;
@@ -241,8 +240,6 @@ impl ProcessManager {
         for tmp_path in temporary_once_paths {
             sandbox_state.revoke_temporary_path(&tmp_path);
         }
-
-        apply_synchronous_output_truncation(&mut final_resp, sandbox_state.session_tmp_dir());
 
         Ok(final_resp)
     }

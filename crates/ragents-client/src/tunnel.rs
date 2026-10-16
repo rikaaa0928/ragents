@@ -268,32 +268,6 @@ impl DaemonTunnelHandle {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn spawn_child_session(
-        &self,
-        parent_session_id: SessionId,
-        parent_activation_id: ActivationId,
-        parent_turn_id: Option<TurnId>,
-        call_id: Option<String>,
-        command_id: CommandId,
-        child_request: CreateSessionRequest,
-    ) -> Result<SessionId, ClientError> {
-        let request_id = format!("req_{}", Uuid::now_v7());
-        let resp = self
-            .call(DaemonToServerMessage::SpawnChildSession {
-                request_id,
-                parent_session_id,
-                parent_activation_id,
-                parent_turn_id,
-                call_id,
-                command_id,
-                child_request: Box::new(child_request),
-            })
-            .await?;
-        let (_, _, spawned_id) = Self::expect_ack(resp)?;
-        spawned_id.ok_or_else(|| ClientError::Tunnel("missing spawned_session_id in Ack".into()))
-    }
-
     pub async fn complete_activation(
         &self,
         session_id: SessionId,
@@ -348,7 +322,6 @@ impl DaemonTunnelHandle {
             | DaemonToServerMessage::FetchEffectiveContext { request_id, .. }
             | DaemonToServerMessage::PushRealtimeMessage { request_id, .. }
             | DaemonToServerMessage::DrainRealtimeMessages { request_id, .. }
-            | DaemonToServerMessage::SpawnChildSession { request_id, .. }
             | DaemonToServerMessage::CompleteActivation { request_id, .. } => request_id,
         }
     }

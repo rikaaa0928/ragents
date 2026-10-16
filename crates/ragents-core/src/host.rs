@@ -121,14 +121,6 @@ pub trait CoreHost: Send + Sync {
             .await
     }
 
-    async fn spawn_child_session(
-        &self,
-        request: CreateSessionRequest,
-        turn_id: Option<TurnId>,
-        call_id: Option<String>,
-        command_id: CommandId,
-    ) -> Result<SessionId, CoreError>;
-
     /// Drains all pending real-time messages for this session at the start of a Turn (or before loop exit).
     async fn drain_realtime_messages(
         &self,

@@ -183,18 +183,6 @@ pub enum DaemonToServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<TurnId>,
     },
-    /// Daemon requests spawning a child session from a tool/extension command
-    SpawnChildSession {
-        request_id: String,
-        parent_session_id: SessionId,
-        parent_activation_id: ActivationId,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parent_turn_id: Option<TurnId>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        call_id: Option<String>,
-        command_id: CommandId,
-        child_request: Box<CreateSessionRequest>,
-    },
     /// Daemon completes an activation (Succeeded, Failed, or Cancelled)
     CompleteActivation {
         request_id: String,

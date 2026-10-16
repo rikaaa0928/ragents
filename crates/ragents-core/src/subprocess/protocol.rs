@@ -43,12 +43,6 @@ pub enum WorkerToParentMessage {
         original_path: Option<PathBuf>,
         reason: Option<String>,
     },
-    SpawnChildSession {
-        request: Box<CreateSessionRequest>,
-        turn_id: Option<TurnId>,
-        call_id: Option<String>,
-        command_id: CommandId,
-    },
     DrainRealtimeMessages {
         turn_id: Option<TurnId>,
     },
@@ -81,9 +75,6 @@ pub enum ParentToWorkerMessage {
     },
     CheckPermissionReply {
         result: Result<PermissionOutcome, String>,
-    },
-    SpawnChildSessionReply {
-        result: Result<SessionId, String>,
     },
     DrainRealtimeMessagesReply {
         result: Result<Vec<Item>, String>,
