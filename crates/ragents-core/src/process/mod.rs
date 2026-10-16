@@ -797,4 +797,18 @@ impl ProcessManager {
             notify.notify_waiters();
         }
     }
+
+    pub fn migrate_session_processes(
+        &self,
+        from_session_id: &SessionId,
+        to_session_id: &SessionId,
+    ) {
+        let guard = self.entries.lock().expect("entries poisoned");
+        for entry in guard.values() {
+            let mut e = entry.lock().expect("process entry poisoned");
+            if &e.info.session_id == from_session_id {
+                e.info.session_id = to_session_id.clone();
+            }
+        }
+    }
 }

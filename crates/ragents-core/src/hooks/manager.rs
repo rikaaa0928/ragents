@@ -172,7 +172,7 @@ impl HookManager {
                 }
                 HookAction::Stop => {
                     return Ok(TransformResult {
-                        payload,
+                        payload: result.payload.unwrap_or(payload),
                         control: FlowControl::Stop,
                     })
                 }

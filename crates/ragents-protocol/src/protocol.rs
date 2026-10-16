@@ -193,6 +193,38 @@ pub enum DaemonToServerMessage {
         turn_id: Option<TurnId>,
         outcome: ActivationTerminalOutcome,
     },
+    /// Daemon commits a 3-session context compaction rollover (`from_session -> compaction_session -> continued_session`)
+    RolloverCompactedSession {
+        request_id: String,
+        request: Box<RolloverCompactedSessionRequest>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloverCompactedSessionRequest {
+    pub from_session_id: SessionId,
+    pub from_activation_id: ActivationId,
+    pub lease_epoch: LeaseEpoch,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    pub summarized_through_pos: ContextPos,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_from_pos: Option<ContextPos>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_through_pos: Option<ContextPos>,
+    pub tokens_before: u64,
+    pub compaction_prompt: String,
+    pub summary_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloverCompactedSessionResponse {
+    pub from_session: Session,
+    pub compaction_session: Session,
+    pub continued_session: Session,
+    pub continued_activation: Activation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -262,6 +294,14 @@ pub enum ServerToDaemonMessage {
         items: Vec<Item>,
         #[serde(skip_serializing_if = "Option::is_none")]
         batch_seq: Option<BatchSeq>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    RolloverCompactedSessionReply {
+        request_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response: Option<Box<RolloverCompactedSessionResponse>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

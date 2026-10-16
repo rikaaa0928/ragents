@@ -235,10 +235,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         "floating"
                     };
                     println!(
-                        "{}\tmode={}\tphase={:?}\tnode={}\titems={}",
+                        "{}\tmode={}\tphase={:?}\trole={:?}\tgen={}\tnode={}\titems={}",
                         s.metadata.id,
                         mode,
                         s.status.phase,
+                        s.status.compaction.role,
+                        s.status.compaction.generation,
                         s.status
                             .bound_node_id
                             .as_ref()
@@ -313,7 +315,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         },
                     })
                     .await?;
-                (s_id, ActivationId::new(act.metadata.id))
+                (act.spec.session_id, ActivationId::new(act.metadata.id))
             } else {
                 let scheduling = build_scheduling_mode(node, workdir, floating)?;
                 let parsed_exts = parse_extension_specs(&extensions)?;

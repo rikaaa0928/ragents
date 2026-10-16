@@ -154,6 +154,19 @@ pub enum SessionEvent {
         count: usize,
         batch_seq: BatchSeq,
     },
+    SessionCompacted {
+        from_session_id: SessionId,
+        compaction_session_id: SessionId,
+        continued_session_id: SessionId,
+        continued_activation_id: ActivationId,
+        compaction_generation: u32,
+        summarized_through_pos: ContextPos,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kept_from_pos: Option<ContextPos>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kept_through_pos: Option<ContextPos>,
+        tokens_before: u64,
+    },
 }
 
 impl SessionEvent {
@@ -184,6 +197,7 @@ impl SessionEvent {
             SessionEvent::BackgroundProcessStarted { .. } => "background_process_started",
             SessionEvent::BackgroundProcessExited { .. } => "background_process_exited",
             SessionEvent::RealtimeMessagesDrained { .. } => "realtime_messages_drained",
+            SessionEvent::SessionCompacted { .. } => "session_compacted",
         }
     }
 

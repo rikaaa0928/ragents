@@ -290,6 +290,36 @@ impl DaemonTunnelHandle {
         Self::expect_ack(resp).map(|(rv, _, _)| rv.unwrap_or_default())
     }
 
+    pub async fn rollover_compacted_session(
+        &self,
+        request: RolloverCompactedSessionRequest,
+    ) -> Result<RolloverCompactedSessionResponse, ClientError> {
+        let request_id = format!("req_{}", Uuid::now_v7());
+        let resp = self
+            .call(DaemonToServerMessage::RolloverCompactedSession {
+                request_id,
+                request: Box::new(request),
+            })
+            .await?;
+        match resp {
+            ServerToDaemonMessage::RolloverCompactedSessionReply {
+                ok: true,
+                response: Some(response),
+                ..
+            } => Ok(*response),
+            ServerToDaemonMessage::RolloverCompactedSessionReply {
+                ok: false, error, ..
+            } => {
+                Err(ClientError::Tunnel(error.unwrap_or_else(|| {
+                    "rollover compacted session failed".into()
+                })))
+            }
+            other => Err(ClientError::Tunnel(format!(
+                "unexpected rollover compacted session reply: {other:?}"
+            ))),
+        }
+    }
+
     fn expect_ack(msg: ServerToDaemonMessage) -> Result<AckPayload, ClientError> {
         match msg {
             ServerToDaemonMessage::Ack {
@@ -322,7 +352,8 @@ impl DaemonTunnelHandle {
             | DaemonToServerMessage::FetchEffectiveContext { request_id, .. }
             | DaemonToServerMessage::PushRealtimeMessage { request_id, .. }
             | DaemonToServerMessage::DrainRealtimeMessages { request_id, .. }
-            | DaemonToServerMessage::CompleteActivation { request_id, .. } => request_id,
+            | DaemonToServerMessage::CompleteActivation { request_id, .. }
+            | DaemonToServerMessage::RolloverCompactedSession { request_id, .. } => request_id,
         }
     }
 }
@@ -389,7 +420,8 @@ pub async fn connect_daemon_tunnel_with_token(
                 ServerToDaemonMessage::Registered { ref request_id, .. }
                 | ServerToDaemonMessage::Ack { ref request_id, .. }
                 | ServerToDaemonMessage::EffectiveContextReply { ref request_id, .. }
-                | ServerToDaemonMessage::RealtimeMessagesReply { ref request_id, .. } => {
+                | ServerToDaemonMessage::RealtimeMessagesReply { ref request_id, .. }
+                | ServerToDaemonMessage::RolloverCompactedSessionReply { ref request_id, .. } => {
                     let req_id = request_id.clone();
                     let tx = pending_reader
                         .lock()

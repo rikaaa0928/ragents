@@ -13,21 +13,35 @@ impl SqliteStore {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
 
-        if Self::load_session_in_tx(&tx, session_id)?.is_none() {
-            return Err(StoreError::NotFound(format!("session {session_id}")));
+        let mut target_sid = session_id.clone();
+        let mut session = Self::load_session_in_tx(&tx, &target_sid)?
+            .ok_or_else(|| StoreError::NotFound(format!("session {target_sid}")))?;
+        let mut hops = 0usize;
+        while session.status.phase == SessionPhase::Closed {
+            if let Some(next_sid) = session.status.compaction.continued_in_session_id.clone() {
+                if hops >= 32 {
+                    break;
+                }
+                hops += 1;
+                session = Self::load_session_in_tx(&tx, &next_sid)?
+                    .ok_or_else(|| StoreError::NotFound(format!("session {next_sid}")))?;
+                target_sid = next_sid;
+            } else {
+                break;
+            }
         }
 
         let now = Utc::now().to_rfc3339();
         for block in content {
             tx.execute(
                 "INSERT INTO realtime_messages (session_id, content_json, created_at) VALUES (?1, ?2, ?3)",
-                params![session_id.as_str(), serde_json::to_string(&block)?, &now],
+                params![target_sid.as_str(), serde_json::to_string(&block)?, &now],
             )?;
         }
 
         let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM realtime_messages WHERE session_id = ?1",
-            params![session_id.as_str()],
+            params![target_sid.as_str()],
             |row| row.get(0),
         )?;
         tx.commit()?;

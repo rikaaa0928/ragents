@@ -48,12 +48,27 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS session_sources (
                 child_session_id    TEXT NOT NULL REFERENCES sessions(session_id),
                 source_order        INTEGER NOT NULL,
+                source_kind         TEXT NOT NULL DEFAULT 'forked_from',
                 source_session_id   TEXT NOT NULL REFERENCES sessions(session_id),
                 from_context_pos    INTEGER NOT NULL,
                 through_context_pos INTEGER NOT NULL,
                 PRIMARY KEY (child_session_id, source_order)
             );
             CREATE INDEX IF NOT EXISTS idx_session_sources_parent ON session_sources(source_session_id);
+
+            CREATE TABLE IF NOT EXISTS session_compactions (
+                from_session_id        TEXT PRIMARY KEY REFERENCES sessions(session_id),
+                compaction_session_id  TEXT NOT NULL UNIQUE REFERENCES sessions(session_id),
+                continued_session_id   TEXT NOT NULL UNIQUE REFERENCES sessions(session_id),
+                compaction_generation  INTEGER NOT NULL,
+                summarized_through_pos INTEGER NOT NULL,
+                kept_from_pos          INTEGER,
+                kept_through_pos       INTEGER,
+                tokens_before          INTEGER NOT NULL,
+                created_at             TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_compactions_continued ON session_compactions(continued_session_id);
+            CREATE INDEX IF NOT EXISTS idx_session_compactions_worker ON session_compactions(compaction_session_id);
 
             CREATE TABLE IF NOT EXISTS activations (
                 activation_id    TEXT PRIMARY KEY,

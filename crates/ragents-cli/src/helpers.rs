@@ -48,9 +48,17 @@ pub(crate) fn parse_extension_specs(raw_exts: &[String]) -> Result<Vec<Extension
     let mut specs = Vec::new();
     for raw in raw_exts {
         let (name, rest) = raw.split_once('=').ok_or_else(|| {
-            anyhow!("Extension must be in 'name=path[:dir1,dir2]' format, got '{raw}'")
+            anyhow!("Extension must be in 'name=path[:dir1,dir2][#{{json_config}}]' format, got '{raw}'")
         })?;
-        let (path, allowed_dirs) = match rest.split_once(':') {
+        let (rest_without_cfg, config) = match rest.split_once('#') {
+            Some((before, cfg_str)) => {
+                let parsed_cfg: serde_json::Value = serde_json::from_str(cfg_str)
+                    .with_context(|| format!("Invalid JSON config in extension spec '{raw}'"))?;
+                (before, parsed_cfg)
+            }
+            None => (rest, serde_json::json!({})),
+        };
+        let (path, allowed_dirs) = match rest_without_cfg.split_once(':') {
             Some((p, dirs_str)) => {
                 let dirs = dirs_str
                     .split(',')
@@ -59,13 +67,13 @@ pub(crate) fn parse_extension_specs(raw_exts: &[String]) -> Result<Vec<Extension
                     .collect();
                 (p, dirs)
             }
-            None => (rest, Vec::new()),
+            None => (rest_without_cfg, Vec::new()),
         };
         specs.push(ExtensionSpec {
             name: name.trim().to_string(),
             path: path.trim().to_string(),
             enabled: true,
-            config: serde_json::json!({}),
+            config,
             allowed_dirs,
         });
     }
@@ -100,208 +108,235 @@ pub async fn watch_activation_to_completion(
     session_id: &SessionId,
     activation_id: &ActivationId,
 ) -> Result<()> {
-    let mut stream = client.watch_events(Some(session_id), 0).await?;
+    let mut current_session_id = session_id.clone();
+    let mut current_activation_id = activation_id.clone();
     let mut rendered_any_turn_text = false;
-    let mut turn_streamed_text = String::new();
-    let mut turn_streaming_line_open = false;
 
-    while let Some(item) = stream.next().await {
-        let env = item?;
-        if env.activation_id.as_ref() != Some(activation_id) {
-            continue;
-        }
-        match &env.event {
-            SessionEvent::ActivationScheduled {
-                node_id,
-                lease_epoch,
-            } => {
-                println!(
-                    "[event] scheduled on node={} (epoch={})",
-                    node_id, lease_epoch
-                );
+    'session_loop: loop {
+        let mut stream = client.watch_events(Some(&current_session_id), 0).await?;
+        let mut turn_streamed_text = String::new();
+        let mut turn_streaming_line_open = false;
+
+        while let Some(item) = stream.next().await {
+            let env = item?;
+            if env.activation_id.as_ref() != Some(&current_activation_id) {
+                continue;
             }
-            SessionEvent::ActivationRescheduled {
-                from_node,
-                to_node,
-                lease_epoch,
-                ..
-            } => {
-                println!(
-                    "[event] rescheduled from={} to={} (epoch={})",
-                    from_node, to_node, lease_epoch
-                );
-            }
-            SessionEvent::ActivationStarted { node_id, .. } => {
-                println!("[event] started on node={node_id}");
-            }
-            SessionEvent::TurnStarted => {
-                turn_streamed_text.clear();
-                turn_streaming_line_open = false;
-                println!("[event] turn started");
-            }
-            SessionEvent::ModelReasoningDelta { delta } => {
-                use std::io::Write;
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
-                turn_streaming_line_open = true;
-            }
-            SessionEvent::ModelTextDelta { delta } => {
-                use std::io::Write;
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
-                turn_streamed_text.push_str(delta);
-                rendered_any_turn_text = true;
-                turn_streaming_line_open = true;
-            }
-            SessionEvent::TurnCompleted { items, .. } => {
-                let mut authoritative_text = String::new();
-                for it in items {
-                    if matches!(it, Item::Message { .. }) {
-                        let t = extract_item_text(it);
-                        if !t.is_empty() {
-                            if !authoritative_text.is_empty() {
-                                authoritative_text.push('\n');
+            match &env.event {
+                SessionEvent::ActivationScheduled {
+                    node_id,
+                    lease_epoch,
+                } => {
+                    println!(
+                        "[event] scheduled on node={} (epoch={})",
+                        node_id, lease_epoch
+                    );
+                }
+                SessionEvent::ActivationRescheduled {
+                    from_node,
+                    to_node,
+                    lease_epoch,
+                    ..
+                } => {
+                    println!(
+                        "[event] rescheduled from={} to={} (epoch={})",
+                        from_node, to_node, lease_epoch
+                    );
+                }
+                SessionEvent::ActivationStarted { node_id, .. } => {
+                    println!("[event] started on node={node_id}");
+                }
+                SessionEvent::TurnStarted => {
+                    turn_streamed_text.clear();
+                    turn_streaming_line_open = false;
+                    println!("[event] turn started");
+                }
+                SessionEvent::ModelReasoningDelta { delta } => {
+                    use std::io::Write;
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                    turn_streaming_line_open = true;
+                }
+                SessionEvent::ModelTextDelta { delta } => {
+                    use std::io::Write;
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                    turn_streamed_text.push_str(delta);
+                    rendered_any_turn_text = true;
+                    turn_streaming_line_open = true;
+                }
+                SessionEvent::TurnCompleted { items, .. } => {
+                    let mut authoritative_text = String::new();
+                    for it in items {
+                        if matches!(it, Item::Message { .. }) {
+                            let t = extract_item_text(it);
+                            if !t.is_empty() {
+                                if !authoritative_text.is_empty() {
+                                    authoritative_text.push('\n');
+                                }
+                                authoritative_text.push_str(&t);
                             }
-                            authoritative_text.push_str(&t);
                         }
                     }
-                }
 
-                if !authoritative_text.is_empty() {
-                    if turn_streamed_text.is_empty() {
-                        println!("{authoritative_text}");
-                        rendered_any_turn_text = true;
-                        turn_streaming_line_open = false;
-                    } else if authoritative_text == turn_streamed_text {
-                        if turn_streaming_line_open {
-                            println!();
+                    if !authoritative_text.is_empty() {
+                        if turn_streamed_text.is_empty() {
+                            println!("{authoritative_text}");
+                            rendered_any_turn_text = true;
+                            turn_streaming_line_open = false;
+                        } else if authoritative_text == turn_streamed_text {
+                            if turn_streaming_line_open {
+                                println!();
+                                turn_streaming_line_open = false;
+                            }
+                        } else if let Some(missing_suffix) =
+                            authoritative_text.strip_prefix(&turn_streamed_text)
+                        {
+                            println!("{missing_suffix}");
+                            rendered_any_turn_text = true;
+                            turn_streaming_line_open = false;
+                        } else {
+                            if turn_streaming_line_open {
+                                println!();
+                            }
+                            println!("{authoritative_text}");
+                            rendered_any_turn_text = true;
                             turn_streaming_line_open = false;
                         }
-                    } else if let Some(missing_suffix) =
-                        authoritative_text.strip_prefix(&turn_streamed_text)
-                    {
-                        println!("{missing_suffix}");
-                        rendered_any_turn_text = true;
-                        turn_streaming_line_open = false;
-                    } else {
-                        if turn_streaming_line_open {
-                            println!();
-                        }
-                        println!("{authoritative_text}");
-                        rendered_any_turn_text = true;
+                    } else if turn_streaming_line_open {
+                        println!();
                         turn_streaming_line_open = false;
                     }
-                } else if turn_streaming_line_open {
-                    println!();
-                    turn_streaming_line_open = false;
+                    turn_streamed_text.clear();
                 }
-                turn_streamed_text.clear();
-            }
-            SessionEvent::ToolCallStarted { name, call_id } => {
-                if turn_streaming_line_open {
-                    println!();
-                    turn_streaming_line_open = false;
+                SessionEvent::ToolCallStarted { name, call_id } => {
+                    if turn_streaming_line_open {
+                        println!();
+                        turn_streaming_line_open = false;
+                    }
+                    println!("[event] tool call started: {name} ({call_id})");
                 }
-                println!("[event] tool call started: {name} ({call_id})");
-            }
-            SessionEvent::ToolCallFinished {
-                name,
-                success,
-                duration_ms,
-                ..
-            } => {
-                println!("[event] tool call finished: {name} (success={success}, {duration_ms}ms)");
-            }
-            SessionEvent::PermissionRequested { request } => {
-                let suggested = request
-                    .capability
-                    .path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| format!("{:?}", request.capability));
-                let orig = request
-                    .original_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| suggested.clone());
-                println!(
-                    "[permission required] request_id={}\n  original_path : {}\n  suggested_path: {} ({:?})\n  reason        : {:?}\n  Approve default : ragents --server <url> approve {} {} --decision allow-session\n  Approve custom  : ragents --server <url> approve {} {} --decision <allow-once|allow-activation|allow-session|allow-workspace|allow-node> --path <custom_dir>",
-                    request.id,
-                    orig,
-                    suggested,
-                    request.capability,
-                    request.reason,
-                    activation_id,
-                    request.id,
-                    activation_id,
-                    request.id
-                );
-            }
-            SessionEvent::PermissionResolved {
-                request_id,
-                decision,
-                override_path,
-                ..
-            } => {
-                println!(
-                    "[event] permission resolved: request_id={} decision={:?} override_path={:?}",
-                    request_id, decision, override_path
-                );
-            }
-            SessionEvent::BackgroundProcessStarted { process } => {
-                println!(
-                    "[event] background process started: id={} pid={:?} lifecycle={:?} cmd={}",
-                    process.process_id, process.pid, process.lifecycle, process.command
-                );
-            }
-            SessionEvent::BackgroundProcessExited { process } => {
-                println!(
-                    "[event] background process exited: id={} pid={:?} phase={:?} exit_code={:?} ({}ms)",
-                    process.process_id,
-                    process.pid,
-                    process.phase,
-                    process.exit_code,
-                    process.duration_ms
-                );
-            }
-            SessionEvent::RealtimeMessagesDrained { count, batch_seq } => {
-                println!(
-                    "[event] drained {} real-time message block(s) into context (batch_seq={})",
-                    count,
-                    batch_seq.value()
-                );
-            }
-            SessionEvent::ActivationCompleted { .. } => {
-                if turn_streaming_line_open {
-                    println!();
+                SessionEvent::ToolCallFinished {
+                    name,
+                    success,
+                    duration_ms,
+                    ..
+                } => {
+                    println!(
+                        "[event] tool call finished: {name} (success={success}, {duration_ms}ms)"
+                    );
                 }
-                if !rendered_any_turn_text {
-                    let ctx = client.get_session_context(session_id).await?;
-                    if let Some(last_msg) = ctx
-                        .effective_items
-                        .iter()
-                        .rev()
-                        .find(|item| matches!(item, Item::Message { .. }))
-                    {
-                        let text = extract_item_text(last_msg);
-                        if !text.is_empty() {
-                            println!("\n{text}");
+                SessionEvent::PermissionRequested { request } => {
+                    let suggested = request
+                        .capability
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| format!("{:?}", request.capability));
+                    let orig = request
+                        .original_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| suggested.clone());
+                    println!(
+                        "[permission required] request_id={}\n  original_path : {}\n  suggested_path: {} ({:?})\n  reason        : {:?}\n  Approve default : ragents --server <url> approve {} {} --decision allow-session\n  Approve custom  : ragents --server <url> approve {} {} --decision <allow-once|allow-activation|allow-session|allow-workspace|allow-node> --path <custom_dir>",
+                        request.id,
+                        orig,
+                        suggested,
+                        request.capability,
+                        request.reason,
+                        current_activation_id,
+                        request.id,
+                        current_activation_id,
+                        request.id
+                    );
+                }
+                SessionEvent::PermissionResolved {
+                    request_id,
+                    decision,
+                    override_path,
+                    ..
+                } => {
+                    println!(
+                        "[event] permission resolved: request_id={} decision={:?} override_path={:?}",
+                        request_id, decision, override_path
+                    );
+                }
+                SessionEvent::BackgroundProcessStarted { process } => {
+                    println!(
+                        "[event] background process started: id={} pid={:?} lifecycle={:?} cmd={}",
+                        process.process_id, process.pid, process.lifecycle, process.command
+                    );
+                }
+                SessionEvent::BackgroundProcessExited { process } => {
+                    println!(
+                        "[event] background process exited: id={} pid={:?} phase={:?} exit_code={:?} ({}ms)",
+                        process.process_id,
+                        process.pid,
+                        process.phase,
+                        process.exit_code,
+                        process.duration_ms
+                    );
+                }
+                SessionEvent::RealtimeMessagesDrained { count, batch_seq } => {
+                    println!(
+                        "[event] drained {} real-time message block(s) into context (batch_seq={})",
+                        count,
+                        batch_seq.value()
+                    );
+                }
+                SessionEvent::SessionCompacted {
+                    from_session_id,
+                    compaction_session_id,
+                    continued_session_id,
+                    continued_activation_id,
+                    compaction_generation,
+                    tokens_before,
+                    ..
+                } => {
+                    if turn_streaming_line_open {
+                        println!();
+                    }
+                    println!(
+                        "[event] session compacted (gen={compaction_generation}, {tokens_before} tokens): {from_session_id} -> {compaction_session_id} -> {continued_session_id} (activation={continued_activation_id})"
+                    );
+                    current_session_id = continued_session_id.clone();
+                    current_activation_id = continued_activation_id.clone();
+                    continue 'session_loop;
+                }
+                SessionEvent::ActivationCompleted { .. } => {
+                    if turn_streaming_line_open {
+                        println!();
+                    }
+                    if !rendered_any_turn_text {
+                        let ctx = client.get_session_context(&current_session_id).await?;
+                        if let Some(last_msg) = ctx
+                            .effective_items
+                            .iter()
+                            .rev()
+                            .find(|item| matches!(item, Item::Message { .. }))
+                        {
+                            let text = extract_item_text(last_msg);
+                            if !text.is_empty() {
+                                println!("\n{text}");
+                            }
                         }
                     }
+                    break 'session_loop;
                 }
-                break;
+                SessionEvent::ActivationFailed { error } => {
+                    bail!("Activation failed: {error}");
+                }
+                SessionEvent::ActivationCancelled => {
+                    println!("[event] activation cancelled");
+                    break 'session_loop;
+                }
+                SessionEvent::ActivationInterrupted { reason } => {
+                    bail!("Activation interrupted: {reason}");
+                }
+                _ => {}
             }
-            SessionEvent::ActivationFailed { error } => {
-                bail!("Activation failed: {error}");
-            }
-            SessionEvent::ActivationCancelled => {
-                println!("[event] activation cancelled");
-                break;
-            }
-            SessionEvent::ActivationInterrupted { reason } => {
-                bail!("Activation interrupted: {reason}");
-            }
-            _ => {}
         }
+        break 'session_loop;
     }
     Ok(())
 }

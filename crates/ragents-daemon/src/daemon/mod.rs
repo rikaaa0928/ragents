@@ -429,17 +429,19 @@ impl AgentDaemon {
 
             match exec_res {
                 Ok(summary) => {
-                    let _ = tunnel
-                        .complete_activation(
-                            sess_id,
-                            act_id,
-                            lease_epoch,
-                            summary.last_turn_id,
-                            ActivationTerminalOutcome::Succeeded {
-                                usage: summary.total_usage,
-                            },
-                        )
-                        .await;
+                    if summary.compacted_into_session_id.is_none() {
+                        let _ = tunnel
+                            .complete_activation(
+                                sess_id,
+                                act_id,
+                                lease_epoch,
+                                summary.last_turn_id,
+                                ActivationTerminalOutcome::Succeeded {
+                                    usage: summary.total_usage,
+                                },
+                            )
+                            .await;
+                    }
                 }
                 Err(CoreError::Cancelled) => {
                     let _ = tunnel

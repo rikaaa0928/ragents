@@ -11,7 +11,7 @@ use openresponses_rust::{
     CreateResponseBody, InputTokensDetails, Item, MessageContent, OutputTokensDetails,
     ReasoningConfig, ResponseResource, ResponseStatus, Tool, ToolChoiceParam, Usage,
 };
-use ragents_protocol::{CapabilityRequest, SessionEvent, TurnId};
+use ragents_protocol::{CapabilityRequest, CompactionPlan, SessionEvent, TurnId};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -449,16 +449,54 @@ async fn run_react_loop(
             FlowControl::Stop => break,
         }
 
-        host.emit_event(Some(turn_id.clone()), SessionEvent::TurnStarted)
-            .await?;
-
         // Drain all pending real-time messages (background process exit notifications, steer messages)
         // in one atomic batch before loading the effective context for this Turn.
         let _ = host.drain_realtime_messages(Some(turn_id.clone())).await?;
 
         let raw_items = host.load_effective_context().await?;
         let projected_items =
-            apply_context_projection_hook(hook_manager, iteration, raw_items).await?;
+            match apply_context_projection_hook(hook_manager, iteration, raw_items).await? {
+                ContextProjectionOutcome::Projected(items) => items,
+                ContextProjectionOutcome::CompactionRequested(plan) => {
+                    let (compaction_prompt, summary_text, compaction_usage) =
+                        execute_compaction_plan(
+                            &plan,
+                            run_spec,
+                            &draft,
+                            model_backend,
+                            &turn_id,
+                            cancellation,
+                        )
+                        .await?;
+                    if let Some(ref u) = compaction_usage {
+                        accumulated_usage = Some(match accumulated_usage {
+                            Some(ref acc) => add_usage(acc, u),
+                            None => u.clone(),
+                        });
+                    }
+                    let continued_session_id = host
+                        .rollover_compacted_session(
+                            Some(turn_id.clone()),
+                            plan,
+                            compaction_prompt,
+                            summary_text,
+                            accumulated_usage.clone(),
+                        )
+                        .await?;
+                    return Ok(CoreRunSummary {
+                        activation_id: run_spec.activation_id.clone(),
+                        final_text,
+                        total_usage: accumulated_usage,
+                        turns_executed: iteration.saturating_sub(1),
+                        last_turn_id,
+                        compacted_into_session_id: Some(continued_session_id),
+                    });
+                }
+            };
+
+        host.emit_event(Some(turn_id.clone()), SessionEvent::TurnStarted)
+            .await?;
+
         let projection = ContextProjection::new(projected_items);
 
         let mut turn_metadata = std::collections::HashMap::new();
@@ -634,14 +672,20 @@ async fn run_react_loop(
         total_usage: accumulated_usage,
         turns_executed: iteration,
         last_turn_id,
+        compacted_into_session_id: None,
     })
+}
+
+enum ContextProjectionOutcome {
+    Projected(Vec<Item>),
+    CompactionRequested(CompactionPlan),
 }
 
 async fn apply_context_projection_hook(
     hook_manager: &HookManager,
     iteration: usize,
     items: Vec<Item>,
-) -> Result<Vec<Item>, CoreError> {
+) -> Result<ContextProjectionOutcome, CoreError> {
     let payload = serde_json::to_value(&items)?;
     let transformed = hook_manager
         .transform_validated(
@@ -651,7 +695,126 @@ async fn apply_context_projection_hook(
             |_| Ok(()),
         )
         .await?;
-    Ok(serde_json::from_value(transformed.payload).unwrap_or(items))
+    if transformed.control == FlowControl::Stop {
+        if let Ok(plan) = serde_json::from_value::<CompactionPlan>(transformed.payload.clone()) {
+            return Ok(ContextProjectionOutcome::CompactionRequested(plan));
+        }
+    }
+    Ok(ContextProjectionOutcome::Projected(
+        serde_json::from_value(transformed.payload).unwrap_or(items),
+    ))
+}
+
+async fn execute_compaction_plan(
+    plan: &CompactionPlan,
+    run_spec: &CoreRunSpec,
+    draft: &AgentDraft,
+    model_backend: &dyn ModelBackend,
+    turn_id: &TurnId,
+    cancellation: &CancellationToken,
+) -> Result<(String, String, Option<Usage>), CoreError> {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "ragents.session_id".to_string(),
+        run_spec.session_id.to_string(),
+    );
+    metadata.insert(
+        "ragents.activation_id".to_string(),
+        run_spec.activation_id.to_string(),
+    );
+    metadata.insert("ragents.turn_id".to_string(), turn_id.to_string());
+    metadata.insert("ragents.role".to_string(), "compaction_worker".to_string());
+
+    let mut combined_prompt = String::new();
+    let mut history_summary: Option<String> = None;
+    let mut turn_prefix_summary: Option<String> = None;
+    let mut total_usage: Option<Usage> = None;
+
+    if let Some(ref hp) = plan.history_prompt {
+        combined_prompt.push_str(hp);
+        let proj = ContextProjection::new(vec![Item::user_message(hp.clone())]);
+        let step = tokio::select! {
+            res = AgentCore::step(
+                &plan.system_prompt,
+                &proj,
+                &draft.model.name,
+                Some(0.0),
+                draft.model.max_output_tokens,
+                None,
+                vec![],
+                Some(metadata.clone()),
+                &run_spec.model_endpoint,
+                model_backend,
+            ) => res?,
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+        };
+        if let Some(ref u) = step.usage {
+            total_usage = Some(match total_usage {
+                Some(ref acc) => add_usage(acc, u),
+                None => u.clone(),
+            });
+        }
+        history_summary = Some(step.text.trim().to_string());
+    }
+
+    if let Some(ref tpp) = plan.turn_prefix_prompt {
+        if !combined_prompt.is_empty() {
+            combined_prompt.push_str("\n\n---\n\n");
+        }
+        combined_prompt.push_str(tpp);
+        let proj = ContextProjection::new(vec![Item::user_message(tpp.clone())]);
+        let step = tokio::select! {
+            res = AgentCore::step(
+                &plan.system_prompt,
+                &proj,
+                &draft.model.name,
+                Some(0.0),
+                draft.model.max_output_tokens,
+                None,
+                vec![],
+                Some(metadata),
+                &run_spec.model_endpoint,
+                model_backend,
+            ) => res?,
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+        };
+        if let Some(ref u) = step.usage {
+            total_usage = Some(match total_usage {
+                Some(ref acc) => add_usage(acc, u),
+                None => u.clone(),
+            });
+        }
+        turn_prefix_summary = Some(step.text.trim().to_string());
+    }
+
+    let body = match (history_summary, turn_prefix_summary) {
+        (Some(h), Some(t)) => format!("{h}\n\n---\n\n**Turn Context (split turn):**\n\n{t}"),
+        (Some(h), None) => h,
+        (None, Some(t)) => {
+            if let Some(ref prev) = plan.previous_summary {
+                format!("{prev}\n\n---\n\n**Turn Context (split turn):**\n\n{t}")
+            } else {
+                format!("**Turn Context (split turn):**\n\n{t}")
+            }
+        }
+        (None, None) => plan.previous_summary.clone().unwrap_or_default(),
+    };
+
+    let mut formatted = format!("[Compaction Summary]\n\n{}", body.trim());
+    if !plan.read_files.is_empty() {
+        formatted.push_str(&format!(
+            "\n\n<read-files>\n{}\n</read-files>",
+            plan.read_files.join("\n")
+        ));
+    }
+    if !plan.modified_files.is_empty() {
+        formatted.push_str(&format!(
+            "\n\n<modified-files>\n{}\n</modified-files>",
+            plan.modified_files.join("\n")
+        ));
+    }
+
+    Ok((combined_prompt, formatted, total_usage))
 }
 
 async fn apply_model_request_hook(

@@ -410,4 +410,61 @@ impl CoreHost for DaemonCoreHost {
             .await?;
         Ok(Some(resp))
     }
+
+    async fn rollover_compacted_session(
+        &self,
+        turn_id: Option<TurnId>,
+        plan: CompactionPlan,
+        compaction_prompt: String,
+        summary_text: String,
+        compaction_usage: Option<Usage>,
+    ) -> Result<SessionId, CoreError> {
+        let resp = self
+            .tunnel
+            .rollover_compacted_session(RolloverCompactedSessionRequest {
+                from_session_id: self.session_id.clone(),
+                from_activation_id: self.activation_id.clone(),
+                lease_epoch: self.lease_epoch,
+                turn_id,
+                summarized_through_pos: plan.summarized_through_pos,
+                kept_from_pos: plan.kept_from_pos,
+                kept_through_pos: plan.kept_through_pos,
+                tokens_before: plan.tokens_before,
+                compaction_prompt,
+                summary_text,
+                compaction_usage,
+            })
+            .await
+            .map_err(|e| CoreError::HostError(e.to_string()))?;
+
+        let continued_session_id = SessionId::new(resp.continued_session.metadata.id);
+
+        // Migrate session-scoped (and current activation-scoped) permission grants to `continued_session_id`
+        {
+            let act_grants = self
+                .activation_grants
+                .lock()
+                .expect("activation_grants mutex poisoned")
+                .clone();
+            let mut sess_map = self
+                .session_grants
+                .lock()
+                .expect("session_grants mutex poisoned");
+            let mut migrated = sess_map.get(&self.session_id).cloned().unwrap_or_default();
+            for g in act_grants {
+                if !migrated.contains(&g) {
+                    migrated.push(g);
+                }
+            }
+            if !migrated.is_empty() {
+                sess_map.insert(continued_session_id.clone(), migrated);
+            }
+        }
+
+        // Migrate any running `lifecycle = "session"` background processes to `continued_session_id`
+        self.process_manager
+            .migrate_session_processes(&self.session_id, &continued_session_id);
+
+        Ok(continued_session_id)
+    }
 }

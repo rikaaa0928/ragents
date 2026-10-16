@@ -50,6 +50,13 @@ pub enum WorkerToParentMessage {
         extension_id: Option<String>,
         request: ProcessActionRequest,
     },
+    RolloverCompactedSession {
+        turn_id: Option<TurnId>,
+        plan: Box<CompactionPlan>,
+        compaction_prompt: String,
+        summary_text: String,
+        compaction_usage: Option<Usage>,
+    },
     CreateModelResponse {
         request: Box<CreateResponseBody>,
     },
@@ -81,6 +88,9 @@ pub enum ParentToWorkerMessage {
     },
     ManageProcessReply {
         result: Result<Option<ProcessActionResponse>, String>,
+    },
+    RolloverCompactedSessionReply {
+        result: Result<SessionId, String>,
     },
     CreateModelResponseReply {
         result: Result<Box<ResponseResource>, String>,

@@ -72,6 +72,8 @@ pub struct CoreRunSummary {
     pub total_usage: Option<Usage>,
     pub turns_executed: usize,
     pub last_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_into_session_id: Option<SessionId>,
 }
 
 #[async_trait]
@@ -137,6 +139,21 @@ pub trait CoreHost: Send + Sync {
         _request: ProcessActionRequest,
     ) -> Result<Option<ProcessActionResponse>, CoreError> {
         Ok(None)
+    }
+
+    /// Commits a 3-session context compaction rollover (`from_session -> compaction_session -> continued_session`)
+    /// and returns the newly created `continued_session_id`.
+    async fn rollover_compacted_session(
+        &self,
+        _turn_id: Option<TurnId>,
+        _plan: CompactionPlan,
+        _compaction_prompt: String,
+        _summary_text: String,
+        _compaction_usage: Option<Usage>,
+    ) -> Result<SessionId, CoreError> {
+        Err(CoreError::HostError(
+            "rollover_compacted_session is not supported by this CoreHost".into(),
+        ))
     }
 }
 

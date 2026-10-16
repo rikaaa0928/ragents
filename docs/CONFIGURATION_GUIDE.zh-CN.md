@@ -116,6 +116,16 @@ enabled = true
 allowed_dirs = ["~/.agents/skills"]
 config = { include_workspace = true, include_global = true, include_agents_md = true }
 
+[[extensions]]
+name = "compaction"
+path = "/Volumes/storage/src/ai/agents/ragents/extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm"
+enabled = true
+# 自动上下文压缩阈值配置：
+# - trigger_tokens：当上下文估算或模型返回的 Token 数达到该阈值时，自动触发三会话接力压缩（默认 64000，可在超长上下文模型质量衰减前主动提前压缩）
+# - keep_recent_tokens：压缩时原样保留在 ContinuedFrom 尾部切片中的最近对话 Token 数（默认 20000，自动在 Assistant Step / User 边界切分，绝不切断平行 FunctionCall 与 FunctionCallOutput）
+# - custom_instructions：可选的自定义摘要侧重点指令
+config = { enabled = true, trigger_tokens = 64000, keep_recent_tokens = 20000 }
+
 # ============================================================================
 # 4. 节点默认权限与沙箱边界策略
 # ============================================================================

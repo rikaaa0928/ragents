@@ -200,6 +200,49 @@ impl SessionSpec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    #[default]
+    Working,
+    CompactionWorker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SessionCompactionInfo {
+    #[serde(default)]
+    pub role: SessionRole,
+    #[serde(default)]
+    pub generation: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compacted_from_session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_in_session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionPlan {
+    pub summarized_through_pos: ContextPos,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_from_pos: Option<ContextPos>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_through_pos: Option<ContextPos>,
+    pub tokens_before: u64,
+    pub system_prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_prefix_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_summary: Option<String>,
+    #[serde(default)]
+    pub read_files: Vec<String>,
+    #[serde(default)]
+    pub modified_files: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionStatus {
     pub phase: SessionPhase,
@@ -213,6 +256,8 @@ pub struct SessionStatus {
     pub effective_context_item_count: u64,
     pub batch_count: u64,
     pub event_count: u64,
+    #[serde(default)]
+    pub compaction: SessionCompactionInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -229,6 +274,7 @@ impl SessionStatus {
             effective_context_item_count,
             batch_count: 0,
             event_count: 0,
+            compaction: SessionCompactionInfo::default(),
             last_error: None,
         }
     }

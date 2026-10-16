@@ -448,7 +448,36 @@ impl CoreExecutor for SubprocessExecutor {
                         )
                         .await?;
                     }
+                    WorkerToParentMessage::RolloverCompactedSession {
+                        turn_id,
+                        plan,
+                        compaction_prompt,
+                        summary_text,
+                        compaction_usage,
+                    } => {
+                        let res = tokio::select! {
+                            r = host.rollover_compacted_session(
+                                turn_id,
+                                *plan,
+                                compaction_prompt,
+                                summary_text,
+                                compaction_usage,
+                            ) => r.map_err(|e| e.to_string()),
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        };
+                        send_jsonl(
+                            &mut writer,
+                            &ParentToWorkerMessage::RolloverCompactedSessionReply { result: res },
+                        )
+                        .await?;
+                    }
                     WorkerToParentMessage::CreateModelResponse { request } => {
+                        let is_compaction_worker = request
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("ragents.role"))
+                            .map(|s| s.as_str())
+                            == Some("compaction_worker");
                         let turn_id = request
                             .metadata
                             .as_ref()
@@ -456,13 +485,17 @@ impl CoreExecutor for SubprocessExecutor {
                             .map(TurnId::new);
                         let (delta_tx, mut delta_rx) =
                             tokio::sync::mpsc::unbounded_channel::<crate::model::ModelStreamDelta>();
-                        let cb: crate::model::ModelStreamCallback = Arc::new(move |delta| {
-                            let _ = delta_tx.send(delta);
-                        });
+                        let cb: Option<crate::model::ModelStreamCallback> = if is_compaction_worker {
+                            None
+                        } else {
+                            Some(Arc::new(move |delta| {
+                                let _ = delta_tx.send(delta);
+                            }))
+                        };
                         let model_fut = model_backend.create_response_streaming(
                             &parent_endpoint,
                             *request,
-                            Some(cb),
+                            cb,
                         );
                         tokio::pin!(model_fut);
                         let res = loop {

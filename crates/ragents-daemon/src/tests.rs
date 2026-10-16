@@ -816,3 +816,437 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
     server_cancel.cancel();
     let _ = std::fs::remove_dir_all(&base_tmp);
 }
+
+#[tokio::test]
+async fn test_three_session_context_compaction_and_multi_generation_chain() {
+    use std::path::PathBuf;
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let compaction_wasm = manifest_dir.join(
+        "../../extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm",
+    );
+    let file_editor_wasm = manifest_dir.join(
+        "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+    );
+    assert!(
+        compaction_wasm.exists(),
+        "ragent_compaction_extension.wasm must be built"
+    );
+    assert!(
+        file_editor_wasm.exists(),
+        "ragent_file_editor_extension.wasm must be built"
+    );
+
+    let store = SqliteStore::open_in_memory().unwrap();
+    let state = ApiServerState::new(store, 5000);
+    let server_cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = serve_tcp(listener, state, server_cancel.clone())
+        .await
+        .unwrap();
+    let server_url = format!("http://{addr}");
+    let client = RagentsClient::new(&server_url);
+
+    struct CompactionTestBackend {
+        step: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelBackend for CompactionTestBackend {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            request: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            let role = request
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("ragents.role"))
+                .map(|s| s.as_str())
+                .unwrap_or("working");
+
+            let input_json = serde_json::to_string(&request.input).unwrap_or_default();
+
+            if role == "compaction_worker" {
+                let is_incremental = input_json.contains("<previous-summary>");
+                let summary_text = if is_incremental {
+                    "## Goal\nBuild & verify multi-generation compacted service.\n\n## Progress\n### Done\n- [x] Read config.toml and wrote output_v1.txt\n- [x] Read schema.sql and edited output_v1.txt in generation 2"
+                } else {
+                    "## Goal\nBuild & verify compacted service.\n\n## Progress\n### Done\n- [x] Read config.toml and wrote output_v1.txt"
+                };
+                return Ok(make_openresponses_resource(
+                    &format!("resp_compact_{}", uuid::Uuid::now_v7()),
+                    "gpt-4.1",
+                    vec![Item::assistant_message(summary_text)],
+                    None,
+                ));
+            }
+
+            let current = {
+                let mut g = self.step.lock().unwrap();
+                *g += 1;
+                *g
+            };
+
+            let items = match current {
+                1 => vec![
+                    Item::FunctionCall {
+                        id: None,
+                        call_id: "call_read_1".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({ "path": "config.toml" }).to_string(),
+                        status: None,
+                    },
+                    Item::FunctionCall {
+                        id: None,
+                        call_id: "call_write_1".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "output_v1.txt",
+                            "content": "initial content payload that adds enough tokens to the conversation history for compaction testing."
+                        })
+                        .to_string(),
+                        status: None,
+                    },
+                ],
+                2 => vec![Item::FunctionCall {
+                    id: None,
+                    call_id: "call_read_verify_1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "path": "output_v1.txt" }).to_string(),
+                    status: None,
+                }],
+                3 => {
+                    // At step 3, `sess_1` has compacted into `sess_2`!
+                    // Verify `request.input` starts with `[Compaction Summary]` from `sess_compact_1`!
+                    assert!(
+                        input_json.contains("[Compaction Summary]"),
+                        "step 3 on sess_2 must start with [Compaction Summary], got: {input_json}"
+                    );
+                    assert!(
+                        input_json.contains("<read-files>\\nconfig.toml\\n</read-files>"),
+                        "step 3 summary must track read-only config.toml: {input_json}"
+                    );
+                    assert!(
+                        input_json.contains("<modified-files>\\noutput_v1.txt\\n</modified-files>"),
+                        "step 3 summary must track modified output_v1.txt: {input_json}"
+                    );
+                    vec![Item::assistant_message(
+                        "Completed phase 1 after first automatic compaction.",
+                    )]
+                }
+                4 => vec![
+                    Item::FunctionCall {
+                        id: None,
+                        call_id: "call_read_2".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({ "path": "schema.sql" }).to_string(),
+                        status: None,
+                    },
+                    Item::FunctionCall {
+                        id: None,
+                        call_id: "call_edit_2".into(),
+                        name: "replace_in_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "output_v1.txt",
+                            "edits": [{
+                                "oldText": "initial content payload",
+                                "newText": "updated generation 2 payload"
+                            }]
+                        })
+                        .to_string(),
+                        status: None,
+                    },
+                ],
+                5 => vec![Item::FunctionCall {
+                    id: None,
+                    call_id: "call_read_verify_2".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "path": "output_v1.txt" }).to_string(),
+                    status: None,
+                }],
+                _ => {
+                    // Step 6 runs on `sess_3` (generation 2 compaction)!
+                    assert!(
+                        input_json.contains("edited output_v1.txt in generation 2"),
+                        "step 6 on sess_3 must contain generation 2 updated summary: {input_json}"
+                    );
+                    assert!(
+                        input_json.contains("config.toml") && input_json.contains("schema.sql"),
+                        "step 6 summary must preserve cumulative read_files across generations: {input_json}"
+                    );
+                    vec![Item::assistant_message(
+                        "Completed phase 2 on sess_3 after second consecutive compaction.",
+                    )]
+                }
+            };
+
+            let reported_total_tokens = if current == 2 || current == 5 {
+                500
+            } else {
+                60
+            };
+
+            Ok(make_openresponses_resource(
+                &format!("resp_work_{current}"),
+                "gpt-4.1",
+                items,
+                Some(openresponses_rust::Usage {
+                    input_tokens: reported_total_tokens - 20,
+                    output_tokens: 20,
+                    total_tokens: reported_total_tokens,
+                    input_tokens_details: openresponses_rust::InputTokensDetails {
+                        cached_tokens: 0,
+                    },
+                    output_tokens_details: openresponses_rust::OutputTokensDetails {
+                        reasoning_tokens: 0,
+                    },
+                }),
+            ))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_dir = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(
+        ws_dir.join("config.toml"),
+        "port = 8080\nmode = 'production'\ndescription = 'configuration file with enough text to contribute tokens'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ws_dir.join("schema.sql"),
+        "CREATE TABLE items (id INT PRIMARY KEY, name TEXT NOT NULL, details TEXT);\n",
+    )
+    .unwrap();
+
+    let mut cfg = DaemonConfig::default_local("node_compact", &server_url);
+    cfg.temp_root_dir = tmp.path().join("tmp");
+    cfg.extensions = vec![
+        ExtensionSpec {
+            name: "file_editor".into(),
+            path: file_editor_wasm.to_string_lossy().to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+            allowed_dirs: vec![],
+        },
+        ExtensionSpec {
+            name: "compaction".into(),
+            path: compaction_wasm.to_string_lossy().to_string(),
+            enabled: true,
+            config: serde_json::json!({
+                "enabled": true,
+                "trigger_tokens": 400,
+                "keep_recent_tokens": 25
+            }),
+            allowed_dirs: vec![],
+        },
+    ];
+
+    let daemon = AgentDaemon::new(cfg).with_model_backend(Arc::new(CompactionTestBackend {
+        step: Mutex::new(0),
+    }));
+    let d_cancel = CancellationToken::new();
+    daemon.start(d_cancel.clone()).await.unwrap();
+
+    let mut watch = client.watch_events(None, 0).await.unwrap();
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_gen0")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_compact"),
+                    workspace_path: ws_dir.clone(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: Some("You are a helpful coding agent.".into()),
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message(
+                    "Please inspect config.toml and write output_v1.txt with the initial payload.",
+                )],
+                model_override: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+    let sess_1_id = SessionId::new(created.session.metadata.id);
+    assert_eq!(sess_1_id.as_str(), "sess_gen0");
+
+    // Wait for `SessionCompacted` on `sess_1`, and then `ActivationCompleted` on `sess_2`!
+    let mut compact_1_id: Option<SessionId> = None;
+    let mut sess_2_id: Option<SessionId> = None;
+    let mut cont_act_1_id: Option<ActivationId> = None;
+
+    while let Some(Ok(env)) = watch.next().await {
+        if let SessionEvent::SessionCompacted {
+            ref from_session_id,
+            ref compaction_session_id,
+            ref continued_session_id,
+            ref continued_activation_id,
+            compaction_generation,
+            ..
+        } = env.event
+        {
+            assert_eq!(from_session_id, &sess_1_id);
+            assert_eq!(compaction_generation, 1);
+            compact_1_id = Some(compaction_session_id.clone());
+            sess_2_id = Some(continued_session_id.clone());
+            cont_act_1_id = Some(continued_activation_id.clone());
+        }
+        if let Some(ref target_act) = cont_act_1_id {
+            if env.activation_id.as_ref() == Some(target_act)
+                && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+            {
+                break;
+            }
+        }
+    }
+
+    let compact_1_id = compact_1_id.expect("compact_1_id emitted");
+    let sess_2_id = sess_2_id.expect("sess_2_id emitted");
+
+    // Verify bidirectional lineage across `sess_1 <-> compact_1 <-> sess_2`
+    let s1 = client.get_session(&sess_1_id).await.unwrap().unwrap();
+    let sc1 = client.get_session(&compact_1_id).await.unwrap().unwrap();
+    let s2 = client.get_session(&sess_2_id).await.unwrap().unwrap();
+
+    assert_eq!(s1.status.phase, SessionPhase::Closed);
+    assert_eq!(
+        s1.status.compaction.compaction_session_id.as_ref(),
+        Some(&compact_1_id)
+    );
+    assert_eq!(
+        s1.status.compaction.continued_in_session_id.as_ref(),
+        Some(&sess_2_id)
+    );
+
+    assert_eq!(sc1.status.phase, SessionPhase::Closed);
+    assert_eq!(sc1.status.compaction.role, SessionRole::CompactionWorker);
+    assert_eq!(sc1.status.compaction.generation, 1);
+    assert_eq!(
+        sc1.status.compaction.compacted_from_session_id.as_ref(),
+        Some(&sess_1_id)
+    );
+    assert_eq!(
+        sc1.status.compaction.continued_in_session_id.as_ref(),
+        Some(&sess_2_id)
+    );
+
+    assert_eq!(s2.status.phase, SessionPhase::Open);
+    assert_eq!(s2.status.compaction.role, SessionRole::Working);
+    assert_eq!(s2.status.compaction.generation, 1);
+    assert_eq!(
+        s2.status.compaction.compacted_from_session_id.as_ref(),
+        Some(&sess_1_id)
+    );
+    assert_eq!(
+        s2.status.compaction.compaction_session_id.as_ref(),
+        Some(&compact_1_id)
+    );
+    assert_eq!(s2.spec.sources.len(), 2);
+    assert_eq!(s2.spec.sources[0].kind, SessionSourceKind::SummaryOf);
+    assert_eq!(s2.spec.sources[0].session_id, compact_1_id);
+    assert_eq!(s2.spec.sources[1].kind, SessionSourceKind::ContinuedFrom);
+    assert_eq!(s2.spec.sources[1].session_id, sess_1_id);
+
+    // Now submit a second task targeting `sess_1_id` (verifying automatic compaction-chain routing to `sess_2`!)
+    // which will trigger a second consecutive compaction (`sess_2 -> compact_2 -> sess_3`, generation = 2)!
+    let act_phase2 = client
+        .create_activation(CreateActivationRequest {
+            activation_id: None,
+            labels: BTreeMap::new(),
+            spec: ActivationSpec {
+                session_id: sess_1_id.clone(),
+                submission_kind: SubmissionKind::Normal,
+                input: vec![Item::user_message(
+                    "Now read schema.sql and update output_v1.txt for phase 2.",
+                )],
+                model_override: None,
+                desired_phase: DesiredActivationPhase::Running,
+                interaction_responses: BTreeMap::new(),
+            },
+        })
+        .await
+        .unwrap();
+    // Because `sess_1` was compacted into `sess_2`, `create_activation` automatically routed it to `sess_2`!
+    assert_eq!(act_phase2.spec.session_id, sess_2_id);
+
+    let mut compact_2_id: Option<SessionId> = None;
+    let mut sess_3_id: Option<SessionId> = None;
+    let mut cont_act_2_id: Option<ActivationId> = None;
+
+    while let Some(Ok(env)) = watch.next().await {
+        if let SessionEvent::SessionCompacted {
+            ref from_session_id,
+            ref compaction_session_id,
+            ref continued_session_id,
+            ref continued_activation_id,
+            compaction_generation,
+            ..
+        } = env.event
+        {
+            if from_session_id == &sess_2_id {
+                assert_eq!(compaction_generation, 2);
+                compact_2_id = Some(compaction_session_id.clone());
+                sess_3_id = Some(continued_session_id.clone());
+                cont_act_2_id = Some(continued_activation_id.clone());
+            }
+        }
+        if let Some(ref target_act) = cont_act_2_id {
+            if env.activation_id.as_ref() == Some(target_act)
+                && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+            {
+                break;
+            }
+        }
+    }
+
+    let compact_2_id = compact_2_id.expect("compact_2_id emitted");
+    let sess_3_id = sess_3_id.expect("sess_3_id emitted");
+
+    let s2_after = client.get_session(&sess_2_id).await.unwrap().unwrap();
+    let sc2 = client.get_session(&compact_2_id).await.unwrap().unwrap();
+    let s3 = client.get_session(&sess_3_id).await.unwrap().unwrap();
+
+    assert_eq!(s2_after.status.phase, SessionPhase::Closed);
+    assert_eq!(
+        s2_after.status.compaction.continued_in_session_id.as_ref(),
+        Some(&sess_3_id)
+    );
+    assert_eq!(sc2.status.compaction.role, SessionRole::CompactionWorker);
+    assert_eq!(sc2.status.compaction.generation, 2);
+
+    // Verify `compact_2`'s input prompt included `<previous-summary>` from `compact_1`!
+    let sc2_ctx = client.get_session_context(&compact_2_id).await.unwrap();
+    let sc2_prompt_json = serde_json::to_string(&sc2_ctx.effective_items[0]).unwrap();
+    assert!(
+        sc2_prompt_json.contains("<previous-summary>"),
+        "generation 2 compaction prompt must contain <previous-summary>: {sc2_prompt_json}"
+    );
+
+    // Verify `sess_3` has generation 2 and flat 2-entry `sources` (`SummaryOf(compact_2)` + `ContinuedFrom(sess_2)`)
+    assert_eq!(s3.status.phase, SessionPhase::Open);
+    assert_eq!(s3.status.compaction.generation, 2);
+    assert_eq!(
+        s3.status.compaction.compacted_from_session_id.as_ref(),
+        Some(&sess_2_id)
+    );
+    assert_eq!(
+        s3.status.compaction.compaction_session_id.as_ref(),
+        Some(&compact_2_id)
+    );
+    assert_eq!(s3.spec.sources.len(), 2);
+    assert_eq!(s3.spec.sources[0].session_id, compact_2_id);
+    assert_eq!(s3.spec.sources[1].session_id, sess_2_id);
+
+    d_cancel.cancel();
+    server_cancel.cancel();
+}

@@ -119,14 +119,21 @@ impl SqliteStore {
             )?;
 
             for (order, src) in session.spec.sources.iter().enumerate() {
+                let kind_str = match src.kind {
+                    SessionSourceKind::ForkedFrom => "forked_from",
+                    SessionSourceKind::DerivedFrom => "derived_from",
+                    SessionSourceKind::SummaryOf => "summary_of",
+                    SessionSourceKind::ContinuedFrom => "continued_from",
+                };
                 tx.execute(
                     "INSERT INTO session_sources (
-                        child_session_id, source_order, source_session_id,
+                        child_session_id, source_order, source_kind, source_session_id,
                         from_context_pos, through_context_pos
-                    ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         session_id.as_str(),
                         order as i64,
+                        kind_str,
                         src.session_id.as_str(),
                         src.from_context_pos.value() as i64,
                         src.through_context_pos.value() as i64,

@@ -262,6 +262,34 @@ impl CoreHost for IpcCoreHostProxy {
             ))),
         }
     }
+
+    async fn rollover_compacted_session(
+        &self,
+        turn_id: Option<TurnId>,
+        plan: CompactionPlan,
+        compaction_prompt: String,
+        summary_text: String,
+        compaction_usage: Option<Usage>,
+    ) -> Result<SessionId, CoreError> {
+        let mut ch = self.channel.lock().await;
+        match ch
+            .call(&WorkerToParentMessage::RolloverCompactedSession {
+                turn_id,
+                plan: Box::new(plan),
+                compaction_prompt,
+                summary_text,
+                compaction_usage,
+            })
+            .await?
+        {
+            ParentToWorkerMessage::RolloverCompactedSessionReply { result } => {
+                result.map_err(CoreError::HostError)
+            }
+            other => Err(CoreError::HostError(format!(
+                "unexpected reply to RolloverCompactedSession: {other:?}"
+            ))),
+        }
+    }
 }
 
 struct IpcModelBackendProxy {

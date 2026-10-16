@@ -48,7 +48,8 @@ ragents/
 │   ├── shell/                        # 宿主前后台命令执行与进程管理扩展（含 2000行/50KB 尾部截断与落盘）
 │   ├── file_editor/                  # 文件分页读取 (offset/limit)、写入与非重叠精确替换扩展
 │   ├── image_viewer/                 # 多模态图像查看扩展
-│   └── skills/                       # Agent Skills (.agents/skills) 与 AGENTS.md 自动发现与加载扩展
+│   ├── skills/                       # Agent Skills (.agents/skills) 与 AGENTS.md 自动发现与加载扩展
+│   └── compaction/                   # 三会话自动上下文压缩与多代接力摘要扩展 (sess_1 -> sess_compact -> sess_2)
 ├── crates/
 │   ├── ragents-protocol/             # 核心声明式资源、事件、REST/SSE/WS 协议与扩展契约
 │   ├── ragents-apiserver/            # 控制面服务：SQLite WAL 存储、双模调度器、REST/SSE/WS 与 Authn/Authz/Admission 扩展
@@ -72,7 +73,7 @@ ragents/
 ### 3.1 编译主程序与内置 WASM 扩展
 
 ```bash
-# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, skills)
+# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, skills, compaction)
 ./scripts/build-extensions.sh
 
 # 2. 编译 ragents 工作区所有二进制
@@ -161,6 +162,7 @@ export RAGENTS_MODEL="gemini-3.8-flash"
   --extension shell=/Volumes/storage/src/ai/agents/ragents/extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm \
   --extension file_editor=/Volumes/storage/src/ai/agents/ragents/extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm \
   --extension "skills=/Volumes/storage/src/ai/agents/ragents/extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm:~/.agents/skills" \
+  --extension 'compaction=/Volumes/storage/src/ai/agents/ragents/extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm#{"trigger_tokens":64000,"keep_recent_tokens":20000}' \
   "请检查 src/main.rs 并运行 cargo check"
 ```
 

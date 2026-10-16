@@ -21,6 +21,7 @@ pub enum SubmissionKind {
     #[default]
     Normal,
     FollowUp,
+    Continuation,
     Steer {
         target_activation_id: ActivationId,
     },
@@ -91,7 +92,7 @@ impl ActivationSpec {
                 self.session_id.to_string(),
             ));
         }
-        if self.input.is_empty() {
+        if self.input.is_empty() && !matches!(self.submission_kind, SubmissionKind::Continuation) {
             return Err(ProtocolValidationError::EmptyActivationInput);
         }
         if let Some(ref model) = self.model_override {

@@ -312,6 +312,27 @@ fn handle_daemon_message(
                 send_ack_err(out_tx, request_id, e.to_string());
             }
         },
+        DaemonToServerMessage::RolloverCompactedSession {
+            request_id,
+            request,
+        } => match state.store.rollover_compacted_session(*request) {
+            Ok((response, _)) => {
+                let _ = out_tx.send(ServerToDaemonMessage::RolloverCompactedSessionReply {
+                    request_id,
+                    ok: true,
+                    response: Some(Box::new(response)),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                let _ = out_tx.send(ServerToDaemonMessage::RolloverCompactedSessionReply {
+                    request_id,
+                    ok: false,
+                    response: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        },
     }
 }
 
