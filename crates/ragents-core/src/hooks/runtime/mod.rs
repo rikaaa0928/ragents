@@ -244,7 +244,21 @@ impl WasmPlugin {
                 FilePerms::all(),
             );
         }
-        for dir in preopen_dirs {
+
+        let mut effective_preopen_dirs = preopen_dirs.to_vec();
+        if let Ok(home_str) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            wasi_builder.env("HOME", &home_str);
+            if core_host.is_some() {
+                let global_agents_dir = Path::new(&home_str).join(".agents");
+                if global_agents_dir.exists()
+                    && !effective_preopen_dirs.contains(&global_agents_dir)
+                {
+                    effective_preopen_dirs.push(global_agents_dir);
+                }
+            }
+        }
+
+        for dir in &effective_preopen_dirs {
             if dir.exists() {
                 if let Some(dir_str) = dir.to_str() {
                     let _ =
@@ -336,7 +350,7 @@ impl WasmPlugin {
             table: ResourceTable::new(),
             plugin_name: plugin_name.clone(),
             workspace_root: workspace_root.to_path_buf(),
-            preopen_dirs: preopen_dirs.to_vec(),
+            preopen_dirs: effective_preopen_dirs,
             core_host,
             sandbox_state,
             local_process_manager: ProcessManager::new(None),

@@ -183,6 +183,27 @@ impl SandboxState {
         &self.session_tmp_dir
     }
 
+    pub fn is_read_denied(&self, path: &Path) -> bool {
+        let norm_target = canonicalize_or_normalize(path);
+        let allowed = self
+            .allowed_read_paths
+            .lock()
+            .expect("allowed_read_paths poisoned");
+        if allowed
+            .iter()
+            .any(|p| path.starts_with(p) || norm_target.starts_with(p))
+        {
+            return false;
+        }
+        let denied = self
+            .denied_read_paths
+            .lock()
+            .expect("denied_read_paths poisoned");
+        denied
+            .iter()
+            .any(|p| path.starts_with(p) || norm_target.starts_with(p))
+    }
+
     pub async fn execute_command(
         &self,
         work_dir: &Path,

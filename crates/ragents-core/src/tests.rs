@@ -1320,3 +1320,145 @@ async fn test_openresponses_sse_streaming_deltas_and_transient_retry() {
 
     let _ = std::fs::remove_dir_all(&base_tmp);
 }
+
+#[tokio::test]
+async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
+    let skills_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm");
+    if !skills_wasm_path.exists() {
+        return;
+    }
+
+    let base_tmp =
+        std::env::temp_dir().join(format!("ragents-skills-test-{}", uuid::Uuid::now_v7()));
+    let ws_root = base_tmp.join("ws");
+    let sess_tmp = base_tmp.join("tmp");
+    let ws_skill_dir = ws_root.join(".agents/skills/demo-deploy");
+    std::fs::create_dir_all(&ws_skill_dir).unwrap();
+    std::fs::create_dir_all(&sess_tmp).unwrap();
+
+    std::fs::write(
+        ws_root.join("AGENTS.md"),
+        "Always run tests with uv run pytest.",
+    )
+    .unwrap();
+    std::fs::write(
+        ws_skill_dir.join("SKILL.md"),
+        "---\nname: demo-deploy\ndescription: Deploy the demo service to staging.\n---\n# Demo Deploy Skill\nStep 1: Run `./deploy.sh --env staging`\n",
+    )
+    .unwrap();
+
+    struct CapturingInstructionsBackend {
+        responses: Mutex<Vec<ResponseResource>>,
+        captured_instructions: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ModelBackend for CapturingInstructionsBackend {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            request: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            if let Some(inst) = request.instructions {
+                self.captured_instructions.lock().unwrap().push(inst);
+            }
+            let mut guard = self.responses.lock().unwrap();
+            if guard.is_empty() {
+                return Err(CoreError::ResponseFailed("no mock responses left".into()));
+            }
+            Ok(guard.remove(0))
+        }
+    }
+
+    let host = Arc::new(MockCoreHost {
+        items: Mutex::new(vec![Item::user_message("how do I deploy demo?")]),
+        ..Default::default()
+    });
+
+    let fc_load_skill = Item::FunctionCall {
+        id: Some("fc_sk_1".into()),
+        call_id: "call_sk_1".into(),
+        name: "load_skill".into(),
+        arguments: serde_json::json!({ "name": "demo-deploy" }).to_string(),
+        status: None,
+    };
+    let resp1 = make_openresponses_resource("r_sk_1", "gpt-4.1", vec![fc_load_skill], None);
+    let resp2 = make_openresponses_resource(
+        "r_sk_2",
+        "gpt-4.1",
+        vec![Item::assistant_message(
+            "Loaded demo-deploy skill: run ./deploy.sh --env staging",
+        )],
+        None,
+    );
+
+    let model_backend = Arc::new(CapturingInstructionsBackend {
+        responses: Mutex::new(vec![resp1, resp2]),
+        captured_instructions: Mutex::new(Vec::new()),
+    });
+
+    let cfg = ConfigRevision::new_merged(
+        "You are a coding assistant.".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![ExtensionSpec {
+            name: "skills".to_string(),
+            path: skills_wasm_path.to_string_lossy().to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+        }],
+    );
+
+    let run_spec = CoreRunSpec {
+        session_id: SessionId::new("sess_sk"),
+        activation_id: ActivationId::new("act_sk"),
+        workspace_root: ws_root,
+        session_tmp_dir: sess_tmp,
+        effective_config: cfg,
+        effective_permissions: PermissionPolicyLayer::default(),
+        model_endpoint: ModelEndpointConfig {
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+            api_key: "sk-local".to_string(),
+            ..Default::default()
+        },
+        max_turns: None,
+    };
+
+    let executor = InProcessExecutor;
+    let summary = executor
+        .execute(
+            run_spec,
+            host.clone(),
+            model_backend.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("execute skills extension test");
+
+    assert_eq!(
+        summary.final_text,
+        "Loaded demo-deploy skill: run ./deploy.sh --env staging"
+    );
+
+    let instructions = model_backend.captured_instructions.lock().unwrap();
+    assert!(!instructions.is_empty());
+    let first_sys_prompt = &instructions[0];
+    assert!(
+        first_sys_prompt.contains("<workspace_instructions file=\"AGENTS.md\">"),
+        "AGENTS.md should be injected into system_prompt: {first_sys_prompt}"
+    );
+    assert!(
+        first_sys_prompt.contains("<name>demo-deploy</name>")
+            && first_sys_prompt.contains("Deploy the demo service to staging."),
+        "workspace .agents/skills/demo-deploy should be injected into <available_skills>: {first_sys_prompt}"
+    );
+
+    let items = host.items.lock().unwrap();
+    let all_outputs = serde_json::to_string(&*items).unwrap();
+    assert!(
+        all_outputs.contains("Step 1: Run `./deploy.sh --env staging`"),
+        "load_skill must return the full SKILL.md content: {all_outputs}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base_tmp);
+}

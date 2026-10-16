@@ -12,6 +12,7 @@ exclude = [
     "extensions/shell",
     "extensions/file_editor",
     "extensions/image_viewer",
+    "extensions/skills",
 ]
 
 [workspace.package]

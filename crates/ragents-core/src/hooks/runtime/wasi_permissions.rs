@@ -134,20 +134,21 @@ impl HostState {
         let norm_target = crate::sandbox::canonicalize_or_normalize(full_path);
         let in_workspace =
             full_path.starts_with(&self.workspace_root) || norm_target.starts_with(&norm_ws);
+        let in_preopen_dirs = self.preopen_dirs.iter().any(|dir| {
+            let norm_dir = crate::sandbox::canonicalize_or_normalize(dir);
+            full_path.starts_with(dir) || norm_target.starts_with(&norm_dir)
+        });
 
         let Some(ref host) = self.core_host else {
-            if in_workspace {
-                return Ok(());
-            }
-            let in_allowed = self.preopen_dirs.iter().any(|dir| {
-                let norm_dir = crate::sandbox::canonicalize_or_normalize(dir);
-                full_path.starts_with(dir) || norm_target.starts_with(&norm_dir)
-            });
-            if in_allowed {
+            if in_workspace || in_preopen_dirs {
                 return Ok(());
             }
             return Err(wasi_fs_types::ErrorCode::NotPermitted.into());
         };
+
+        if !is_write && in_preopen_dirs && !self.sandbox_state.is_read_denied(full_path) {
+            return Ok(());
+        }
 
         if is_write {
             if self
