@@ -136,6 +136,7 @@ impl SqliteStore {
             Some(batch_seq),
             SessionEvent::ActivationSubmitted {
                 input_batch_seq: batch_seq,
+                items: batch.items,
             },
         )?;
         events_out.push(ev.clone());
@@ -249,6 +250,7 @@ impl SqliteStore {
             let mut session = Self::load_session_in_tx(&tx, session_id)?
                 .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
 
+            let committed_items = items.clone();
             let appended_batch_seq = if !items.is_empty() {
                 let b_seq = BatchSeq::new(session.status.batch_count);
                 let first_seq = LocalItemSeq::new(session.status.local_item_count);
@@ -298,6 +300,7 @@ impl SqliteStore {
             let session_event = match companion {
                 BatchCompanionEvent::InputSubmitted => SessionEvent::ActivationSubmitted {
                     input_batch_seq: appended_batch_seq.unwrap_or(BatchSeq::new(0)),
+                    items: committed_items,
                 },
                 BatchCompanionEvent::TurnCompleted {
                     response_id: resp_id,
@@ -306,6 +309,7 @@ impl SqliteStore {
                     response_id: resp_id,
                     appended_batch_seq,
                     usage,
+                    items: committed_items,
                 },
                 BatchCompanionEvent::ToolCallFinished {
                     call_id,
@@ -318,6 +322,7 @@ impl SqliteStore {
                     success,
                     duration_ms,
                     output_batch_seq: appended_batch_seq,
+                    items: committed_items,
                 },
             };
 

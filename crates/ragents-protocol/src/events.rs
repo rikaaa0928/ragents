@@ -64,6 +64,8 @@ pub enum SessionEvent {
 
     ActivationSubmitted {
         input_batch_seq: BatchSeq,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<Item>,
     },
     ActivationScheduled {
         node_id: NodeId,
@@ -107,6 +109,8 @@ pub enum SessionEvent {
         appended_batch_seq: Option<BatchSeq>,
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<Item>,
     },
 
     ToolCallStarted {
@@ -120,6 +124,8 @@ pub enum SessionEvent {
         duration_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_batch_seq: Option<BatchSeq>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<Item>,
     },
 
     PermissionRequested {

@@ -89,7 +89,8 @@ pub async fn watch_activation_to_completion(
     activation_id: &ActivationId,
 ) -> Result<()> {
     let mut stream = client.watch_events(Some(session_id), 0).await?;
-    let mut streamed_text_in_activation = false;
+    let mut rendered_any_turn_text = false;
+    let mut turn_streamed_text = String::new();
     let mut turn_streaming_line_open = false;
 
     while let Some(item) = stream.next().await {
@@ -122,6 +123,8 @@ pub async fn watch_activation_to_completion(
                 println!("[event] started on node={node_id}");
             }
             SessionEvent::TurnStarted => {
+                turn_streamed_text.clear();
+                turn_streaming_line_open = false;
                 println!("[event] turn started");
             }
             SessionEvent::ModelReasoningDelta { delta } => {
@@ -134,14 +137,53 @@ pub async fn watch_activation_to_completion(
                 use std::io::Write;
                 print!("{delta}");
                 let _ = std::io::stdout().flush();
-                streamed_text_in_activation = true;
+                turn_streamed_text.push_str(delta);
+                rendered_any_turn_text = true;
                 turn_streaming_line_open = true;
             }
-            SessionEvent::TurnCompleted { .. } => {
-                if turn_streaming_line_open {
+            SessionEvent::TurnCompleted { items, .. } => {
+                let mut authoritative_text = String::new();
+                for it in items {
+                    if matches!(it, Item::Message { .. }) {
+                        let t = extract_item_text(it);
+                        if !t.is_empty() {
+                            if !authoritative_text.is_empty() {
+                                authoritative_text.push('\n');
+                            }
+                            authoritative_text.push_str(&t);
+                        }
+                    }
+                }
+
+                if !authoritative_text.is_empty() {
+                    if turn_streamed_text.is_empty() {
+                        println!("{authoritative_text}");
+                        rendered_any_turn_text = true;
+                        turn_streaming_line_open = false;
+                    } else if authoritative_text == turn_streamed_text {
+                        if turn_streaming_line_open {
+                            println!();
+                            turn_streaming_line_open = false;
+                        }
+                    } else if let Some(missing_suffix) =
+                        authoritative_text.strip_prefix(&turn_streamed_text)
+                    {
+                        println!("{missing_suffix}");
+                        rendered_any_turn_text = true;
+                        turn_streaming_line_open = false;
+                    } else {
+                        if turn_streaming_line_open {
+                            println!();
+                        }
+                        println!("{authoritative_text}");
+                        rendered_any_turn_text = true;
+                        turn_streaming_line_open = false;
+                    }
+                } else if turn_streaming_line_open {
                     println!();
                     turn_streaming_line_open = false;
                 }
+                turn_streamed_text.clear();
             }
             SessionEvent::ToolCallStarted { name, call_id } => {
                 if turn_streaming_line_open {
@@ -220,7 +262,7 @@ pub async fn watch_activation_to_completion(
                 if turn_streaming_line_open {
                     println!();
                 }
-                if !streamed_text_in_activation {
+                if !rendered_any_turn_text {
                     let ctx = client.get_session_context(session_id).await?;
                     if let Some(last_msg) = ctx
                         .effective_items
