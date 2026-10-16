@@ -170,7 +170,7 @@ async fn test_in_process_executor_single_turn_without_tools() {
     assert_eq!(summary.final_text, "2+2 is 4.");
     assert_eq!(summary.turns_executed, 1);
     assert_eq!(host.items.lock().unwrap().len(), 2);
-    assert_eq!(host.events.lock().unwrap().len(), 1);
+    assert_eq!(host.events.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -1216,6 +1216,116 @@ async fn test_file_editor_pagination_non_overlapping_edits_and_shell_output_trun
     assert!(
         all_outputs.contains("out-2500"),
         "tail-truncated shell output must include line 2500"
+    );
+
+    let _ = std::fs::remove_dir_all(&base_tmp);
+}
+
+#[tokio::test]
+async fn test_openresponses_sse_streaming_deltas_and_transient_retry() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        // Attempt 1: return 503 Service Unavailable to verify transient retry
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\nConnection: close\r\n\r\nupstream overloaded",
+                )
+                .await;
+        }
+        // Attempt 2: return text/event-stream SSE with 3 text deltas + completed response
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let completed_resp = make_openresponses_resource(
+                "resp_sse_1",
+                "gpt-4.1",
+                vec![Item::assistant_message("Hello streaming world!")],
+                None,
+            );
+            let completed_event = serde_json::json!({
+                "type": "response.completed",
+                "sequence_number": 4,
+                "response": completed_resp
+            });
+            let sse_body = format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"streaming \"}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"world!\"}}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::to_string(&completed_event).unwrap()
+            );
+            let resp_http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse_body.len(),
+                sse_body
+            );
+            let _ = sock.write_all(resp_http.as_bytes()).await;
+        }
+    });
+
+    let base_tmp = std::env::temp_dir().join(format!("ragents-sse-test-{}", uuid::Uuid::now_v7()));
+    let ws_root = base_tmp.join("ws");
+    let sess_tmp = base_tmp.join("tmp");
+
+    let host = Arc::new(MockCoreHost {
+        items: Mutex::new(vec![Item::user_message("stream greeting")]),
+        ..Default::default()
+    });
+
+    let cfg = ConfigRevision::new_merged(
+        "You are a helpful assistant.".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![],
+    );
+
+    let run_spec = CoreRunSpec {
+        session_id: SessionId::new("sess_sse"),
+        activation_id: ActivationId::new("act_sse"),
+        workspace_root: ws_root,
+        session_tmp_dir: sess_tmp,
+        effective_config: cfg,
+        effective_permissions: PermissionPolicyLayer::default(),
+        model_endpoint: ModelEndpointConfig {
+            base_url: format!("http://{addr}/v1"),
+            api_key: "sk-local".to_string(),
+            ..Default::default()
+        },
+        max_turns: None,
+    };
+
+    let executor = InProcessExecutor;
+    let model_backend = Arc::new(OpenResponsesModelBackend);
+    let summary = executor
+        .execute(
+            run_spec,
+            host.clone(),
+            model_backend,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("execute SSE streaming with retry");
+
+    assert_eq!(summary.final_text, "Hello streaming world!");
+
+    let events = host.events.lock().unwrap();
+    let deltas: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::ModelTextDelta { delta } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        vec![
+            "Hello ".to_string(),
+            "streaming ".to_string(),
+            "world!".to_string()
+        ]
     );
 
     let _ = std::fs::remove_dir_all(&base_tmp);

@@ -316,4 +316,14 @@ impl ModelBackend for IpcModelBackendProxy {
             ))),
         }
     }
+
+    async fn create_response_streaming(
+        &self,
+        endpoint: &ModelEndpointConfig,
+        request: CreateResponseBody,
+        _on_delta: Option<crate::model::ModelStreamCallback>,
+    ) -> Result<ResponseResource, CoreError> {
+        // Parent process streams deltas directly to `CoreHost::emit_event` while executing `CreateModelResponse`.
+        self.create_response(endpoint, request).await
+    }
 }

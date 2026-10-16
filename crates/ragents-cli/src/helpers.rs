@@ -89,6 +89,9 @@ pub async fn watch_activation_to_completion(
     activation_id: &ActivationId,
 ) -> Result<()> {
     let mut stream = client.watch_events(Some(session_id), 0).await?;
+    let mut streamed_text_in_activation = false;
+    let mut turn_streaming_line_open = false;
+
     while let Some(item) = stream.next().await {
         let env = item?;
         if env.activation_id.as_ref() != Some(activation_id) {
@@ -121,7 +124,30 @@ pub async fn watch_activation_to_completion(
             SessionEvent::TurnStarted => {
                 println!("[event] turn started");
             }
+            SessionEvent::ModelReasoningDelta { delta } => {
+                use std::io::Write;
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
+                turn_streaming_line_open = true;
+            }
+            SessionEvent::ModelTextDelta { delta } => {
+                use std::io::Write;
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
+                streamed_text_in_activation = true;
+                turn_streaming_line_open = true;
+            }
+            SessionEvent::TurnCompleted { .. } => {
+                if turn_streaming_line_open {
+                    println!();
+                    turn_streaming_line_open = false;
+                }
+            }
             SessionEvent::ToolCallStarted { name, call_id } => {
+                if turn_streaming_line_open {
+                    println!();
+                    turn_streaming_line_open = false;
+                }
                 println!("[event] tool call started: {name} ({call_id})");
             }
             SessionEvent::ToolCallFinished {
@@ -191,16 +217,21 @@ pub async fn watch_activation_to_completion(
                 );
             }
             SessionEvent::ActivationCompleted { .. } => {
-                let ctx = client.get_session_context(session_id).await?;
-                if let Some(last_msg) = ctx
-                    .effective_items
-                    .iter()
-                    .rev()
-                    .find(|item| matches!(item, Item::Message { .. }))
-                {
-                    let text = extract_item_text(last_msg);
-                    if !text.is_empty() {
-                        println!("\n{text}");
+                if turn_streaming_line_open {
+                    println!();
+                }
+                if !streamed_text_in_activation {
+                    let ctx = client.get_session_context(session_id).await?;
+                    if let Some(last_msg) = ctx
+                        .effective_items
+                        .iter()
+                        .rev()
+                        .find(|item| matches!(item, Item::Message { .. }))
+                    {
+                        let text = extract_item_text(last_msg);
+                        if !text.is_empty() {
+                            println!("\n{text}");
+                        }
                     }
                 }
                 break;

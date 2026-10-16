@@ -8,6 +8,7 @@ use crate::error::CoreError;
 use crate::host::{CoreExecutor, CoreHost, CoreRunSpec, CoreRunSummary};
 use crate::model::ModelBackend;
 use async_trait::async_trait;
+use ragents_protocol::{SessionEvent, TurnId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -464,9 +465,43 @@ impl CoreExecutor for SubprocessExecutor {
                         .await?;
                     }
                     WorkerToParentMessage::CreateModelResponse { request } => {
-                        let res = tokio::select! {
-                            r = model_backend.create_response(&parent_endpoint, *request) => r.map(Box::new).map_err(|e| e.to_string()),
-                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        let turn_id = request
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("ragents.turn_id"))
+                            .map(TurnId::new);
+                        let (delta_tx, mut delta_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<crate::model::ModelStreamDelta>();
+                        let cb: crate::model::ModelStreamCallback = Arc::new(move |delta| {
+                            let _ = delta_tx.send(delta);
+                        });
+                        let model_fut = model_backend.create_response_streaming(
+                            &parent_endpoint,
+                            *request,
+                            Some(cb),
+                        );
+                        tokio::pin!(model_fut);
+                        let res = loop {
+                            tokio::select! {
+                                r = &mut model_fut => {
+                                    while let Ok(delta) = delta_rx.try_recv() {
+                                        let ev = match delta {
+                                            crate::model::ModelStreamDelta::TextDelta { delta } => SessionEvent::ModelTextDelta { delta },
+                                            crate::model::ModelStreamDelta::ReasoningDelta { delta } => SessionEvent::ModelReasoningDelta { delta },
+                                        };
+                                        let _ = host.emit_event(turn_id.clone(), ev).await;
+                                    }
+                                    break r.map(Box::new).map_err(|e| e.to_string());
+                                }
+                                Some(delta) = delta_rx.recv() => {
+                                    let ev = match delta {
+                                        crate::model::ModelStreamDelta::TextDelta { delta } => SessionEvent::ModelTextDelta { delta },
+                                        crate::model::ModelStreamDelta::ReasoningDelta { delta } => SessionEvent::ModelReasoningDelta { delta },
+                                    };
+                                    let _ = host.emit_event(turn_id.clone(), ev).await;
+                                }
+                                _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                            }
                         };
                         send_jsonl(
                             &mut writer,

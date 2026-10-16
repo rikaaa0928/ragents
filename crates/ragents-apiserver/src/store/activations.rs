@@ -350,6 +350,25 @@ impl SqliteStore {
         turn_id: Option<TurnId>,
         event: SessionEvent,
     ) -> Result<SessionEventEnvelope, StoreError> {
+        if event.is_ephemeral_stream_delta() {
+            let act = self
+                .get_activation(activation_id)?
+                .ok_or_else(|| StoreError::NotFound(format!("activation {activation_id}")))?;
+            Self::verify_fencing(&act, lease_epoch)?;
+            let envelope = SessionEventEnvelope {
+                resource_version: ResourceVersion::new(0),
+                event_seq: EventSeq::new(0),
+                event_id: EventId::generate(),
+                session_id: session_id.clone(),
+                activation_id: Some(activation_id.clone()),
+                turn_id,
+                created_at: Utc::now(),
+                event,
+            };
+            self.publish_events(vec![envelope.clone()]);
+            return Ok(envelope);
+        }
+
         let mut events_to_publish = Vec::new();
         let envelope = {
             let mut conn = self.conn.lock().expect("store mutex poisoned");

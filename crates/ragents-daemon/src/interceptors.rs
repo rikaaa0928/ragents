@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use openresponses_rust::{CreateResponseBody, ResponseResource};
-use ragents_core::{ControlPluginRunner, CoreError, ModelBackend, ModelEndpointConfig};
+use ragents_core::{
+    emit_synthetic_deltas_from_items, ControlPluginRunner, CoreError, ModelBackend,
+    ModelEndpointConfig, ModelStreamCallback,
+};
 use ragents_protocol::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -227,7 +230,35 @@ impl ModelBackend for InterceptedModelBackend {
     async fn create_response_raw(
         &self,
         endpoint: &ModelEndpointConfig,
+        request_json: serde_json::Value,
+    ) -> Result<ResponseResource, CoreError> {
+        self.create_response_raw_streaming(endpoint, request_json, None)
+            .await
+    }
+
+    async fn create_response_streaming(
+        &self,
+        endpoint: &ModelEndpointConfig,
+        mut request: CreateResponseBody,
+        on_delta: Option<ModelStreamCallback>,
+    ) -> Result<ResponseResource, CoreError> {
+        if self.chain.is_empty() {
+            return self
+                .inner
+                .create_response_streaming(endpoint, request, on_delta)
+                .await;
+        }
+        request.stream = Some(true);
+        let raw_json = serde_json::to_value(&request)?;
+        self.create_response_raw_streaming(endpoint, raw_json, on_delta)
+            .await
+    }
+
+    async fn create_response_raw_streaming(
+        &self,
+        endpoint: &ModelEndpointConfig,
         mut request_json: serde_json::Value,
+        on_delta: Option<ModelStreamCallback>,
     ) -> Result<ResponseResource, CoreError> {
         let mut effective_endpoint = endpoint.clone();
         let mut model_id = request_json
@@ -307,11 +338,22 @@ impl ModelBackend for InterceptedModelBackend {
         // 2. Call underlying ModelBackend (unless short-circuited by an interceptor)
         let started_at = std::time::Instant::now();
         let mut response = match short_circuit_response {
-            Some(resp) => resp,
+            Some(resp) => {
+                if let Some(ref cb) = on_delta {
+                    emit_synthetic_deltas_from_items(&resp.output, cb);
+                }
+                resp
+            }
             None => {
-                self.inner
-                    .create_response_raw(&effective_endpoint, request_json)
-                    .await?
+                if on_delta.is_some() {
+                    self.inner
+                        .create_response_raw_streaming(&effective_endpoint, request_json, on_delta)
+                        .await?
+                } else {
+                    self.inner
+                        .create_response_raw(&effective_endpoint, request_json)
+                        .await?
+                }
             }
         };
         let duration_ms = started_at.elapsed().as_millis() as u64;

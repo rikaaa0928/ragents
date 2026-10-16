@@ -4,7 +4,7 @@ use crate::hooks::*;
 use crate::host::{
     CoreExecutor, CoreHost, CoreRunSpec, CoreRunSummary, ModelEndpointConfig, PermissionOutcome,
 };
-use crate::model::ModelBackend;
+use crate::model::{ModelBackend, ModelStreamCallback, ModelStreamDelta};
 use crate::sandbox::SandboxState;
 use async_trait::async_trait;
 use openresponses_rust::{
@@ -65,7 +65,7 @@ impl AgentCore {
             max_output_tokens,
             reasoning,
             metadata,
-            stream: Some(false),
+            stream: Some(true),
             ..Default::default()
         }
     }
@@ -155,12 +155,43 @@ impl AgentCore {
         }
     }
 
-    pub async fn execute_request(
+    pub async fn execute_request_streaming(
         request: CreateResponseBody,
         endpoint: &ModelEndpointConfig,
         model_backend: &dyn ModelBackend,
+        host: &dyn CoreHost,
+        turn_id: &TurnId,
     ) -> Result<AgentCoreStepResult, CoreError> {
-        let response: ResponseResource = model_backend.create_response(endpoint, request).await?;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<ModelStreamDelta>();
+        let cb: ModelStreamCallback = Arc::new(move |delta| {
+            let _ = delta_tx.send(delta);
+        });
+
+        let model_fut = model_backend.create_response_streaming(endpoint, request, Some(cb));
+        tokio::pin!(model_fut);
+
+        let response: ResponseResource = loop {
+            tokio::select! {
+                res = &mut model_fut => {
+                    let r = res?;
+                    while let Ok(delta) = delta_rx.try_recv() {
+                        let ev = match delta {
+                            ModelStreamDelta::TextDelta { delta } => SessionEvent::ModelTextDelta { delta },
+                            ModelStreamDelta::ReasoningDelta { delta } => SessionEvent::ModelReasoningDelta { delta },
+                        };
+                        let _ = host.emit_event(Some(turn_id.clone()), ev).await;
+                    }
+                    break r;
+                }
+                Some(delta) = delta_rx.recv() => {
+                    let ev = match delta {
+                        ModelStreamDelta::TextDelta { delta } => SessionEvent::ModelTextDelta { delta },
+                        ModelStreamDelta::ReasoningDelta { delta } => SessionEvent::ModelReasoningDelta { delta },
+                    };
+                    let _ = host.emit_event(Some(turn_id.clone()), ev).await;
+                }
+            }
+        };
 
         if let Some(err) = response.error {
             return Err(CoreError::ResponseFailed(err.message));
@@ -201,7 +232,20 @@ impl AgentCore {
             tools,
             metadata,
         );
-        Self::execute_request(request, endpoint, model_backend).await
+        let response: ResponseResource = model_backend.create_response(endpoint, request).await?;
+        if let Some(err) = response.error {
+            return Err(CoreError::ResponseFailed(err.message));
+        }
+        if response.status == ResponseStatus::Failed {
+            return Err(CoreError::ResponseFailed(
+                "Response status is failed".into(),
+            ));
+        }
+        Ok(Self::parse_output_items(
+            response.output,
+            Some(response.id),
+            response.usage,
+        ))
     }
 }
 
@@ -470,10 +514,12 @@ async fn run_react_loop(
             apply_model_request_hook(hook_manager, iteration, initial_request).await?;
 
         let raw_step = tokio::select! {
-            res = AgentCore::execute_request(
+            res = AgentCore::execute_request_streaming(
                 prepared_request,
                 &run_spec.model_endpoint,
                 model_backend,
+                host,
+                &turn_id,
             ) => res?,
             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
         };

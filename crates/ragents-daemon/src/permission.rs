@@ -154,16 +154,38 @@ fn normalize_path(path: &Path, base: &Path) -> PathBuf {
     if let Ok(canon) = joined.canonicalize() {
         return canon;
     }
-    let mut out = PathBuf::new();
+    let mut cleaned = PathBuf::new();
     for comp in joined.components() {
         use std::path::Component;
         match comp {
             Component::CurDir => {}
             Component::ParentDir => {
-                out.pop();
+                cleaned.pop();
             }
-            c => out.push(c.as_os_str()),
+            c => cleaned.push(c.as_os_str()),
         }
     }
-    out
+
+    // Walk up to the nearest existing ancestor so symlinks like `/tmp` -> `/private/tmp`
+    // on macOS resolve consistently even when the leaf file does not exist yet.
+    let mut cursor: &Path = &cleaned;
+    let mut tail = Vec::new();
+    while !cursor.as_os_str().is_empty() {
+        if let Ok(canon_ancestor) = cursor.canonicalize() {
+            let mut result = canon_ancestor;
+            for part in tail.into_iter().rev() {
+                result.push(part);
+            }
+            return result;
+        }
+        if let Some(name) = cursor.file_name() {
+            tail.push(name.to_os_string());
+        }
+        match cursor.parent() {
+            Some(p) if p != cursor => cursor = p,
+            _ => break,
+        }
+    }
+
+    cleaned
 }

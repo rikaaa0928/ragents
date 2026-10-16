@@ -544,8 +544,9 @@ fn async_stream_events(
         }
 
         while let Ok(ev) = live_rx.recv().await {
+            let is_ephemeral = ev.event.is_ephemeral_stream_delta();
             let rv = ev.resource_version.value();
-            if rv <= highest_rv {
+            if !is_ephemeral && rv <= highest_rv {
                 continue;
             }
             if let Some(ref target_sess) = filter_session {
@@ -564,7 +565,9 @@ fn async_stream_events(
                     continue;
                 }
             }
-            highest_rv = rv;
+            if !is_ephemeral {
+                highest_rv = rv;
+            }
             if let Ok(json_str) = serde_json::to_string(&ev) {
                 let sse = SseEvent::default()
                     .id(rv.to_string())

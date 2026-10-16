@@ -94,6 +94,12 @@ pub enum SessionEvent {
     },
 
     TurnStarted,
+    ModelTextDelta {
+        delta: String,
+    },
+    ModelReasoningDelta {
+        delta: String,
+    },
     TurnCompleted {
         #[serde(skip_serializing_if = "Option::is_none")]
         response_id: Option<String>,
@@ -161,6 +167,8 @@ impl SessionEvent {
             SessionEvent::ActivationCancelled => "activation_cancelled",
             SessionEvent::ActivationInterrupted { .. } => "activation_interrupted",
             SessionEvent::TurnStarted => "turn_started",
+            SessionEvent::ModelTextDelta { .. } => "model_text_delta",
+            SessionEvent::ModelReasoningDelta { .. } => "model_reasoning_delta",
             SessionEvent::TurnCompleted { .. } => "turn_completed",
             SessionEvent::ToolCallStarted { .. } => "tool_call_started",
             SessionEvent::ToolCallFinished { .. } => "tool_call_finished",
@@ -171,5 +179,12 @@ impl SessionEvent {
             SessionEvent::BackgroundProcessExited { .. } => "background_process_exited",
             SessionEvent::RealtimeMessagesDrained { .. } => "realtime_messages_drained",
         }
+    }
+
+    pub fn is_ephemeral_stream_delta(&self) -> bool {
+        matches!(
+            self,
+            SessionEvent::ModelTextDelta { .. } | SessionEvent::ModelReasoningDelta { .. }
+        )
     }
 }
