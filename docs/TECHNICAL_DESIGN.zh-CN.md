@@ -531,11 +531,18 @@ pub trait CoreHost: Send + Sync {
         reason: Option<String>,
     ) -> Result<PermissionOutcome, CoreError>;
 
-    /// 请求派生子 Session（对应 session.spawn）
-    async fn spawn_child_session(
+    /// 在每个 Turn 开始前（或循环退出前）原子消费 api-server 实时消息队列
+    async fn drain_realtime_messages(
         &self,
-        request: SpawnSessionRequest,
-    ) -> Result<SessionId, CoreError>;
+        turn_id: Option<TurnId>,
+    ) -> Result<Vec<openresponses_rust::Item>, CoreError>;
+
+    /// 委托宿主机常驻 ProcessManager 管理前后台命令进程
+    async fn manage_process(
+        &self,
+        extension_id: Option<&str>,
+        request: ProcessActionRequest,
+    ) -> Result<Option<ProcessActionResponse>, CoreError>;
 }
 
 /// 由执行器实现，屏蔽进程内协程 (InProcess) 与独立子进程 (Subprocess) 的差异
@@ -565,18 +572,18 @@ pub trait CoreExecutor: Send + Sync {
 2. 执行 `input.prepare` 与 `context.append.prepare` Hook，由 `agent-daemon` 提交初始 `Input` Batch。
 3. 执行 `agent.prepare` Hook，收集扩展注册的 `Tool` 定义列表。
 4. 进入 ReAct Turn 循环：
-   - 检查 `cancellation.is_cancelled()`。
-   - 通过 `host.emit_event(TurnStarted)` 发出回合开始事件。
+   - 检查 `cancellation.is_cancelled()`，执行 `turn.prepare` Hook。
+   - 通过 `host.emit_event(TurnStarted)` 发出回合开始事件，并调用 `host.drain_realtime_messages()` 原子消费 `api-server` 实时队列。
    - 通过 `host.load_effective_context()` 获取当前最新上下文，执行 `context.project.prepare` 构建临时 `ContextProjection`（不改写历史）。
-   - 使用 `agent-daemon` 注入的 `ModelClient`（含本地 `base_url` 与 `api_key`）发送 Open Responses 请求（`stream = false`）。
-   - 收到 `ResponseResource` 后，调用 `host.commit_model_output(...)` 持久化 `ModelOutput` Batch。
+   - 执行 `model.request.prepare` Hook，随后使用 `ModelBackend` 发送 OpenResponses 流式请求（`stream = true`，内置瞬态错误指数退避重试），实时通过 `host.emit_event(ModelTextDelta / ModelReasoningDelta)` 推送增量文本。
+   - 收到完整 `ResponseResource` 后，依次执行 `model.response.observe`、`model.response.prepare` 与 `context.append.prepare` Hook，调用 `host.commit_model_output(...)` 持久化 `ModelOutput` Batch 并下发包含权威 `items` 的 `TurnCompleted` 事件。
    - 若响应包含 `Item::FunctionCall`：
      - 串行遍历每个工具调用，发出 `ToolCallStarted`。
-     - 先调用扩展的 `permission.requirements` 获取所需能力，再调用 `host.check_permission(...)`。
-     - 若权限通过，执行工具 Action（`tools.call`），将输出封装为 `Item::FunctionCallOutput`（即使工具执行报错也封装为错误文本输出供模型感知，不直接中断循环）。
-     - 调用 `host.commit_tool_output(...)` 持久化 `ToolOutput` Batch，继续下一轮 Turn。
-   - 若响应不含 `FunctionCall`，退出循环，由 `agent-daemon` 提交 `ActivationCompleted`。
-5. 无论成功、失败或取消，最终执行 `hook_manager.shutdown()` 释放资源。
+     - 依次执行 `tool.call.prepare` 与 `permission.requirements` Hook。
+     - 执行工具 Action（`tools.call`）与 `tool.result.prepare`、`context.append.prepare` Hook，将输出封装为 `Item::FunctionCallOutput`（即使工具执行报错也封装为错误文本输出供模型感知，不直接中断循环）。
+     - 调用 `host.commit_tool_output(...)` 持久化 `ToolOutput` Batch，触发 `turn.complete` Hook，继续下一轮 Turn。
+   - 若响应不含 `FunctionCall`，触发 `turn.complete` Hook，再次检查 `drain_realtime_messages()` 确认无新到达实时通知后退出循环，由 `agent-daemon` 提交 `ActivationCompleted`。
+5. 无论成功、失败或取消，最终执行 `agent.error`（若出错）、`agent.shutdown` 与 `hook_manager.shutdown()` 释放资源。
 
 ---
 

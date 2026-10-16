@@ -1,6 +1,6 @@
 # 双消息队列与宿主命令进程管理系统设计文档
 
-- **文档状态**：Draft（待评审）
+- **文档状态**：Implemented（已实现）
 - **关联模块**：`ragents-protocol`、`ragents-apiserver`、`ragents-daemon`、`ragents-core`、`extensions/shell`
 
 ---
@@ -200,15 +200,15 @@ interface host {
 
 在 `ragent_shell_extension.wasm` 中提供直观、好用的工具供大模型调用：
 
-1. **`shell`（启动/执行命令，兼容原有习惯并扩展异步能力）**：
+1. **`shell`（启动/执行命令，支持阻塞与后台异步模式）**：
    - `command` (`string`, 必填)：要执行的终端命令。
    - `wait` (`boolean`, 默认 `true`)：
-     - `true`：阻塞等待命令完成，直接返回 `exit_code`、`stdout`、`stderr`；
+     - `true`：阻塞等待命令完成，直接返回 `exit_code`、`stdout`、`stderr`（单次输出超过 **2000 行或 50KB** 时由 `extensions/shell` 自动保留尾部并将完整输出落盘至 `.ragents-tmp/`）；
      - `false`：后台异步启动进程，立即返回 `process_id`、真实 `pid` 与当前状态。
    - `lifecycle` (`"activation" | "session"`, 默认 `"activation"`)：
      - `"activation"`：当前 Activation 结束时自动停止并清理；
      - `"session"`：跨 Activation 保持后台运行，直至被主动停止或 Session 关闭。
-   - `timeout_seconds` (`integer`, 默认 `1800`)：最大运行超时秒数（`0` 表示不限时）。
+   - `timeout` / `timeout_seconds` (`number`, 可选，默认 `0` 不限时)：最大运行超时秒数（支持整数或小数秒，如 `0.5`、`10`）。阻塞模式下若触发超时，宿主会按进程组（`-pgid`）清理子进程树，并**完整保留超时前已产生的 `stdout` 与 `stderr`** 返回给模型。
 2. **`process_status`（查询单个或全部后台进程状态与返回码）**：
    - `process_id` (`string`, 可选)：指定进程 ID（或 PID）；若省略则列出当前 Session 下所有托管进程的状态、PID、生命周期与 `exit_code`。
 3. **`process_logs`（查询后台进程日志）**：

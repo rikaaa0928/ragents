@@ -28,7 +28,8 @@
 | **S7B：`agent-daemon` 拦截器扩展体系** | ✅ 已完成 | `bab6fc7` | `DaemonInterceptor` 原生 Trait + WASM 组件驱动 + HTTP/UDS Webhook 驱动，支持 `before_model_request`（修改标准模型参数、注入供应商扩展字段、注入自定义 Header、动态轮换 `api_key`）、`after_model_response` 与 `evaluate_permission` |
 | **S7C：`api-server` 鉴权与准入控制扩展体系** | ✅ 已完成 | `e7149b6`, `8d95166` | `AuthnPlugin`（区分 `client_http` 与 `daemon_tunnel`）、`AuthzPlugin`（支持 `enforced_label_selector` 多租户透明隔离）、`AdmissionPlugin`（`Mutating` 变更准入与 `Validating` 校验准入）及 CLI/SDK `--auth-token` 支持 |
 | **S7D：原生 WASI 0.2 权限统一与控制面 WASM 隔离** | ✅ 已完成 | `268cc28`, `c6056c1`, `e6b9efb` | 保持 WIT 最小化，直接接管 WASI 0.2 `wasi:filesystem/types::HostDescriptor`、`wasi:http/outgoing-handler` (`WasiHttpView`) 与 `wasi:sockets` (`socket_addr_check`)；控制面 WASM 插件默认开放网络、隔离宿主机 `/` 并仅挂载私有目录与 `allowed_dirs` |
-| **S7E：双消息队列与后台命令进程管理系统** | ✅ 已完成 | 本次提交 | `api-server` 双消息队列（`FollowUp` 等待队列 + `Realtime` 实时队列，支持单次全部取出并保持多个独立 `MessageContent` 块）；`agent-daemon` 托管 `ProcessManager` 支持 `wait: bool`、`lifecycle: "activation" \| "session"`、进程组级回收、`stdout`/`stderr`/`combined` 三通道日志查询、后台进程自然退出实时通知及 `ragents steer` CLI |
+| **S7E：双消息队列与后台命令进程管理系统** | ✅ 已完成 | `5877f9d`, `8dc7169` | `api-server` 双消息队列（`FollowUp` 等待队列 + `Realtime` 实时队列，支持单次全部取出并保持多个独立 `MessageContent` 块）；`agent-daemon` 托管 `ProcessManager` 支持 `wait: bool`、`lifecycle: "activation" \| "session"`、默认无超时限制（`0`）、阻塞超时按进程组强杀并保留超时前输出、`stdout`/`stderr`/`combined` 三通道日志查询、后台进程自然退出实时通知及 `ragents steer` CLI |
+| **S7F：子模块拆分、工具输出保护、SSE 流式对账与 Skills 扩展** | ✅ 已完成 | `c65aea9`, `80da66e`, `acb709f`, `3800c72`, `2d1cfb7`, `3cb7262`, `891734d` | 全仓大文件按职责拆分为清晰子模块；`read_file` 支持 `offset`/`limit` 与 2000行/50KB 头部截断、`replace_in_file` 支持针对原文件的多块无重叠原子替换、`shell` 扩展支持 2000行/50KB 尾部截断与落盘；OpenResponses SSE 实时流式推送（`ModelTextDelta`/`ModelReasoningDelta`）+ `TurnCompleted { items }` 权威完整版对账兜底 + 瞬态错误指数退避重试；新增 `extensions/skills` WASM 扩展与 `ExtensionSpec.allowed_dirs` 声明式目录授权 |
 
 ---
 
@@ -65,7 +66,7 @@
 ## 3. 常用构建、验证与运行命令
 
 ```bash
-# 1. 编译全部 WASM 扩展 (shell, file_editor, image_viewer)
+# 1. 编译全部 WASM 扩展 (shell, file_editor, image_viewer, skills)
 ./scripts/build-extensions.sh
 
 # 2. 运行全仓格式化检查、测试与严格 Clippy

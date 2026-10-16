@@ -16,15 +16,17 @@
    - **`Floating` 模式**：不绑定机器与本地路径，由 `api-server` 自动调度至支持目标模型的健康节点（优先复原节点亲和性，其次按最小负载），在节点临时目录执行；当节点故障离线时支持**自动跨机重调度并无缝接续历史上下文**。
 3. **节点本地模型凭证保险箱（Zero-Trust Secret Locality）**
    - 模型 `base_url` 与 `api_key` 仅保存在各节点本地的 `agent-daemon` 中，**永不上传至 `api-server` 数据库或网络层**；`agent-daemon` 仅向控制面上报该节点支持的模型名称列表（`supported_models: Vec<String>`）。
-4. **纯 OpenResponses 协议与双向 ID 穿透**
-   - 统一基于 `openresponses-rust` 标准格式通信；工具调用 `call_id`、消息 `Item` ID 原生贯通，且自动将 `ragents.session_id` / `ragents.activation_id` / `ragents.turn_id` 注入 OpenResponses 请求 `metadata`。
+4. **纯 OpenResponses 协议、流式增量推送（SSE Streaming）与双向 ID 穿透**
+   - 统一基于 `openresponses-rust` 标准格式通信；默认开启 SSE 流式响应（`stream = true`）并内置对 `429` / `502` / `503` / `504` 的指数退避自动重试。
+   - 生成过程中通过 `SessionEvent::ModelTextDelta` / `ModelReasoningDelta` 向客户端实时广播低延迟流式增量（不写入 SQLite 防止碎片膨胀），而在每轮结束时通过 `TurnCompleted { items }` 持久化并下发完整权威输出，供客户端自动对账自愈。
+   - 工具调用 `call_id`、消息 `Item` ID 原生贯通，且自动将 `ragents.session_id` / `ragents.activation_id` / `ragents.turn_id` 注入 OpenResponses 请求 `metadata`。
 5. **子进程容器化 + WASI 沙箱 + OS 内核级命令沙箱**
    - 默认采用 `SubprocessExecutor`：每次 `Activation` 派生独立 OS 子进程（`ragents internal-core-worker`），自动剥离环境变量中的 `RAGENTS_API_KEY`，通过单 Daemon 共享的 Unix Domain Socket（`SharedIpcHub`，不可用时自动回退本地回环 TCP）与父进程通信。
    - Wasmtime 组件预编译缓存（`.cwasm` SHA-256 内容寻址，`< 1ms` 极速加载）。
    - **OS 内核级命令沙箱**：macOS 下自动启用 `/usr/bin/sandbox-exec`（Seatbelt），Linux 下自动启用 `/usr/bin/bwrap`（Bubblewrap），拦截一切未授权的工作区外文件写入与受限目录读取。
 6. **三大能力边界统一鉴权（宿主 Shell + WASI 0.2 文件系统 + WASI 0.2 网络）与 5 级权限审批**
-   - **最小化宿主导入**：WIT `ragent:extension/host` 仅暴露唯一的命令执行接口 `execute-command-with-timeout`；WASM 插件内部的文件读写与网络请求全部走 **WASI 0.2 标准接口**。
-   - **宿主 Shell（`execute-command-with-timeout`）**：当 `uv run`、`pip install` 等命令访问工作区外部目录（如 `~/.cache/uv`）被内核沙箱拦截时，系统在**单次工具调用内部**自动捕获受阻路径（支持 `stderr` 快速提取 + macOS 内核沙箱日志兜底），支持单次命令内**多目录循环递进审批**，获批后原地自动解锁沙箱并重跑命令。
+   - **最小化宿主导入**：WIT `ragent:extension/host` 仅暴露唯一的进程管理接口 `manage-process`；WASM 插件内部的文件读写与网络请求全部走 **WASI 0.2 标准接口**。
+   - **宿主进程管理（`manage-process`）**：当 `uv run`、`pip install` 等命令访问工作区外部目录（如 `~/.cache/uv`）被内核沙箱拦截时，系统在**单次工具调用内部**自动捕获受阻路径（支持 `stderr` 快速提取 + macOS 内核沙箱日志兜底），支持单次命令内**多目录循环递进审批**，获批后原地自动解锁沙箱并重跑命令。
    - **WASI 0.2 文件系统（`wasi:filesystem/types::HostDescriptor`）**：直接接管 WASI 0.2 底层 `open-at`、`create-directory-at`、`unlink-file-at`、`rename-at` 等异步系统调用。无论 WASM 插件（如 `file_editor.wasm` 或任意第三方黑盒 `.wasm`）如何构造路径并调用 `std::fs`，只要触碰未授权目录，均在 WASI `open-at` 系统调用处直接挂起并发起 `FileRead` / `FileWrite` 审批，批准后当场返回文件描述符完成读写。
    - **WASI 0.2 网络（`wasi:http/outgoing-handler` & `wasi:sockets`）**：通过 Wasmtime WASI 0.2 内置的 `WasiHttpView::send_request` 与 `WasiCtxBuilder::socket_addr_check` 拦截所有出站 HTTP 与 TCP/UDP 连接，自动触发 `CapabilityRequest::Http` 权限校验与交互式域名审批（支持 `--path "*.example.com"` 通配符覆盖）。
    - 审批时统一展示 `original_path`（原始受阻文件路径或完整 URL）与 `suggested_path`（自动收敛建议目录或目标域名），支持用户通过 `--path` 手动收窄或放宽范围，并提供 **`allow-once` / `allow-activation` / `allow-session` / `allow-workspace` / `allow-node`** 5 级生效周期。
@@ -42,10 +44,11 @@ ragents/
 ├── Cargo.toml                        # Workspace 根配置
 ├── scripts/build-extensions.sh       # 构建内置 wasm32-wasip2 工具扩展脚本
 ├── wit/ragent-extension.wit          # WASM 扩展 WIT 接口契约
-├── extensions/                       # 内置 WASM 工具扩展源码
-│   ├── shell/                        # 宿主终端命令执行扩展
-│   ├── file_editor/                  # 文件读写与精确替换扩展
-│   └── image_viewer/                 # 图像查看扩展
+├── extensions/                       # 内置 WASM 工具扩展源码 (wasm32-wasip2)
+│   ├── shell/                        # 宿主前后台命令执行与进程管理扩展（含 2000行/50KB 尾部截断与落盘）
+│   ├── file_editor/                  # 文件分页读取 (offset/limit)、写入与非重叠精确替换扩展
+│   ├── image_viewer/                 # 多模态图像查看扩展
+│   └── skills/                       # Agent Skills (.agents/skills) 与 AGENTS.md 自动发现与加载扩展
 ├── crates/
 │   ├── ragents-protocol/             # 核心声明式资源、事件、REST/SSE/WS 协议与扩展契约
 │   ├── ragents-apiserver/            # 控制面服务：SQLite WAL 存储、双模调度器、REST/SSE/WS 与 Authn/Authz/Admission 扩展
@@ -69,7 +72,7 @@ ragents/
 ### 3.1 编译主程序与内置 WASM 扩展
 
 ```bash
-# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer)
+# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, skills)
 ./scripts/build-extensions.sh
 
 # 2. 编译 ragents 工作区所有二进制
@@ -157,6 +160,7 @@ export RAGENTS_MODEL="gemini-3.8-flash"
   --model gemini-3.8-flash \
   --extension shell=/Volumes/storage/src/ai/agents/ragents/extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm \
   --extension file_editor=/Volumes/storage/src/ai/agents/ragents/extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm \
+  --extension "skills=/Volumes/storage/src/ai/agents/ragents/extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm:~/.agents/skills" \
   "请检查 src/main.rs 并运行 cargo check"
 ```
 

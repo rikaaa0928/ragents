@@ -92,7 +92,9 @@ default_temperature = 0.1
 name = "shell"
 path = "/Volumes/storage/src/ai/agents/ragents/extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm"
 enabled = true
-config = { default_timeout_seconds = 1800 }
+# default_timeout_seconds = 0 表示默认无超时限制（与 pi 一致，支持单次调用传 timeout 秒数）
+# max_output_lines / max_output_bytes 控制阻塞命令输出尾部截断阈值（超出部分自动落盘至 .ragents-tmp/）
+config = { default_timeout_seconds = 0, max_output_lines = 2000, max_output_bytes = 51200 }
 
 [[extensions]]
 name = "file_editor"
@@ -105,6 +107,14 @@ name = "image_viewer"
 path = "/Volumes/storage/src/ai/agents/ragents/extensions/image_viewer/target/wasm32-wasip2/release/ragent_image_viewer_extension.wasm"
 enabled = true
 config = {}
+
+[[extensions]]
+name = "skills"
+path = "/Volumes/storage/src/ai/agents/ragents/extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm"
+enabled = true
+# 声明式授予该扩展额外允许读取的宿主机目录（支持 ~/ 展开；会自动挂载至 WASI 并合并进 PermissionSnapshot）
+allowed_dirs = ["~/.agents/skills"]
+config = { include_workspace = true, include_global = true, include_agents_md = true }
 
 # ============================================================================
 # 4. 节点默认权限与沙箱边界策略
@@ -165,30 +175,53 @@ config = { inject_thinking_budget = 4096 }
 
 ---
 
-## 3. 多级配置合并与不可变快照机制
+## 3. 多级配置优先级、合并规则与不可变快照机制
 
-当一个 `Activation` 被调度到某个 `agent-daemon` 节点执行时，节点会按以下优先级合并配置（**右者覆盖左者**）：
+在 `ragents` 中，**CLI 命令行参数是生成或修改声明式配置资源（`DaemonConfig`、`SessionSpec`、`ActivationSpec`）的入口**，真正的配置合并发生在 `agent-daemon` 接管任务时的 `DaemonConfig::merge_for_activation` 中。
+
+### 3.1 总体优先级顺序（由高到低）
 
 ```text
-[Node 级 daemon.toml 默认配置]  ──►  [Session 级 SessionSpec 配置]  ──►  [Activation 级 model_override]
+[单次激活覆盖 ActivationSpec] ──► [会话声明 SessionSpec] ──► [节点配置 daemon.toml] ──► [环境变量兜底]
 ```
 
-1. **模型选择优先级**：
-   - `ActivationSpec.model_override.name` > `SessionSpec.model.name` > `DaemonConfig.default_model` > `DaemonConfig.models` 中的第一个模型。
-2. **扩展列表合并**：
-   - 以 `extension.name` 为键，将 `DaemonConfig.extensions` 与 `SessionSpec.extensions` 合并，同名扩展以 `SessionSpec` 为准。
-3. **权限策略合并**：
-   - 将 `DaemonConfig.default_permissions`、当前会话/工作目录/节点已通过 `ragents approve` 动态授予的权限（`session_grants` / `workspace_grants` / `node_grants`）以及 `SessionSpec.permissions` 合并为最终生效策略。
-4. **内容寻址快照（`ConfigRevision` & `PermissionSnapshot`）**：
-   - 合并完成后，`agent-daemon` 会剔除所有敏感凭证（`api_key`、`base_url`），对规范化 JSON 计算 SHA-256 摘要（生成 `cfg_sha256:...` 与 `permsnap_sha256:...`），通过 `AcceptActivation` 回写至 `api-server` 审计归档。
+1. **CLI 参数与各层配置资源的映射关系**：
+   - `ragents daemon --config daemon.toml` / `ragents up --daemon-config daemon.toml`：加载节点级基线配置 **`DaemonConfig`**（若未指定 `--config`，则从 `RAGENTS_BASE_URL`、`RAGENTS_API_KEY`、`RAGENTS_MODEL` 环境变量生成默认 `DaemonConfig`）。
+   - `ragents session create ...` 或首次 `ragents run ...`：命令行参数（`--model`、`--system-prompt`、`--extension name=path[:dir1,dir2]`、`--node`、`--workdir`）直接组装为 **`SessionSpec`** 提交至 `api-server`。
+   - `ragents run --session <existing_id> --model <override_model> <prompt>`：在已有会话上发起新一轮输入时，`--model` 写入当次激活的 **`ActivationSpec.model_override`**，仅覆盖当前这一轮 Activation。
+
+### 3.2 各配置项的具体合并规则
+
+1. **模型与推理参数（Model & Parameters）**：
+   - **模型名称 (`model.name`)**：
+     `ActivationSpec.model_override.name` $\succ$ `SessionSpec.model.name` $\succ$ `daemon.toml` 的 `default_model` $\succ$ `daemon.toml` 的 `[models]` 表中第一个模型。
+     *(注：确定模型名称后，其连接的 `base_url`、`api_key`、`extra_headers` **100% 强制取自执行节点本地 `daemon.toml` 的 `[models.<name>]`**，客户端或 `SessionSpec` 绝不能覆盖节点本地凭证。)*
+   - **采样与推理参数 (`temperature` / `max_output_tokens` / `reasoning`)**：
+     `ActivationSpec.model_override` $\succ$ `SessionSpec.model` $\succ$ `daemon.toml` 中该模型的默认值。
+2. **系统提示词（System Prompt）**：
+   - 若 `SessionSpec.system_prompt`（或 CLI `--system-prompt`）非空则优先使用；否则回退使用 `daemon.toml` 的 `default_system_prompt`。
+   - 随后在 `agent-core` 启动时，挂载的 WASM 扩展（如 `skills` 扩展）可通过 `agent.prepare` Hook 进一步向有效 `system_prompt` 动态追加 `<workspace_instructions>`（`AGENTS.md`）与 `<available_skills>`。
+3. **WASM 扩展列表（`extensions`）—— 按扩展名 `name` 字典合并覆盖**：
+   - 先加载 `daemon.toml` 中的所有 `[[extensions]]` 作为基线字典（以 `ext.name` 为 Key）。
+   - 再遍历 `SessionSpec.extensions`（即 CLI `--extension` 传入的扩展）：
+     - **不同名扩展**：取并集（例如 `daemon.toml` 默认配置了 `shell` 与 `file_editor`，CLI 传入 `--extension skills=...:~/.agents/skills`，最终三者同时生效）。
+     - **同名扩展**：`SessionSpec` 中的同名 `ExtensionSpec` 完整覆盖 `daemon.toml` 中的对应项（可用于在特定会话中覆盖某扩展的 `config`、`allowed_dirs` 或将 `enabled` 设为 `false`）。
+4. **权限策略层（`permissions`）与扩展 `allowed_dirs`**：
+   - **基础策略合并**：`SessionSpec.permissions` 覆盖 `daemon.toml` 的 `default_permissions`（按 `file_read`、`file_write`、`http_hosts`、`command_work_dir` 四个维度的 `deny` / `allow` / `default` 逐项覆盖，未指定的维度继承 `daemon.toml`）。
+   - **叠加启用扩展的 `allowed_dirs`**：将最终生效（`enabled = true`）的所有扩展声明的 `allowed_dirs` 自动合并追加到 `effective_permissions.file_read.allow` 中，同时在 WASI 0.2 `preopen_dirs` 与 OS 内核沙箱 `allowed_read_paths` 中注册。
+   - **单规则集内部判定铁律（Deny 永远最高）**：
+     在同一个规则集内，无论 `allow` 来自节点默认配置、会话配置还是扩展 `allowed_dirs`，执行判定顺序永远是：
+     **① 命中 `deny` 立即拒绝 $\succ$ ② 命中 `allow`（含 `allowed_dirs` 与运行时动态授权）放行 $\succ$ ③ 命中 `default` 或工作区默认边界策略**。
+5. **内容寻址审计快照（`ConfigRevision` & `PermissionSnapshot`）**：
+   - 每次 `Activation` 开始执行前，`agent-daemon` 剔除所有敏感凭证（`api_key`、`base_url`），对合并后的规范化 JSON 计算 SHA-256 摘要（生成 `cfg_sha256:...` 与 `permsnap_sha256:...`），通过 `AcceptActivation` 回写至 `api-server` 持久化归档，确保每次历史运行均可精确复盘。
 
 ---
 
 ## 4. 三大能力域统一权限审批说明（Shell / WASI 0.2 文件 / WASI 0.2 网络）
 
-`ragents` 遵循**最小宿主导入原则**：WIT `ragent:extension/host` 仅提供 `execute-command-with-timeout` 一个宿主函数，WASM 内部的文件读写与网络请求全部通过 **WASI 0.2 标准内置权限机制** 管控：
+`ragents` 遵循**最小宿主导入原则**：WIT `ragent:extension/host` 仅提供 `manage-process` 一个宿主进程管理函数，WASM 内部的文件读写与网络请求全部通过 **WASI 0.2 标准内置权限机制** 管控：
 
-1. **宿主提供的 Shell（`execute-command-with-timeout` + OS 内核沙箱）**：
+1. **宿主提供的命令进程管理（`manage-process` + OS 内核沙箱）**：
    - **macOS**：通过 `/usr/bin/sandbox-exec`（Seatbelt）在内核层拦截未授权的 `file-write*` 与被拒的 `file-read-data`。
    - **Linux**：通过 `/usr/bin/bwrap`（Bubblewrap）只读根挂载 + 授权目录读写绑定。
    - **Windows**：不做额外 OS 沙箱限制。
