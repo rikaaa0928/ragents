@@ -179,6 +179,10 @@ impl SandboxState {
         r_guard.retain(|p| p != path);
     }
 
+    pub fn session_tmp_dir(&self) -> &Path {
+        &self.session_tmp_dir
+    }
+
     pub async fn execute_command(
         &self,
         work_dir: &Path,

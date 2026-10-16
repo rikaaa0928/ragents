@@ -119,7 +119,7 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
                 tools.push(serde_json::json!({
                     "enabled": true,
                     "name": "shell",
-                    "description": "在宿主系统上执行终端命令。支持同步阻塞等待完成（wait=true，默认）或后台异步启动进程并立即返回 process_id 与真实 pid（wait=false）。",
+                    "description": "Execute a shell command on the host system. Supports synchronous blocking execution (wait=true, default) or asynchronous background execution returning process_id and pid (wait=false). For blocking commands, output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file.",
                     "parameters": {
                         "type": "object",
                         "properties": {

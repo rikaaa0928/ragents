@@ -1022,3 +1022,201 @@ async fn test_blocking_shell_timeout_preserves_partial_output_and_kills_process_
 
     let _ = std::fs::remove_dir_all(&base_tmp);
 }
+
+#[tokio::test]
+async fn test_file_editor_pagination_non_overlapping_edits_and_shell_output_truncation() {
+    let editor_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+    );
+    let shell_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm");
+    if !editor_wasm_path.exists() || !shell_wasm_path.exists() {
+        return;
+    }
+
+    let base_tmp =
+        std::env::temp_dir().join(format!("ragents-trunc-edit-{}", uuid::Uuid::now_v7()));
+    let ws_root = base_tmp.join("ws");
+    let sess_tmp = base_tmp.join("tmp");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&sess_tmp).unwrap();
+
+    // Create a 2,500-line file in workspace
+    let big_file = ws_root.join("big.txt");
+    let content = (1..=2500)
+        .map(|i| format!("line-{i:04}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&big_file, &content).unwrap();
+
+    // Create a source file for testing non-overlapping `replace_in_file`
+    let code_file = ws_root.join("code.rs");
+    std::fs::write(
+        &code_file,
+        "fn alpha() {\n    let x = 1;\n}\nfn beta() {\n    let y = 2;\n}\n",
+    )
+    .unwrap();
+
+    let host = Arc::new(MockCoreHost {
+        items: Mutex::new(vec![Item::user_message("test tools")]),
+        ..Default::default()
+    });
+
+    // Turn 1:
+    // 1. read_file on 2,500-line file without offset/limit -> auto-truncated at 2,000 lines
+    // 2. read_file with offset=2490, limit=5 -> returns 5 lines and "6 more lines in file. Use offset=2495"
+    // 3. replace_in_file with 2 disjoint edits
+    // 4. replace_in_file with overlapping edits -> rejected
+    // 5. shell command printing 2,500 lines -> tail-truncated to lines 501-2500 and spilled to temp file
+    let fc1 = Item::FunctionCall {
+        id: Some("fc_1".into()),
+        call_id: "call_read_full".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({ "path": "big.txt" }).to_string(),
+        status: None,
+    };
+    let fc2 = Item::FunctionCall {
+        id: Some("fc_2".into()),
+        call_id: "call_read_page".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({ "path": "big.txt", "offset": 2490, "limit": 5 }).to_string(),
+        status: None,
+    };
+    let fc3 = Item::FunctionCall {
+        id: Some("fc_3".into()),
+        call_id: "call_edit_ok".into(),
+        name: "replace_in_file".into(),
+        arguments: serde_json::json!({
+            "path": "code.rs",
+            "edits": [
+                { "old_text": "let y = 2;", "new_text": "let y = 20;\n    let x = 1;" },
+                { "old_text": "let x = 1;", "new_text": "let x = 10;" }
+            ]
+        })
+        .to_string(),
+        status: None,
+    };
+    let fc4 = Item::FunctionCall {
+        id: Some("fc_4".into()),
+        call_id: "call_edit_overlap".into(),
+        name: "replace_in_file".into(),
+        arguments: serde_json::json!({
+            "path": "code.rs",
+            "edits": [
+                { "old_text": "fn alpha() {\n    let x = 10;", "new_text": "fn alpha() {\n    let x = 100;" },
+                { "old_text": "let x = 10;\n}", "new_text": "let x = 200;\n}" }
+            ]
+        })
+        .to_string(),
+        status: None,
+    };
+    let fc5 = Item::FunctionCall {
+        id: Some("fc_5".into()),
+        call_id: "call_shell_big".into(),
+        name: "shell".into(),
+        arguments: serde_json::json!({
+            "command": "awk 'BEGIN { for (i = 1; i <= 2500; i++) printf \"out-%04d\\n\", i }'"
+        })
+        .to_string(),
+        status: None,
+    };
+
+    let resp1 = make_openresponses_resource("r1", "gpt-4.1", vec![fc1, fc2, fc3, fc4, fc5], None);
+    let resp2 = make_openresponses_resource(
+        "r2",
+        "gpt-4.1",
+        vec![Item::assistant_message("All tool checks completed.")],
+        None,
+    );
+
+    let model_backend = Arc::new(MockModelBackend {
+        responses: Mutex::new(vec![resp1, resp2]),
+    });
+
+    let cfg = ConfigRevision::new_merged(
+        "You are a coding assistant.".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![
+            ExtensionSpec {
+                name: "file_editor".to_string(),
+                path: editor_wasm_path.to_string_lossy().to_string(),
+                enabled: true,
+                config: serde_json::json!({}),
+            },
+            ExtensionSpec {
+                name: "shell".to_string(),
+                path: shell_wasm_path.to_string_lossy().to_string(),
+                enabled: true,
+                config: serde_json::json!({}),
+            },
+        ],
+    );
+
+    let run_spec = CoreRunSpec {
+        session_id: SessionId::new("sess_trunc"),
+        activation_id: ActivationId::new("act_trunc"),
+        workspace_root: ws_root.clone(),
+        session_tmp_dir: sess_tmp.clone(),
+        effective_config: cfg,
+        effective_permissions: PermissionPolicyLayer::default(),
+        model_endpoint: ModelEndpointConfig {
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+            api_key: "sk-local".to_string(),
+            ..Default::default()
+        },
+        max_turns: None,
+    };
+
+    let executor = InProcessExecutor;
+    let summary = executor
+        .execute(
+            run_spec,
+            host.clone(),
+            model_backend,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("execute truncation and edit test");
+    assert_eq!(summary.final_text, "All tool checks completed.");
+
+    // Verify non-overlapping edits matched against original file (Notice edit[0] inserted `let x = 1;`,
+    // which would have broken edit[1] if edits were matched incrementally!)
+    let updated_code = std::fs::read_to_string(&code_file).unwrap();
+    assert_eq!(
+        updated_code,
+        "fn alpha() {\n    let x = 10;\n}\nfn beta() {\n    let y = 20;\n    let x = 1;\n}\n"
+    );
+
+    let items = host.items.lock().unwrap();
+    let all_outputs = serde_json::to_string(&*items).unwrap();
+    assert!(
+        all_outputs.contains("[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]"),
+        "read_file must head-truncate at 2000 lines: {all_outputs}"
+    );
+    assert!(
+        all_outputs.contains("[6 more lines in file. Use offset=2495 to continue.]"),
+        "read_file with offset/limit must report remaining lines: {all_outputs}"
+    );
+    assert!(
+        all_outputs.contains("Successfully replaced 2 block(s) in code.rs."),
+        "replace_in_file must succeed on non-overlapping edits: {all_outputs}"
+    );
+    assert!(
+        all_outputs.contains("edits[0] and edits[1] overlap in code.rs"),
+        "replace_in_file must reject overlapping edits: {all_outputs}"
+    );
+    assert!(
+        all_outputs.contains("Showing lines 501-2500 of 2500. Full output:"),
+        "shell must tail-truncate at 2000 lines and spill full output to temp file: {all_outputs}"
+    );
+    assert!(
+        !all_outputs.contains("out-0001"),
+        "tail-truncated shell output must not include line 1"
+    );
+    assert!(
+        all_outputs.contains("out-2500"),
+        "tail-truncated shell output must include line 2500"
+    );
+
+    let _ = std::fs::remove_dir_all(&base_tmp);
+}

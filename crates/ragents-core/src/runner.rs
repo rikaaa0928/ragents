@@ -38,7 +38,7 @@ pub struct AgentCore;
 
 impl AgentCore {
     #[allow(clippy::too_many_arguments)]
-    pub async fn step(
+    pub fn build_request(
         instructions: &str,
         projection: &ContextProjection,
         model_name: &str,
@@ -47,13 +47,11 @@ impl AgentCore {
         reasoning: Option<ReasoningConfig>,
         tools: Vec<Tool>,
         metadata: Option<std::collections::HashMap<String, String>>,
-        endpoint: &ModelEndpointConfig,
-        model_backend: &dyn ModelBackend,
-    ) -> Result<AgentCoreStepResult, CoreError> {
+    ) -> CreateResponseBody {
         let input = projection.to_openresponses_input();
         let has_tools = !tools.is_empty();
 
-        let request = CreateResponseBody {
+        CreateResponseBody {
             input: Some(input),
             model: Some(model_name.to_string()),
             instructions: Some(instructions.to_string()),
@@ -69,20 +67,14 @@ impl AgentCore {
             metadata,
             stream: Some(false),
             ..Default::default()
-        };
-
-        let response: ResponseResource = model_backend.create_response(endpoint, request).await?;
-
-        if let Some(err) = response.error {
-            return Err(CoreError::ResponseFailed(err.message));
         }
-        if response.status == ResponseStatus::Failed {
-            return Err(CoreError::ResponseFailed(
-                "Response status is failed".into(),
-            ));
-        }
+    }
 
-        let output_items = response.output;
+    pub fn parse_output_items(
+        output_items: Vec<Item>,
+        response_id: Option<String>,
+        usage: Option<Usage>,
+    ) -> AgentCoreStepResult {
         let mut function_calls = Vec::new();
         let mut text = String::new();
         let mut reasoning_text = String::new();
@@ -153,14 +145,63 @@ impl AgentCore {
             }
         }
 
-        Ok(AgentCoreStepResult {
+        AgentCoreStepResult {
             output_items,
             function_calls,
-            response_id: Some(response.id),
-            usage: response.usage,
+            response_id,
+            usage,
             text,
             reasoning_text,
-        })
+        }
+    }
+
+    pub async fn execute_request(
+        request: CreateResponseBody,
+        endpoint: &ModelEndpointConfig,
+        model_backend: &dyn ModelBackend,
+    ) -> Result<AgentCoreStepResult, CoreError> {
+        let response: ResponseResource = model_backend.create_response(endpoint, request).await?;
+
+        if let Some(err) = response.error {
+            return Err(CoreError::ResponseFailed(err.message));
+        }
+        if response.status == ResponseStatus::Failed {
+            return Err(CoreError::ResponseFailed(
+                "Response status is failed".into(),
+            ));
+        }
+
+        Ok(Self::parse_output_items(
+            response.output,
+            Some(response.id),
+            response.usage,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn step(
+        instructions: &str,
+        projection: &ContextProjection,
+        model_name: &str,
+        temperature: Option<f64>,
+        max_output_tokens: Option<i32>,
+        reasoning: Option<ReasoningConfig>,
+        tools: Vec<Tool>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+        endpoint: &ModelEndpointConfig,
+        model_backend: &dyn ModelBackend,
+    ) -> Result<AgentCoreStepResult, CoreError> {
+        let request = Self::build_request(
+            instructions,
+            projection,
+            model_name,
+            temperature,
+            max_output_tokens,
+            reasoning,
+            tools,
+            metadata,
+        );
+        Self::execute_request(request, endpoint, model_backend).await
     }
 }
 
@@ -235,6 +276,32 @@ impl CoreExecutor for InProcessExecutor {
         )
         .await;
 
+        if let Err(ref err) = result {
+            let _ = hook_manager
+                .observe(
+                    HOOK_AGENT_ERROR,
+                    None,
+                    serde_json::json!({
+                        "session_id": run_spec.session_id,
+                        "activation_id": run_spec.activation_id,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+        }
+
+        let _ = hook_manager
+            .observe(
+                HOOK_AGENT_SHUTDOWN,
+                None,
+                serde_json::json!({
+                    "session_id": run_spec.session_id,
+                    "activation_id": run_spec.activation_id,
+                    "ok": result.is_ok(),
+                }),
+            )
+            .await;
+
         let _ = hook_manager.shutdown().await;
         result
     }
@@ -265,6 +332,18 @@ async fn run_react_loop(
         res = hook_manager.transform_agent_draft(HOOK_AGENT_PREPARE, None, initial_draft) => res?,
         _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
     };
+
+    let _ = hook_manager
+        .transform_validated(
+            HOOK_INPUT_PREPARE,
+            None,
+            serde_json::json!({
+                "session_id": run_spec.session_id,
+                "activation_id": run_spec.activation_id,
+            }),
+            |_| Ok(()),
+        )
+        .await?;
 
     let active_tools = draft
         .tools
@@ -335,6 +414,25 @@ async fn run_react_loop(
         let turn_id = TurnId::generate();
         last_turn_id = Some(turn_id.clone());
 
+        let turn_prep = hook_manager
+            .transform_validated(
+                HOOK_TURN_PREPARE,
+                Some(iteration),
+                serde_json::json!({
+                    "session_id": run_spec.session_id,
+                    "activation_id": run_spec.activation_id,
+                    "turn_id": turn_id,
+                    "iteration": iteration,
+                }),
+                |_| Ok(()),
+            )
+            .await?;
+        match turn_prep.control {
+            FlowControl::Continue => {}
+            FlowControl::Skip => continue,
+            FlowControl::Stop => break,
+        }
+
         host.emit_event(Some(turn_id.clone()), SessionEvent::TurnStarted)
             .await?;
 
@@ -358,37 +456,71 @@ async fn run_react_loop(
         );
         turn_metadata.insert("ragents.turn_id".to_string(), turn_id.to_string());
 
-        let step = tokio::select! {
-            res = AgentCore::step(
-                &draft.system_prompt,
-                &projection,
-                &draft.model.name,
-                draft.model.temperature,
-                draft.model.max_output_tokens,
-                draft.model.reasoning.clone(),
-                request_tools.clone(),
-                Some(turn_metadata),
+        let initial_request = AgentCore::build_request(
+            &draft.system_prompt,
+            &projection,
+            &draft.model.name,
+            draft.model.temperature,
+            draft.model.max_output_tokens,
+            draft.model.reasoning.clone(),
+            request_tools.clone(),
+            Some(turn_metadata),
+        );
+        let prepared_request =
+            apply_model_request_hook(hook_manager, iteration, initial_request).await?;
+
+        let raw_step = tokio::select! {
+            res = AgentCore::execute_request(
+                prepared_request,
                 &run_spec.model_endpoint,
                 model_backend,
             ) => res?,
             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
         };
 
-        if let Some(ref usage) = step.usage {
+        if let Some(ref usage) = raw_step.usage {
             accumulated_usage = Some(match accumulated_usage {
                 Some(ref acc) => add_usage(acc, usage),
                 None => usage.clone(),
             });
         }
 
+        hook_manager
+            .observe(
+                HOOK_MODEL_RESPONSE_OBSERVE,
+                Some(iteration),
+                serde_json::json!({
+                    "session_id": run_spec.session_id,
+                    "activation_id": run_spec.activation_id,
+                    "turn_id": turn_id,
+                    "iteration": iteration,
+                    "response_id": raw_step.response_id,
+                    "usage": raw_step.usage,
+                    "accumulated_usage": accumulated_usage,
+                    "output_items": raw_step.output_items,
+                }),
+            )
+            .await?;
+
+        let prepared_output_items =
+            apply_model_response_hook(hook_manager, iteration, raw_step.output_items).await?;
+        let step = AgentCore::parse_output_items(
+            prepared_output_items,
+            raw_step.response_id,
+            raw_step.usage,
+        );
+
         if !step.text.is_empty() {
             final_text = step.text.clone();
         }
 
+        let model_items_to_commit =
+            apply_context_append_hook(hook_manager, iteration, step.output_items.clone()).await?;
+
         host.commit_model_output(
             &turn_id,
             step.response_id.clone(),
-            step.output_items.clone(),
+            model_items_to_commit,
             step.usage.clone(),
         )
         .await?;
@@ -423,17 +555,54 @@ async fn run_react_loop(
                 };
 
                 let duration_ms = started_at.elapsed().as_millis() as u64;
+                let tool_items_to_commit =
+                    apply_context_append_hook(hook_manager, iteration, vec![tool_output_item])
+                        .await?;
                 host.commit_tool_output(
                     &turn_id,
                     &call.call_id,
                     &call.name,
                     success,
                     duration_ms,
-                    vec![tool_output_item],
+                    tool_items_to_commit,
                 )
                 .await?;
             }
+
+            hook_manager
+                .observe(
+                    HOOK_TURN_COMPLETE,
+                    Some(iteration),
+                    serde_json::json!({
+                        "session_id": run_spec.session_id,
+                        "activation_id": run_spec.activation_id,
+                        "turn_id": turn_id,
+                        "iteration": iteration,
+                        "response_id": step.response_id,
+                        "usage": step.usage,
+                        "accumulated_usage": accumulated_usage,
+                        "function_calls_count": step.function_calls.len(),
+                    }),
+                )
+                .await?;
         } else {
+            hook_manager
+                .observe(
+                    HOOK_TURN_COMPLETE,
+                    Some(iteration),
+                    serde_json::json!({
+                        "session_id": run_spec.session_id,
+                        "activation_id": run_spec.activation_id,
+                        "turn_id": turn_id,
+                        "iteration": iteration,
+                        "response_id": step.response_id,
+                        "usage": step.usage,
+                        "accumulated_usage": accumulated_usage,
+                        "function_calls_count": 0,
+                    }),
+                )
+                .await?;
+
             // Before finishing the activation, check if any real-time messages arrived during the final turn.
             // If so, continue into another Turn so the agent can process the notification.
             let late_realtime = host.drain_realtime_messages(None).await?;
@@ -461,6 +630,54 @@ async fn apply_context_projection_hook(
     let transformed = hook_manager
         .transform_validated(
             HOOK_CONTEXT_PROJECT_PREPARE,
+            Some(iteration),
+            payload,
+            |_| Ok(()),
+        )
+        .await?;
+    Ok(serde_json::from_value(transformed.payload).unwrap_or(items))
+}
+
+async fn apply_model_request_hook(
+    hook_manager: &HookManager,
+    iteration: usize,
+    request: CreateResponseBody,
+) -> Result<CreateResponseBody, CoreError> {
+    let payload = serde_json::to_value(&request)?;
+    let transformed = hook_manager
+        .transform_validated(HOOK_MODEL_REQUEST_PREPARE, Some(iteration), payload, |_| {
+            Ok(())
+        })
+        .await?;
+    Ok(serde_json::from_value(transformed.payload).unwrap_or(request))
+}
+
+async fn apply_model_response_hook(
+    hook_manager: &HookManager,
+    iteration: usize,
+    items: Vec<Item>,
+) -> Result<Vec<Item>, CoreError> {
+    let payload = serde_json::to_value(&items)?;
+    let transformed = hook_manager
+        .transform_validated(
+            HOOK_MODEL_RESPONSE_PREPARE,
+            Some(iteration),
+            payload,
+            |_| Ok(()),
+        )
+        .await?;
+    Ok(serde_json::from_value(transformed.payload).unwrap_or(items))
+}
+
+async fn apply_context_append_hook(
+    hook_manager: &HookManager,
+    iteration: usize,
+    items: Vec<Item>,
+) -> Result<Vec<Item>, CoreError> {
+    let payload = serde_json::to_value(&items)?;
+    let transformed = hook_manager
+        .transform_validated(
+            HOOK_CONTEXT_APPEND_PREPARE,
             Some(iteration),
             payload,
             |_| Ok(()),
@@ -523,6 +740,44 @@ async fn execute_tool_call(
         .owner
         .as_deref()
         .ok_or_else(|| CoreError::ToolError("Tool has no owner".into()))?;
+
+    let perm_req_transformed = hook_manager
+        .transform_validated(
+            HOOK_PERMISSION_REQUIREMENTS,
+            Some(iteration),
+            serde_json::json!({
+                "call_id": call_req.call_id,
+                "tool_id": call_req.tool_id,
+                "name": call_req.name,
+                "arguments": call_req.arguments,
+                "requirements": [],
+            }),
+            |_| Ok(()),
+        )
+        .await?;
+    if let Some(reqs) = perm_req_transformed
+        .payload
+        .get("requirements")
+        .and_then(|v| v.as_array())
+    {
+        for req_val in reqs {
+            if let Ok(cap) = serde_json::from_value::<CapabilityRequest>(req_val.clone()) {
+                if let PermissionOutcome::Denied { reason } =
+                    host.check_permission(Some(owner), cap, None).await?
+                {
+                    let err_item = Item::FunctionCallOutput {
+                        id: None,
+                        call_id: call.call_id.clone(),
+                        output: ToolResult::err(format!("Permission denied: {reason}"))
+                            .output
+                            .to_function_output(),
+                        status: None,
+                    };
+                    return Ok((err_item, false));
+                }
+            }
+        }
+    }
 
     let action_result = hook_manager
         .action(
