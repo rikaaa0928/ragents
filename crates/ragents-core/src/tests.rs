@@ -214,6 +214,7 @@ async fn test_in_process_executor_with_wasm_file_editor_extension() {
             path: wasm_path.to_string_lossy().to_string(),
             enabled: true,
             config: serde_json::json!({}),
+            allowed_dirs: vec![],
         }],
     );
 
@@ -302,6 +303,7 @@ async fn test_subprocess_executor_with_wasm_file_editor_extension() {
             path: wasm_path.to_string_lossy().to_string(),
             enabled: true,
             config: serde_json::json!({}),
+            allowed_dirs: vec![],
         }],
     );
 
@@ -540,6 +542,7 @@ async fn test_multi_directory_auto_permission_escalation_loop_in_single_shell_ca
             path: shell_wasm_path.to_string_lossy().to_string(),
             enabled: true,
             config: serde_json::json!({}),
+            allowed_dirs: vec![],
         }],
     );
 
@@ -701,12 +704,14 @@ async fn test_wasm_external_file_dynamic_mount_and_http_fetch_permission_unifica
                 path: shell_wasm_path.to_string_lossy().to_string(),
                 enabled: true,
                 config: serde_json::json!({}),
+                allowed_dirs: vec![],
             },
             ExtensionSpec {
                 name: "file_editor".to_string(),
                 path: editor_wasm_path.to_string_lossy().to_string(),
                 enabled: true,
                 config: serde_json::json!({}),
+                allowed_dirs: vec![],
             },
         ],
     );
@@ -957,6 +962,7 @@ async fn test_blocking_shell_timeout_preserves_partial_output_and_kills_process_
             path: shell_wasm_path.to_string_lossy().to_string(),
             enabled: true,
             config: serde_json::json!({}),
+            allowed_dirs: vec![],
         }],
     );
 
@@ -1132,12 +1138,14 @@ async fn test_file_editor_pagination_non_overlapping_edits_and_shell_output_trun
                 path: editor_wasm_path.to_string_lossy().to_string(),
                 enabled: true,
                 config: serde_json::json!({}),
+                allowed_dirs: vec![],
             },
             ExtensionSpec {
                 name: "shell".to_string(),
                 path: shell_wasm_path.to_string_lossy().to_string(),
                 enabled: true,
                 config: serde_json::json!({}),
+                allowed_dirs: vec![],
             },
         ],
     );
@@ -1333,8 +1341,10 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
         std::env::temp_dir().join(format!("ragents-skills-test-{}", uuid::Uuid::now_v7()));
     let ws_root = base_tmp.join("ws");
     let sess_tmp = base_tmp.join("tmp");
-    let ws_skill_dir = ws_root.join(".agents/skills/demo-deploy");
-    std::fs::create_dir_all(&ws_skill_dir).unwrap();
+    let ext_skills_root = base_tmp.join("external_skills");
+    let ext_skill_dir = ext_skills_root.join("demo-deploy");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&ext_skill_dir).unwrap();
     std::fs::create_dir_all(&sess_tmp).unwrap();
 
     std::fs::write(
@@ -1343,7 +1353,7 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
     )
     .unwrap();
     std::fs::write(
-        ws_skill_dir.join("SKILL.md"),
+        ext_skill_dir.join("SKILL.md"),
         "---\nname: demo-deploy\ndescription: Deploy the demo service to staging.\n---\n# Demo Deploy Skill\nStep 1: Run `./deploy.sh --env staging`\n",
     )
     .unwrap();
@@ -1398,6 +1408,7 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
         captured_instructions: Mutex::new(Vec::new()),
     });
 
+    let ext_skills_str = ext_skills_root.to_string_lossy().to_string();
     let cfg = ConfigRevision::new_merged(
         "You are a coding assistant.".to_string(),
         ModelRequestSpec::new("gpt-4.1"),
@@ -1405,7 +1416,11 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
             name: "skills".to_string(),
             path: skills_wasm_path.to_string_lossy().to_string(),
             enabled: true,
-            config: serde_json::json!({}),
+            config: serde_json::json!({
+                "include_global": false,
+                "skill_dirs": [&ext_skills_str],
+            }),
+            allowed_dirs: vec![ext_skills_str],
         }],
     );
 
@@ -1458,6 +1473,10 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
     assert!(
         all_outputs.contains("Step 1: Run `./deploy.sh --env staging`"),
         "load_skill must return the full SKILL.md content: {all_outputs}"
+    );
+    assert!(
+        host.checked_capabilities.lock().unwrap().is_empty(),
+        "external skill directory declared in ExtensionSpec.allowed_dirs must not trigger interactive permission prompts"
     );
 
     let _ = std::fs::remove_dir_all(&base_tmp);

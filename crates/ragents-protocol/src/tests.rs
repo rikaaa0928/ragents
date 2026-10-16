@@ -42,12 +42,14 @@ fn test_config_revision_content_addressed_sha256_stability() {
         path: "extensions/shell.wasm".to_string(),
         enabled: true,
         config: serde_json::json!({"b": 2, "a": 1}),
+        allowed_dirs: vec![],
     };
     let ext2 = ExtensionSpec {
         name: "shell".to_string(),
         path: "extensions/shell.wasm".to_string(),
         enabled: true,
         config: serde_json::json!({"a": 1, "b": 2}),
+        allowed_dirs: vec![],
     };
 
     let rev1 = ConfigRevision::new_merged(

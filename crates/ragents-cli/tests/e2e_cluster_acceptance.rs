@@ -149,6 +149,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
             path: wasm_path.to_string_lossy().to_string(),
             enabled: true,
             config: serde_json::json!({}),
+            allowed_dirs: vec![],
         }],
         interceptors: vec![],
         default_permissions: PermissionPolicyLayer::default(),

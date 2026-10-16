@@ -47,14 +47,26 @@ pub fn build_scheduling_mode(
 pub(crate) fn parse_extension_specs(raw_exts: &[String]) -> Result<Vec<ExtensionSpec>> {
     let mut specs = Vec::new();
     for raw in raw_exts {
-        let (name, path) = raw
-            .split_once('=')
-            .ok_or_else(|| anyhow!("Extension must be in 'name=path' format, got '{raw}'"))?;
+        let (name, rest) = raw.split_once('=').ok_or_else(|| {
+            anyhow!("Extension must be in 'name=path[:dir1,dir2]' format, got '{raw}'")
+        })?;
+        let (path, allowed_dirs) = match rest.split_once(':') {
+            Some((p, dirs_str)) => {
+                let dirs = dirs_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                (p, dirs)
+            }
+            None => (rest, Vec::new()),
+        };
         specs.push(ExtensionSpec {
             name: name.trim().to_string(),
             path: path.trim().to_string(),
             enabled: true,
             config: serde_json::json!({}),
+            allowed_dirs,
         });
     }
     Ok(specs)

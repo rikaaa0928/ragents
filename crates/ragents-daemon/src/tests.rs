@@ -463,6 +463,7 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
         path: shell_wasm_path.to_string_lossy().to_string(),
         enabled: true,
         config: serde_json::json!({}),
+        allowed_dirs: vec![],
     });
 
     struct BgTestBackend {

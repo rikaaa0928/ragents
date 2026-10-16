@@ -266,8 +266,25 @@ impl DaemonConfig {
         }
         let effective_extensions: Vec<ExtensionSpec> = ext_map.into_values().collect();
 
-        let effective_permissions =
+        let mut effective_permissions =
             merge_permission_layers(&self.default_permissions, &session.spec.permissions);
+        for ext in &effective_extensions {
+            if ext.enabled && !ext.allowed_dirs.is_empty() {
+                let fr = effective_permissions
+                    .file_read
+                    .get_or_insert_with(|| RuleSet {
+                        deny: None,
+                        allow: Some(Vec::new()),
+                        default: None,
+                    });
+                let allow_list = fr.allow.get_or_insert_with(Vec::new);
+                for dir in &ext.allowed_dirs {
+                    if !allow_list.contains(dir) {
+                        allow_list.push(dir.clone());
+                    }
+                }
+            }
+        }
 
         let config_rev = ConfigRevision::new_merged(
             effective_system_prompt,

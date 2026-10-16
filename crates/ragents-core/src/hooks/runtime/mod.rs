@@ -245,17 +245,9 @@ impl WasmPlugin {
             );
         }
 
-        let mut effective_preopen_dirs = preopen_dirs.to_vec();
+        let effective_preopen_dirs = preopen_dirs.to_vec();
         if let Ok(home_str) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             wasi_builder.env("HOME", &home_str);
-            if core_host.is_some() {
-                let global_agents_dir = Path::new(&home_str).join(".agents");
-                if global_agents_dir.exists()
-                    && !effective_preopen_dirs.contains(&global_agents_dir)
-                {
-                    effective_preopen_dirs.push(global_agents_dir);
-                }
-            }
         }
 
         for dir in &effective_preopen_dirs {

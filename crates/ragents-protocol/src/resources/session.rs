@@ -164,6 +164,8 @@ pub struct ExtensionSpec {
     pub enabled: bool,
     #[serde(default = "empty_json_object")]
     pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

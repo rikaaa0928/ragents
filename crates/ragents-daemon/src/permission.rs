@@ -20,21 +20,18 @@ pub fn evaluate_capability_policy(
             path,
             workspace_root,
             session_tmp_dir,
-            true,
         ),
         CapabilityRequest::FileWrite { path } => evaluate_path_rules(
             policy.file_write.as_ref(),
             path,
             workspace_root,
             session_tmp_dir,
-            false,
         ),
         CapabilityRequest::CommandWorkDir { work_dir } => evaluate_path_rules(
             policy.command_work_dir.as_ref(),
             work_dir,
             workspace_root,
             session_tmp_dir,
-            false,
         ),
         CapabilityRequest::Http { host, .. } => {
             if let Some(ref rules) = policy.http_hosts {
@@ -66,7 +63,6 @@ fn evaluate_path_rules(
     target_path: &Path,
     workspace_root: &Path,
     session_tmp_dir: &Path,
-    is_read_only: bool,
 ) -> PolicyEvalResult {
     let norm_target = normalize_path(target_path, workspace_root);
     let norm_ws = normalize_path(workspace_root, workspace_root);
@@ -95,15 +91,6 @@ fn evaluate_path_rules(
                 DefaultPermissionDecision::Deny => PolicyEvalResult::Deny,
                 DefaultPermissionDecision::Ask => PolicyEvalResult::Ask,
             };
-        }
-    }
-
-    if is_read_only {
-        if let Ok(home_str) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-            let norm_agents = normalize_path(&Path::new(&home_str).join(".agents"), workspace_root);
-            if norm_target.starts_with(&norm_agents) {
-                return PolicyEvalResult::Allow;
-            }
         }
     }
 
@@ -159,10 +146,25 @@ pub fn host_matches(rule: &str, host: &str) -> bool {
 }
 
 fn normalize_path(path: &Path, base: &Path) -> PathBuf {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
+    let path_str = path.to_string_lossy();
+    let expanded_buf = if path_str == "~" || path_str.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            let tail = path_str.strip_prefix("~/").unwrap_or("");
+            if tail.is_empty() {
+                PathBuf::from(home)
+            } else {
+                Path::new(&home).join(tail)
+            }
+        } else {
+            path.to_path_buf()
+        }
     } else {
-        base.join(path)
+        path.to_path_buf()
+    };
+    let joined = if expanded_buf.is_absolute() {
+        expanded_buf
+    } else {
+        base.join(expanded_buf)
     };
     if let Ok(canon) = joined.canonicalize() {
         return canon;

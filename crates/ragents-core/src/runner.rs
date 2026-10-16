@@ -268,34 +268,10 @@ impl CoreExecutor for InProcessExecutor {
 
         let mut hook_manager = HookManager::empty();
         let sandbox_state = Arc::new(SandboxState::from_run_spec(&run_spec));
-        let mut preopen_dirs = vec![
+        let base_preopen_dirs = vec![
             run_spec.workspace_root.clone(),
             run_spec.session_tmp_dir.clone(),
         ];
-
-        for ext in &run_spec.effective_config.extensions {
-            if ext.enabled {
-                if let Some(dirs) = ext
-                    .config
-                    .get("skill_dirs")
-                    .or_else(|| ext.config.get("allowed_dirs"))
-                    .and_then(|v| v.as_array())
-                {
-                    for d in dirs.iter().filter_map(|v| v.as_str()) {
-                        let p = Path::new(d);
-                        let resolved = if p.is_absolute() {
-                            p.to_path_buf()
-                        } else {
-                            run_spec.workspace_root.join(p)
-                        };
-                        if !preopen_dirs.contains(&resolved) {
-                            preopen_dirs.push(resolved.clone());
-                        }
-                        sandbox_state.allow_readable_path(resolved);
-                    }
-                }
-            }
-        }
 
         for ext in &run_spec.effective_config.extensions {
             if ext.enabled {
@@ -312,11 +288,19 @@ impl CoreExecutor for InProcessExecutor {
                         ext.name, full_path
                     )));
                 }
+                let mut ext_preopen_dirs = base_preopen_dirs.clone();
+                for dir_str in &ext.allowed_dirs {
+                    let expanded = expand_tilde_path(dir_str, &run_spec.workspace_root);
+                    if !ext_preopen_dirs.contains(&expanded) {
+                        ext_preopen_dirs.push(expanded.clone());
+                    }
+                    sandbox_state.allow_readable_path(expanded);
+                }
                 let plugin = WasmPlugin::load_from_file_with_host(
                     &ext.name,
                     &full_path,
                     &run_spec.workspace_root,
-                    &preopen_dirs,
+                    &ext_preopen_dirs,
                     Some(host.clone()),
                     sandbox_state.clone(),
                 )
@@ -856,5 +840,24 @@ pub fn add_usage(a: &Usage, b: &Usage) -> Usage {
             reasoning_tokens: a.output_tokens_details.reasoning_tokens
                 + b.output_tokens_details.reasoning_tokens,
         },
+    }
+}
+
+fn expand_tilde_path(raw: &str, workspace_root: &Path) -> std::path::PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            let tail = trimmed.strip_prefix("~/").unwrap_or("");
+            if tail.is_empty() {
+                return std::path::PathBuf::from(home);
+            }
+            return Path::new(&home).join(tail);
+        }
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        workspace_root.join(p)
     }
 }
