@@ -200,31 +200,89 @@ impl SandboxState {
         let _ = std::fs::create_dir_all(&hermetic_tmp);
         let trace_tag = format!("RAGENTS_SB_{}", Uuid::now_v7().simple());
 
-        let mut child =
+        let mut cmd =
             match self.build_sandboxed_command(work_dir, command, &hermetic_tmp, &trace_tag) {
                 Ok(cmd) => cmd,
                 Err(err) => return (command_error(err), Vec::new()),
             };
 
-        let output = if timeout_ms == 0 {
-            child.output().await
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(error) => return (command_error(error), Vec::new()),
+        };
+
+        let os_pid = child.id();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut out) = stdout_pipe {
+                use tokio::io::AsyncReadExt;
+                let _ = out.read_to_end(&mut buf).await;
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut err) = stderr_pipe {
+                use tokio::io::AsyncReadExt;
+                let _ = err.read_to_end(&mut buf).await;
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let mut timed_out = false;
+        let wait_res = if timeout_ms == 0 {
+            Some(child.wait().await)
         } else {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.output()).await {
-                Ok(result) => result,
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+                Ok(res) => Some(res),
                 Err(_) => {
-                    return (
-                        command_error(format!("command timed out after {timeout_ms} ms")),
-                        Vec::new(),
-                    )
+                    timed_out = true;
+                    if let Some(pid) = os_pid {
+                        crate::process::kill_process_group(pid).await;
+                    }
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    None
                 }
             }
         };
 
-        match output {
-            Ok(output) => {
-                let exit_code = output.status.code().unwrap_or(-1);
-                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout = stdout_task.await.unwrap_or_default();
+        let stderr = stderr_task.await.unwrap_or_default();
+
+        if timed_out {
+            let secs = if timeout_ms.is_multiple_of(1000) {
+                format!("{}", timeout_ms / 1000)
+            } else {
+                format!("{:.2}", timeout_ms as f64 / 1000.0)
+            };
+            return (
+                CommandOutput {
+                    exit_code: -1,
+                    stdout,
+                    stderr,
+                    error: Some(format!("Command timed out after {secs} seconds")),
+                },
+                Vec::new(),
+            );
+        }
+
+        match wait_res.expect("wait_res present when not timed_out") {
+            Ok(status) => {
+                let exit_code = status.code().unwrap_or(-1);
                 let mut violations = Vec::new();
 
                 if exit_code != 0 && self.mode != SandboxMode::Disabled {

@@ -8,7 +8,8 @@ wit_bindgen::generate!({
 
 const AGENT_PREPARE_HOOK: &str = "agent.prepare";
 const TOOLS_CALL_HOOK: &str = "tools.call";
-const FALLBACK_TIMEOUT_SECONDS: u64 = 30 * 60;
+const FALLBACK_TIMEOUT_SECONDS: u64 = 0;
+const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 
 thread_local! {
     static DEFAULT_TIMEOUT_SECONDS: Cell<u64> = const { Cell::new(FALLBACK_TIMEOUT_SECONDS) };
@@ -137,11 +138,15 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
                                 "default": "activation",
                                 "description": "后台任务的最大生命周期。activation（默认）：当前 activation 结束后自动清理仍在运行的进程；session：跨 activation 保持运行，直至被主动停止或 session 关闭。"
                             },
-                            "timeout_seconds": {
-                                "type": "integer",
+                            "timeout": {
+                                "type": "number",
                                 "minimum": 0,
-                                "default": default_timeout_seconds(),
-                                "description": "命令最大运行超时时间（秒），0 表示禁用超时。默认 1800 秒。"
+                                "description": "Timeout in seconds (optional, no default timeout)"
+                            },
+                            "timeout_seconds": {
+                                "type": "number",
+                                "minimum": 0,
+                                "description": "Timeout in seconds (optional, no default timeout; alias of timeout)"
                             }
                         },
                         "required": ["command"]
@@ -249,13 +254,29 @@ fn handle_shell(args: &serde_json::Value) -> Result<ToolResult, String> {
         .get("lifecycle")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("activation");
-    let timeout_seconds = match args.get("timeout_seconds") {
-        Some(value) => value
-            .as_u64()
-            .ok_or("'timeout_seconds' must be a non-negative integer")?,
-        None => default_timeout_seconds(),
+    let timeout_ms = match args.get("timeout").or_else(|| args.get("timeout_seconds")) {
+        Some(value) if !value.is_null() => {
+            let secs = value
+                .as_f64()
+                .ok_or("Invalid timeout: must be a finite number of seconds")?;
+            if !secs.is_finite() || secs < 0.0 {
+                return Err("Invalid timeout: must be a finite non-negative number of seconds".into());
+            }
+            if secs == 0.0 {
+                0
+            } else {
+                let ms = (secs * 1000.0).round() as u64;
+                if ms > MAX_TIMEOUT_MS {
+                    return Err(format!(
+                        "Invalid timeout: maximum is {} seconds",
+                        MAX_TIMEOUT_MS / 1000
+                    ));
+                }
+                ms.max(1)
+            }
+        }
+        _ => timeout_millis(default_timeout_seconds())?,
     };
-    let timeout_ms = timeout_millis(timeout_seconds)?;
 
     let req_json = serde_json::json!({
         "action": "start",
@@ -276,7 +297,7 @@ fn handle_shell(args: &serde_json::Value) -> Result<ToolResult, String> {
         let stderr = resp.stderr.unwrap_or_default();
         let success = resp.ok && exit_code == 0 && resp.error.is_none();
         let output = if let Some(ref error) = resp.error {
-            format!("failed to execute command: {error}")
+            format!("exit_code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}\nerror: {error}")
         } else {
             format!("exit_code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}")
         };

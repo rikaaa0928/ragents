@@ -31,6 +31,7 @@ struct MockCoreHost {
     checked_capabilities: Mutex<Vec<CapabilityRequest>>,
     checked_original_paths: Mutex<Vec<Option<std::path::PathBuf>>>,
     override_path_on_approve: Mutex<Option<std::path::PathBuf>>,
+    tool_durations_ms: Mutex<Vec<u64>>,
 }
 
 #[async_trait]
@@ -56,9 +57,10 @@ impl CoreHost for MockCoreHost {
         _call_id: &str,
         _tool_name: &str,
         _success: bool,
-        _duration_ms: u64,
+        duration_ms: u64,
         items: Vec<Item>,
     ) -> Result<BatchSeq, CoreError> {
+        self.tool_durations_ms.lock().unwrap().push(duration_ms);
         self.items.lock().unwrap().extend(items);
         Ok(BatchSeq::new(2))
     }
@@ -906,6 +908,117 @@ async fn test_control_plane_wasm_plugin_allows_network_and_configured_dirs_while
         .expect("control plugin WASI HTTP allowed by default");
     assert_eq!(status, 200);
     assert_eq!(body, "control_http_ok");
+
+    let _ = std::fs::remove_dir_all(&base_tmp);
+}
+
+#[tokio::test]
+async fn test_blocking_shell_timeout_preserves_partial_output_and_kills_process_group() {
+    let shell_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm");
+    if !shell_wasm_path.exists() {
+        return;
+    }
+
+    let base_tmp =
+        std::env::temp_dir().join(format!("ragents-blocking-timeout-{}", uuid::Uuid::now_v7()));
+    let ws_root = base_tmp.join("ws");
+    let sess_tmp = base_tmp.join("tmp");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&sess_tmp).unwrap();
+
+    let host = Arc::new(MockCoreHost {
+        items: Mutex::new(vec![Item::user_message(
+            "run blocking command with timeout",
+        )]),
+        ..Default::default()
+    });
+
+    // Call `shell` in blocking mode (wait=true default) with `timeout: 0.3` (300ms)
+    let fc_item = Item::FunctionCall {
+        id: Some("fc_to_1".to_string()),
+        call_id: "call_to_1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({
+            "command": "echo partial_stdout_before_timeout && echo partial_stderr_before_timeout >&2 && sleep 30",
+            "timeout": 0.3
+        })
+        .to_string(),
+        status: None,
+    };
+
+    let resp1 = make_openresponses_resource("resp_to_1", "gpt-4.1", vec![fc_item], None);
+    let resp2 = make_openresponses_resource(
+        "resp_to_2",
+        "gpt-4.1",
+        vec![Item::assistant_message("Command timed out as expected.")],
+        None,
+    );
+
+    let model_backend = Arc::new(MockModelBackend {
+        responses: Mutex::new(vec![resp1, resp2]),
+    });
+
+    let cfg = ConfigRevision::new_merged(
+        "You are a coding assistant.".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![ExtensionSpec {
+            name: "shell".to_string(),
+            path: shell_wasm_path.to_string_lossy().to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+        }],
+    );
+
+    let run_spec = CoreRunSpec {
+        session_id: SessionId::new("sess_to"),
+        activation_id: ActivationId::new("act_to"),
+        workspace_root: ws_root,
+        session_tmp_dir: sess_tmp,
+        effective_config: cfg,
+        effective_permissions: PermissionPolicyLayer::default(),
+        model_endpoint: ModelEndpointConfig {
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+            api_key: "sk-local".to_string(),
+            ..Default::default()
+        },
+        max_turns: None,
+    };
+
+    let started = std::time::Instant::now();
+    let executor = InProcessExecutor;
+    let summary = executor
+        .execute(
+            run_spec,
+            host.clone(),
+            model_backend,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("execute blocking timeout test");
+
+    assert_eq!(summary.final_text, "Command timed out as expected.");
+    let tool_ms = host.tool_durations_ms.lock().unwrap()[0];
+    assert!(
+        tool_ms < 5_000,
+        "blocking timeout should have killed `sleep 30` quickly, tool_ms={tool_ms}ms (elapsed={:?})",
+        started.elapsed()
+    );
+
+    let items = host.items.lock().unwrap();
+    let all_outputs = serde_json::to_string(&*items).unwrap();
+    assert!(
+        all_outputs.contains("partial_stdout_before_timeout"),
+        "partial stdout must be preserved on timeout: {all_outputs}"
+    );
+    assert!(
+        all_outputs.contains("partial_stderr_before_timeout"),
+        "partial stderr must be preserved on timeout: {all_outputs}"
+    );
+    assert!(
+        all_outputs.contains("Command timed out after 0.30 seconds"),
+        "timeout error message must be included: {all_outputs}"
+    );
 
     let _ = std::fs::remove_dir_all(&base_tmp);
 }

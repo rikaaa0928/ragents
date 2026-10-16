@@ -1,5 +1,7 @@
 mod entry;
 
+pub(crate) use entry::kill_process_group;
+
 use crate::error::CoreError;
 use crate::host::{CoreHost, PermissionOutcome};
 use crate::sandbox::{
@@ -9,8 +11,8 @@ use crate::sandbox::{
 use async_trait::async_trait;
 use chrono::Utc;
 use entry::{
-    format_exit_notification, kill_process_group, request_sandbox_violation_approval,
-    ManagedProcessEntry, EARLY_SANDBOX_CHECK_WINDOW_MS, MAX_SANDBOX_ESCALATION_ROUNDS,
+    format_exit_notification, request_sandbox_violation_approval, ManagedProcessEntry,
+    EARLY_SANDBOX_CHECK_WINDOW_MS, MAX_SANDBOX_ESCALATION_ROUNDS,
 };
 use openresponses_rust::MessageContent;
 use ragents_protocol::*;
