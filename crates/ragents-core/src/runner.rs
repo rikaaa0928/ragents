@@ -268,10 +268,34 @@ impl CoreExecutor for InProcessExecutor {
 
         let mut hook_manager = HookManager::empty();
         let sandbox_state = Arc::new(SandboxState::from_run_spec(&run_spec));
-        let preopen_dirs = vec![
+        let mut preopen_dirs = vec![
             run_spec.workspace_root.clone(),
             run_spec.session_tmp_dir.clone(),
         ];
+
+        for ext in &run_spec.effective_config.extensions {
+            if ext.enabled {
+                if let Some(dirs) = ext
+                    .config
+                    .get("skill_dirs")
+                    .or_else(|| ext.config.get("allowed_dirs"))
+                    .and_then(|v| v.as_array())
+                {
+                    for d in dirs.iter().filter_map(|v| v.as_str()) {
+                        let p = Path::new(d);
+                        let resolved = if p.is_absolute() {
+                            p.to_path_buf()
+                        } else {
+                            run_spec.workspace_root.join(p)
+                        };
+                        if !preopen_dirs.contains(&resolved) {
+                            preopen_dirs.push(resolved.clone());
+                        }
+                        sandbox_state.allow_readable_path(resolved);
+                    }
+                }
+            }
+        }
 
         for ext in &run_spec.effective_config.extensions {
             if ext.enabled {

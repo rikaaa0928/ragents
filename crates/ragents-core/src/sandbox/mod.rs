@@ -128,6 +128,19 @@ impl SandboxState {
             }
         }
 
+        if let Ok(home_str) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            let global_agents_dir = Path::new(&home_str).join(".agents");
+            if global_agents_dir.exists() {
+                let norm_agents = canonicalize_or_normalize(&global_agents_dir);
+                if !denied_read_paths
+                    .iter()
+                    .any(|d| norm_agents.starts_with(d) && d == &norm_agents)
+                {
+                    allowed_read_paths.push(norm_agents);
+                }
+            }
+        }
+
         Self {
             mode,
             workspace_root: workspace_root.to_path_buf(),
