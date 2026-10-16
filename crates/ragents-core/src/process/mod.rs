@@ -1,3 +1,5 @@
+mod entry;
+
 use crate::error::CoreError;
 use crate::host::{CoreHost, PermissionOutcome};
 use crate::sandbox::{
@@ -6,6 +8,10 @@ use crate::sandbox::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use entry::{
+    format_exit_notification, kill_process_group, request_sandbox_violation_approval,
+    ManagedProcessEntry, EARLY_SANDBOX_CHECK_WINDOW_MS, MAX_SANDBOX_ESCALATION_ROUNDS,
+};
 use openresponses_rust::MessageContent;
 use ragents_protocol::*;
 use std::collections::HashMap;
@@ -17,10 +23,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-const MAX_LOG_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-const EARLY_SANDBOX_CHECK_WINDOW_MS: u64 = 150;
-const MAX_SANDBOX_ESCALATION_ROUNDS: usize = 16;
-
 #[async_trait]
 pub trait ProcessNotificationSink: Send + Sync {
     async fn on_process_started(&self, process: ManagedProcessInfo);
@@ -29,43 +31,6 @@ pub trait ProcessNotificationSink: Send + Sync {
         process: ManagedProcessInfo,
         realtime_notification: MessageContent,
     );
-}
-
-struct ManagedProcessEntry {
-    info: ManagedProcessInfo,
-    stdout_buf: String,
-    stderr_buf: String,
-    combined_buf: String,
-    /// Set to `true` when stopped explicitly via `Stop` or lifecycle cleanup so we don't emit
-    /// redundant unsolicited exit notifications during teardown.
-    suppressed_notification: bool,
-    stop_notify: Arc<Notify>,
-}
-
-impl ManagedProcessEntry {
-    fn append_stdout(&mut self, line: &str) {
-        append_capped(&mut self.stdout_buf, line);
-        append_capped(&mut self.combined_buf, line);
-    }
-
-    fn append_stderr(&mut self, line: &str) {
-        append_capped(&mut self.stderr_buf, line);
-        append_capped(&mut self.combined_buf, line);
-    }
-}
-
-fn append_capped(buf: &mut String, line: &str) {
-    buf.push_str(line);
-    buf.push('\n');
-    if buf.len() > MAX_LOG_BUFFER_BYTES {
-        let drain_to = buf.len() - (MAX_LOG_BUFFER_BYTES * 3 / 4);
-        let safe_idx = buf
-            .char_indices()
-            .map(|(i, _)| i)
-            .find(|&i| i >= drain_to)
-            .unwrap_or(0);
-        buf.drain(..safe_idx);
-    }
 }
 
 #[derive(Clone, Default)]
@@ -100,7 +65,6 @@ impl ProcessManager {
                 lifecycle,
                 timeout_ms,
             } => {
-                // 1. Mandatory Host-Import Permission Check (`CommandWorkDir`)
                 if let Some(host) = core_host {
                     let cap = CapabilityRequest::CommandWorkDir {
                         work_dir: workspace_root.to_path_buf(),
@@ -351,14 +315,10 @@ impl ProcessManager {
                 duration_ms: 0,
             };
 
-            let entry = Arc::new(Mutex::new(ManagedProcessEntry {
-                info: info.clone(),
-                stdout_buf: String::new(),
-                stderr_buf: String::new(),
-                combined_buf: String::new(),
-                suppressed_notification: false,
-                stop_notify: stop_notify.clone(),
-            }));
+            let entry = Arc::new(Mutex::new(ManagedProcessEntry::new(
+                info.clone(),
+                stop_notify.clone(),
+            )));
 
             let stdout_pipe = child.stdout.take();
             let stderr_pipe = child.stderr.take();
@@ -389,7 +349,6 @@ impl ProcessManager {
                 }
             });
 
-            // Wait a brief window (150ms) to see if the command immediately failed due to an OS sandbox violation
             tokio::time::sleep(Duration::from_millis(EARLY_SANDBOX_CHECK_WINDOW_MS)).await;
 
             if let Ok(Some(status)) = child.try_wait() {
@@ -469,7 +428,6 @@ impl ProcessManager {
                     }
                 }
 
-                // Process finished within the early window without recoverable sandbox violations
                 let finished_at = Utc::now();
                 let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;
                 let final_info = {
@@ -501,7 +459,6 @@ impl ProcessManager {
                 });
             }
 
-            // Process is running in background! Register it and spawn the monitor task.
             self.entries
                 .lock()
                 .expect("entries poisoned")
@@ -772,7 +729,6 @@ impl ProcessManager {
                 kill_process_group(p).await;
             }
             notify.notify_waiters();
-            // Wait briefly for the monitor task to finalize exit status
             for _ in 0..20 {
                 if entry.lock().expect("process entry poisoned").info.phase
                     != ManagedProcessPhase::Running
@@ -792,9 +748,6 @@ impl ProcessManager {
         })
     }
 
-    /// Automatically stops all running processes with `lifecycle == ProcessLifecycle::Activation`
-    /// belonging to `activation_id` when the activation finishes.
-    /// Processes with `lifecycle == ProcessLifecycle::Session` continue running untouched.
     pub async fn cleanup_activation_processes(&self, activation_id: &ActivationId) {
         let to_stop: Vec<(Arc<Notify>, Option<u32>)> = {
             let guard = self.entries.lock().expect("entries poisoned");
@@ -820,7 +773,6 @@ impl ProcessManager {
         }
     }
 
-    /// Automatically stops all running processes belonging to `session_id` (both `Activation` and `Session` lifecycles).
     pub async fn cleanup_session_processes(&self, session_id: &SessionId) {
         let to_stop: Vec<(Arc<Notify>, Option<u32>)> = {
             let guard = self.entries.lock().expect("entries poisoned");
@@ -842,104 +794,5 @@ impl ProcessManager {
             }
             notify.notify_waiters();
         }
-    }
-}
-
-async fn request_sandbox_violation_approval(
-    host: &Arc<dyn CoreHost>,
-    plugin_name: &str,
-    command: &str,
-    v: &SandboxViolation,
-    sandbox_state: &Arc<SandboxState>,
-    unlocked_paths: &mut Vec<PathBuf>,
-    temporary_once_paths: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    let reason = format!(
-        "Command `{}` requires {} access to '{}' (suggested directory: '{}')",
-        command,
-        v.operation,
-        v.raw_path.display(),
-        v.capability
-            .path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
-    );
-    match host
-        .check_permission_with_original_path(
-            Some(plugin_name),
-            v.capability.clone(),
-            Some(v.raw_path.clone()),
-            Some(reason),
-        )
-        .await
-    {
-        Ok(PermissionOutcome::Allowed {
-            effective_capability,
-            persist_in_activation,
-        }) => {
-            let granted_cap = effective_capability.unwrap_or_else(|| v.capability.clone());
-            if let Some(p) = granted_cap.path() {
-                unlocked_paths.push(p.to_path_buf());
-                if !persist_in_activation {
-                    temporary_once_paths.push(p.to_path_buf());
-                }
-            }
-            unlocked_paths.push(v.raw_path.clone());
-            match granted_cap {
-                CapabilityRequest::FileWrite { path } => {
-                    sandbox_state.allow_writable_path(path);
-                }
-                CapabilityRequest::CommandWorkDir { work_dir } => {
-                    sandbox_state.allow_writable_path(work_dir);
-                }
-                CapabilityRequest::FileRead { path } => {
-                    sandbox_state.allow_readable_path(path);
-                }
-                CapabilityRequest::Http { .. } => {}
-            }
-            Ok(())
-        }
-        Ok(PermissionOutcome::Denied { reason }) => Err(format!(
-            "[RAGENTS_SANDBOX_DENIED] Permission denied for {:?}: {reason}",
-            v.capability
-        )),
-        Err(err) => Err(format!(
-            "[RAGENTS_SANDBOX_ERROR] Permission request failed: {err}"
-        )),
-    }
-}
-
-fn format_exit_notification(info: &ManagedProcessInfo) -> String {
-    format!(
-        "[System Notification: Background Process Exited]\n- process_id: {}\n- pid: {}\n- command: {}\n- phase: {:?}\n- exit_code: {}\n- duration_ms: {}\nHint: Use `process_logs` with `process_id: \"{}\"` and `stream: \"combined\"` (or \"stdout\" / \"stderr\") to inspect its output if needed.",
-        info.process_id,
-        info.pid
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        info.command,
-        info.phase,
-        info.exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "none".into()),
-        info.duration_ms,
-        info.process_id
-    )
-}
-
-async fn kill_process_group(pid: u32) {
-    #[cfg(unix)]
-    {
-        let neg_pgid = format!("-{pid}");
-        let _ = tokio::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(&neg_pgid)
-            .output()
-            .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = tokio::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(&neg_pgid)
-            .output()
-            .await;
     }
 }
