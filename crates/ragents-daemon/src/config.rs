@@ -121,7 +121,34 @@ fn default_temp_root() -> PathBuf {
 impl DaemonConfig {
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, DaemonConfigError> {
         let content = std::fs::read_to_string(path)?;
-        let cfg: Self = toml::from_str(&content)?;
+        let mut cfg: Self = toml::from_str(&content)?;
+        if let Ok(env_base_url) = std::env::var("RAGENTS_BASE_URL") {
+            if !env_base_url.trim().is_empty() {
+                for m in cfg.models.values_mut() {
+                    if m.base_url.trim().is_empty() || m.base_url == "${RAGENTS_BASE_URL}" {
+                        m.base_url = env_base_url.clone();
+                    }
+                }
+                if let Ok(env_model) = std::env::var("RAGENTS_MODEL") {
+                    let trimmed = env_model.trim();
+                    if !trimmed.is_empty() {
+                        cfg.models
+                            .entry(trimmed.to_string())
+                            .or_insert_with(|| LocalModelConfig {
+                                base_url: env_base_url.clone(),
+                                api_key: None,
+                                api_key_env: Some("RAGENTS_API_KEY".to_string()),
+                                extra_headers: BTreeMap::new(),
+                                default_temperature: None,
+                                default_max_output_tokens: None,
+                            });
+                        if cfg.default_model.is_none() {
+                            cfg.default_model = Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
         Ok(cfg)
     }
 
