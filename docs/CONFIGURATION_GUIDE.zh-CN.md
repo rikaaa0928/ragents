@@ -90,7 +90,7 @@ default_temperature = 0.1
 # ============================================================================
 [[extensions]]
 name = "shell"
-path = "/Volumes/storage/src/ai/agents/ragents/extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm"
+path = "./extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm"
 enabled = true
 # default_timeout_seconds = 0 表示默认无超时限制（与 pi 一致，支持单次调用传 timeout 秒数）
 # max_output_lines / max_output_bytes 控制阻塞命令输出尾部截断阈值（超出部分自动落盘至 .ragents-tmp/）
@@ -98,19 +98,19 @@ config = { default_timeout_seconds = 0, max_output_lines = 2000, max_output_byte
 
 [[extensions]]
 name = "file_editor"
-path = "/Volumes/storage/src/ai/agents/ragents/extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm"
+path = "./extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm"
 enabled = true
 config = {}
 
 [[extensions]]
 name = "image_viewer"
-path = "/Volumes/storage/src/ai/agents/ragents/extensions/image_viewer/target/wasm32-wasip2/release/ragent_image_viewer_extension.wasm"
+path = "./extensions/image_viewer/target/wasm32-wasip2/release/ragent_image_viewer_extension.wasm"
 enabled = true
 config = {}
 
 [[extensions]]
 name = "skills"
-path = "/Volumes/storage/src/ai/agents/ragents/extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm"
+path = "./extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm"
 enabled = true
 # 声明式授予该扩展额外允许读取的宿主机目录（支持 ~/ 展开；会自动挂载至 WASI 并合并进 PermissionSnapshot）
 allowed_dirs = ["~/.agents/skills"]
@@ -118,7 +118,7 @@ config = { include_workspace = true, include_global = true, include_agents_md = 
 
 [[extensions]]
 name = "compaction"
-path = "/Volumes/storage/src/ai/agents/ragents/extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm"
+path = "./extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm"
 enabled = true
 # 自动上下文压缩阈值配置：
 # - trigger_tokens：当上下文估算或模型返回的 Token 数达到该阈值时，自动触发三会话接力压缩（默认 64000，可在超长上下文模型质量衰减前主动提前压缩）

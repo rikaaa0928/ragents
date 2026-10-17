@@ -157,12 +157,12 @@ export RAGENTS_MODEL="gemini-3.8-flash"
 ```bash
 ./target/debug/ragents run \
   --node node-mac-studio-01 \
-  --workdir /Volumes/storage/src/my-project \
+  --workdir ./my-project \
   --model gemini-3.8-flash \
-  --extension shell=/Volumes/storage/src/ai/agents/ragents/extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm \
-  --extension file_editor=/Volumes/storage/src/ai/agents/ragents/extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm \
-  --extension "skills=/Volumes/storage/src/ai/agents/ragents/extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm:~/.agents/skills" \
-  --extension 'compaction=/Volumes/storage/src/ai/agents/ragents/extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm#{"trigger_tokens":64000,"keep_recent_tokens":20000}' \
+  --extension shell=./extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm \
+  --extension file_editor=./extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm \
+  --extension "skills=./extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm:~/.agents/skills" \
+  --extension 'compaction=./extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm#{"trigger_tokens":64000,"keep_recent_tokens":20000}' \
   "请检查 src/main.rs 并运行 cargo check"
 ```
 
