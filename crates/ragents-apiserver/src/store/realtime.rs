@@ -3,49 +3,97 @@ use chrono::Utc;
 use openresponses_rust::Item;
 use ragents_protocol::*;
 use rusqlite::params;
+use std::collections::BTreeMap;
 
 impl SqliteStore {
     pub fn push_realtime_message(
         &self,
         session_id: &SessionId,
         content: Vec<openresponses_rust::MessageContent>,
-    ) -> Result<usize, StoreError> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
-        let tx = conn.transaction()?;
+    ) -> Result<PushRealtimeMessageResponse, StoreError> {
+        let mut events_to_publish = Vec::new();
+        let mut dispatches = Vec::new();
+        let response = {
+            let mut conn = self.conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
 
-        let mut target_sid = session_id.clone();
-        let mut session = Self::load_session_in_tx(&tx, &target_sid)?
-            .ok_or_else(|| StoreError::NotFound(format!("session {target_sid}")))?;
-        let mut hops = 0usize;
-        while session.status.phase == SessionPhase::Closed {
-            if let Some(next_sid) = session.status.compaction.continued_in_session_id.clone() {
-                if hops >= 32 {
+            let mut target_sid = session_id.clone();
+            let mut session = Self::load_session_in_tx(&tx, &target_sid)?
+                .ok_or_else(|| StoreError::NotFound(format!("session {target_sid}")))?;
+            let mut hops = 0usize;
+            while session.status.phase == SessionPhase::Closed {
+                if let Some(next_sid) = session.status.compaction.continued_in_session_id.clone() {
+                    if hops >= 32 {
+                        break;
+                    }
+                    hops += 1;
+                    session = Self::load_session_in_tx(&tx, &next_sid)?
+                        .ok_or_else(|| StoreError::NotFound(format!("session {next_sid}")))?;
+                    target_sid = next_sid;
+                } else {
                     break;
                 }
-                hops += 1;
-                session = Self::load_session_in_tx(&tx, &next_sid)?
-                    .ok_or_else(|| StoreError::NotFound(format!("session {next_sid}")))?;
-                target_sid = next_sid;
-            } else {
-                break;
             }
-        }
 
-        let now = Utc::now().to_rfc3339();
-        for block in content {
-            tx.execute(
-                "INSERT INTO realtime_messages (session_id, content_json, created_at) VALUES (?1, ?2, ?3)",
-                params![target_sid.as_str(), serde_json::to_string(&block)?, &now],
+            if session.status.phase != SessionPhase::Open {
+                return Err(StoreError::Conflict(format!(
+                    "session {target_sid} is not open (phase: {:?})",
+                    session.status.phase
+                )));
+            }
+
+            let now = Utc::now().to_rfc3339();
+            for block in content {
+                tx.execute(
+                    "INSERT INTO realtime_messages (session_id, content_json, created_at) VALUES (?1, ?2, ?3)",
+                    params![target_sid.as_str(), serde_json::to_string(&block)?, &now],
+                )?;
+            }
+
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM realtime_messages WHERE session_id = ?1",
+                params![target_sid.as_str()],
+                |row| row.get(0),
             )?;
-        }
 
-        let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM realtime_messages WHERE session_id = ?1",
-            params![target_sid.as_str()],
-            |row| row.get(0),
-        )?;
-        tx.commit()?;
-        Ok(count as usize)
+            // If the session is currently idle (no active or queued activation), automatically wake it up
+            // by creating and scheduling a Continuation activation so the realtime message is immediately processed.
+            let mut spawned_activation_id = None;
+            if count > 0
+                && session.status.active_activation_id.is_none()
+                && session.status.queued_activation_count == 0
+            {
+                let wake_act = Self::create_activation_in_tx(
+                    &tx,
+                    CreateActivationRequest {
+                        activation_id: None,
+                        labels: BTreeMap::new(),
+                        spec: ActivationSpec {
+                            session_id: target_sid.clone(),
+                            submission_kind: SubmissionKind::Continuation,
+                            input: vec![],
+                            model_override: None,
+                            desired_phase: DesiredActivationPhase::Running,
+                            interaction_responses: BTreeMap::new(),
+                        },
+                    },
+                    &mut events_to_publish,
+                )?;
+                spawned_activation_id = Some(ActivationId::new(wake_act.metadata.id));
+                dispatches = Self::schedule_pending_in_tx(&tx, &mut events_to_publish)?;
+            }
+
+            tx.commit()?;
+            PushRealtimeMessageResponse {
+                queued_count: count as usize,
+                target_session_id: Some(target_sid),
+                spawned_activation_id,
+            }
+        };
+
+        self.publish_events(events_to_publish);
+        self.publish_dispatches(dispatches);
+        Ok(response)
     }
 
     /// Atomically drains ALL queued real-time messages for `session_id` in one batch,

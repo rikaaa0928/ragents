@@ -353,11 +353,8 @@ pub(crate) async fn handle_push_realtime_message(
             &sess.metadata.labels,
         )
         .await?;
-    let queued_count = state.store.push_realtime_message(&id, req.content)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(PushRealtimeMessageResponse { queued_count }),
-    ))
+    let resp = state.store.push_realtime_message(&id, req.content)?;
+    Ok((StatusCode::CREATED, Json(resp)))
 }
 
 pub(crate) async fn handle_get_activation(

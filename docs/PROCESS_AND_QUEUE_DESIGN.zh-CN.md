@@ -70,7 +70,7 @@
 | **存储位置** | `api-server` SQLite (`realtime_messages` 表) | `api-server` SQLite (`activations` 表，`phase = Queued`) |
 | **谁调用 `api-server` 写入？** | ① **`agent-daemon`**：监控到 `wait=false` 后台进程退出时，通过 WS 隧道发送 `PushRealtimeMessage` 给 `api-server`<br>② **客户端 (CLI/SDK)**：通过 HTTP `POST /api/v1/sessions/{id}/realtime`（或 `SubmissionKind::Steer`）发送给 `api-server` | **客户端 (CLI/SDK)**：通过 HTTP `POST /api/v1/sessions/{id}/activations`（`SubmissionKind::Normal / FollowUp`）发送给 `api-server` |
 | **谁调用 `api-server` 读取？** | **`agent-core` -> `agent-daemon`**：在每次 ReAct Loop（每个 `Turn` 调用大模型前）发送 `DrainRealtimeMessages` 给 `api-server` | **`api-server` 内部调度器**：在当前 `Activation` 完成（`CompleteActivation`）的同一个事务内自动取出下一个 `Queued` Activation 派发给 `agent-daemon` |
-| **边界情况：当最后一次 Tool 执行完、模型正准备结束 Activation 时收到实时消息** | 在 ReAct 循环准备 `break` 退出前，会再做一次 `drain_realtime_messages()` 检查：若 `api-server` 实时队列非空（例如后台进程刚好在最后一刻退出），**自动继续下一轮 `Turn`** 让模型处理该通知，绝不漏消息！ | 若 `Session` 当前处于空闲期（无运行中 `Activation`）时某 `lifecycle=session` 的后台进程退出，`agent-daemon` 同样上报给 `api-server` 存入 `realtime_messages` 表，在下一次 `Activation` 启动的第 1 个 `Turn` 自动被读取。 |
+| **边界情况：当最后一次 Tool 执行完、模型正准备结束 Activation 时，或当 Session 已停止运行（空闲）时收到实时消息** | ① 在 ReAct 循环准备 `break` 退出前，会再做一次 `drain_realtime_messages()` 检查：若 `api-server` 实时队列非空（例如后台进程刚好在最后一刻退出），**自动继续下一轮 `Turn`** 让模型处理该通知；<br>② 若 `Session` 当前处于空闲期（`active_activation_id == None && queued_activation_count == 0`）时收到实时消息（如用户执行 `ragents steer` 或 `lifecycle=session` 的后台进程退出），`push_realtime_message` 会在同一个 SQLite 事务内**自动创建并调度一个 `Continuation` 类型的 `Activation`** 立即唤醒 Session 消费该消息！ | 当 `Session` 空闲时提交 `Activation` 会立即被调度器派发运行；当 `Session` 忙碌时以 `Queued` 状态排队，等当前 `Activation` 结束后自动按 FIFO 顺序唤醒运行。 |
 
 ---
 

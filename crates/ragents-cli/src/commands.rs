@@ -368,10 +368,18 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let resp = client
                 .push_realtime_message(&sess_id, PushRealtimeMessageRequest { content: blocks })
                 .await?;
-            println!(
-                "Enqueued real-time message block(s) into session {} (total pending: {})",
-                sess_id, resp.queued_count
-            );
+            let effective_sid = resp.target_session_id.as_ref().unwrap_or(&sess_id);
+            if let Some(ref act_id) = resp.spawned_activation_id {
+                println!(
+                    "Enqueued real-time message block(s) into idle session {} and automatically spawned activation {} (total pending: {})",
+                    effective_sid, act_id, resp.queued_count
+                );
+            } else {
+                println!(
+                    "Enqueued real-time message block(s) into session {} (total pending: {})",
+                    effective_sid, resp.queued_count
+                );
+            }
             Ok(())
         }
         Commands::Cancel { activation_id } => {

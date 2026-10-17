@@ -98,6 +98,10 @@ impl PushRealtimeMessageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushRealtimeMessageResponse {
     pub queued_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_activation_id: Option<ActivationId>,
 }
 
 // ============================================================================

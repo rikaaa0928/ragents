@@ -812,6 +812,34 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
     assert!(ctx2_json.contains("out_line_1"), "ctx2: {ctx2_json}");
     assert!(ctx2_json.contains("err_line_1"), "ctx2: {ctx2_json}");
 
+    // Now that `sess_id` is completely idle (`act2` has completed), push a realtime message
+    // and verify that `push_realtime_message` automatically spawns and runs a Continuation Activation!
+    let wake_resp = client
+        .push_realtime_message(
+            &sess_id,
+            PushRealtimeMessageRequest::from_text("Wake up idle session via realtime queue!"),
+        )
+        .await
+        .unwrap();
+    let wake_act_id = wake_resp
+        .spawned_activation_id
+        .expect("push_realtime_message on idle session must auto-spawn an activation");
+
+    while let Some(Ok(env)) = watch.next().await {
+        if env.activation_id.as_ref() == Some(&wake_act_id)
+            && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+        {
+            break;
+        }
+    }
+
+    let ctx3 = client.get_session_context(&sess_id).await.unwrap();
+    let ctx3_json = serde_json::to_string(&ctx3.effective_items).unwrap();
+    assert!(
+        ctx3_json.contains("Wake up idle session via realtime queue!"),
+        "ctx3 must contain the drained realtime message that woke up the session: {ctx3_json}"
+    );
+
     d_cancel.cancel();
     server_cancel.cancel();
     let _ = std::fs::remove_dir_all(&base_tmp);
