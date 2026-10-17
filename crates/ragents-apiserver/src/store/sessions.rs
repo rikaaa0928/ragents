@@ -251,12 +251,29 @@ impl SqliteStore {
         patch: PatchSessionSpecRequest,
     ) -> Result<Session, StoreError> {
         let mut events_to_publish = Vec::new();
+        let mut reconcile_notices = Vec::new();
         let session = {
             let mut conn = self.conn.lock().expect("store mutex poisoned");
             let tx = conn.transaction()?;
 
-            let mut session = Self::load_session_in_tx(&tx, session_id)?
-                .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
+            let mut target_sid = session_id.clone();
+            let mut session = Self::load_session_in_tx(&tx, &target_sid)?
+                .ok_or_else(|| StoreError::NotFound(format!("session {target_sid}")))?;
+
+            let mut hops = 0usize;
+            while session.status.phase == SessionPhase::Closed {
+                if let Some(next_sid) = session.status.compaction.continued_in_session_id.clone() {
+                    if hops >= 32 {
+                        break;
+                    }
+                    hops += 1;
+                    session = Self::load_session_in_tx(&tx, &next_sid)?
+                        .ok_or_else(|| StoreError::NotFound(format!("session {next_sid}")))?;
+                    target_sid = next_sid;
+                } else {
+                    break;
+                }
+            }
 
             if let Some(ref model) = patch.model {
                 model.validate()?;
@@ -282,20 +299,92 @@ impl SqliteStore {
             if let Some(perms) = patch.permissions {
                 session.spec.permissions = perms;
             }
+
+            let mut phase_transition_event: Option<SessionEvent> = None;
             if let Some(desired_phase) = patch.desired_phase {
-                if desired_phase != DesiredSessionPhase::Open
-                    && session.status.active_activation_id.is_some()
-                {
-                    return Err(StoreError::Conflict(format!(
-                        "cannot close or archive session {session_id} while an activation is active"
-                    )));
+                if desired_phase != DesiredSessionPhase::Open {
+                    // Cancel all Queued activations for this session
+                    let queued_ids: Vec<String> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT activation_id FROM activations WHERE session_id = ?1 AND phase = 'queued'",
+                        )?;
+                        let rows = stmt.query_map(params![target_sid.as_str()], |r| r.get(0))?;
+                        let mut list = Vec::new();
+                        for r in rows {
+                            list.push(r?);
+                        }
+                        list
+                    };
+                    for q_id_str in queued_ids {
+                        let q_id = ActivationId::new(q_id_str);
+                        if let Some(mut q_act) = Self::load_activation_in_tx(&tx, &q_id)? {
+                            q_act.spec.desired_phase = DesiredActivationPhase::Cancelled;
+                            q_act.status.phase = ActivationPhase::Cancelled;
+                            q_act.status.finished_at = Some(Utc::now());
+                            Self::save_activation_in_tx(&tx, &mut q_act)?;
+                            let cancel_ev = Self::append_event_in_tx(
+                                &tx,
+                                &target_sid,
+                                Some(q_id),
+                                None,
+                                None,
+                                SessionEvent::ActivationCancelled,
+                            )?;
+                            session.status.event_count = cancel_ev.event_seq.value() + 1;
+                            events_to_publish.push(cancel_ev);
+                        }
+                    }
+                    session.status.queued_activation_count = 0;
+
+                    // If there is an active activation, request cancellation and notify the assigned daemon
+                    if let Some(active_id) = session.status.active_activation_id.clone() {
+                        if let Some(mut act) = Self::load_activation_in_tx(&tx, &active_id)? {
+                            if act.status.phase.is_active() {
+                                act.spec.desired_phase = DesiredActivationPhase::Cancelled;
+                                act.status.phase = ActivationPhase::Cancelling;
+                                Self::save_activation_in_tx(&tx, &mut act)?;
+                                let cancel_req_ev = Self::append_event_in_tx(
+                                    &tx,
+                                    &target_sid,
+                                    Some(active_id.clone()),
+                                    None,
+                                    None,
+                                    SessionEvent::ActivationCancellationRequested,
+                                )?;
+                                session.status.event_count = cancel_req_ev.event_seq.value() + 1;
+                                events_to_publish.push(cancel_req_ev);
+                                if let Some(ref node_id) = act.status.assigned_node {
+                                    reconcile_notices.push(super::ReconcileNotice {
+                                        node_id: node_id.clone(),
+                                        session_id: target_sid.clone(),
+                                        activation_id: active_id,
+                                        lease_epoch: act.status.lease_epoch,
+                                        desired_phase: DesiredActivationPhase::Cancelled,
+                                        interaction_responses: act
+                                            .spec
+                                            .interaction_responses
+                                            .clone(),
+                                    });
+                                }
+                            }
+                        }
+                        session.status.active_activation_id = None;
+                    }
                 }
                 session.spec.desired_phase = desired_phase;
-                session.status.phase = match desired_phase {
+                let new_phase = match desired_phase {
                     DesiredSessionPhase::Open => SessionPhase::Open,
                     DesiredSessionPhase::Closed => SessionPhase::Closed,
                     DesiredSessionPhase::Archived => SessionPhase::Archived,
                 };
+                if session.status.phase != new_phase {
+                    session.status.phase = new_phase;
+                    phase_transition_event = match new_phase {
+                        SessionPhase::Closed => Some(SessionEvent::SessionClosed),
+                        SessionPhase::Archived => Some(SessionEvent::SessionArchived),
+                        SessionPhase::Open | SessionPhase::Corrupted => None,
+                    };
+                }
             }
 
             let new_gen = session.metadata.generation.next();
@@ -304,7 +393,7 @@ impl SqliteStore {
 
             let ev = Self::append_event_in_tx(
                 &tx,
-                session_id,
+                &target_sid,
                 None,
                 None,
                 None,
@@ -315,11 +404,21 @@ impl SqliteStore {
             session.status.event_count = ev.event_seq.value() + 1;
             events_to_publish.push(ev);
 
+            if let Some(phase_ev_kind) = phase_transition_event {
+                let phase_ev =
+                    Self::append_event_in_tx(&tx, &target_sid, None, None, None, phase_ev_kind)?;
+                session.status.event_count = phase_ev.event_seq.value() + 1;
+                events_to_publish.push(phase_ev);
+            }
+
             Self::save_session_in_tx(&tx, &mut session)?;
             tx.commit()?;
             session
         };
 
+        for notice in reconcile_notices {
+            let _ = self.reconcile_tx.send(notice);
+        }
         self.publish_events(events_to_publish);
         Ok(session)
     }

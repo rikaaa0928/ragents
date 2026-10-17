@@ -31,6 +31,7 @@ pub struct ApiServerState {
     pub extensions: ApiServerExtensions,
     pub(crate) daemon_peers:
         Arc<Mutex<HashMap<NodeId, mpsc::UnboundedSender<ServerToDaemonMessage>>>>,
+    pub(crate) shutdown: CancellationToken,
 }
 
 impl ApiServerState {
@@ -40,6 +41,7 @@ impl ApiServerState {
             lease_ttl_ms,
             extensions: ApiServerExtensions::default(),
             daemon_peers: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
         };
         state.spawn_background_workers();
         state
@@ -104,6 +106,30 @@ impl ApiServerState {
                 }
             }
         });
+
+        let mut event_rx = self.store.subscribe_events();
+        let peers_for_cleanup = self.daemon_peers.clone();
+        tokio::spawn(async move {
+            while let Ok(env) = event_rx.recv().await {
+                if matches!(
+                    env.event,
+                    SessionEvent::SessionClosed | SessionEvent::SessionArchived
+                ) {
+                    let senders: Vec<mpsc::UnboundedSender<ServerToDaemonMessage>> =
+                        peers_for_cleanup
+                            .lock()
+                            .expect("peers mutex poisoned")
+                            .values()
+                            .cloned()
+                            .collect();
+                    for tx in senders {
+                        let _ = tx.send(ServerToDaemonMessage::CleanupSession {
+                            session_id: env.session_id.clone(),
+                        });
+                    }
+                }
+            }
+        });
     }
 
     pub fn spawn_lease_patrol(&self, interval: Duration, cancel: CancellationToken) {
@@ -165,6 +191,12 @@ pub async fn serve_tcp(
     let addr = listener.local_addr()?;
     let patrol_interval = Duration::from_millis((state.lease_ttl_ms / 3).max(500));
     state.spawn_lease_patrol(patrol_interval, cancel.clone());
+    let state_shutdown = state.shutdown.clone();
+    let cancel_for_ws = cancel.clone();
+    tokio::spawn(async move {
+        cancel_for_ws.cancelled().await;
+        state_shutdown.cancel();
+    });
     let app = build_router(state);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app)

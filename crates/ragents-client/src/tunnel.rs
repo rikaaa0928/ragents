@@ -22,31 +22,57 @@ pub enum DaemonPushEvent {
         desired_phase: DesiredActivationPhase,
         interaction_responses: BTreeMap<PermissionRequestId, PermissionResolutionSpec>,
     },
+    CleanupSession {
+        session_id: SessionId,
+    },
     Disconnected,
+}
+
+struct TunnelInner {
+    out_tx: mpsc::UnboundedSender<DaemonToServerMessage>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<ServerToDaemonMessage>>>>,
 }
 
 #[derive(Clone)]
 pub struct DaemonTunnelHandle {
-    out_tx: mpsc::UnboundedSender<DaemonToServerMessage>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<ServerToDaemonMessage>>>>,
+    inner: Arc<Mutex<TunnelInner>>,
 }
 
 type AckPayload = (Option<ResourceVersion>, Option<BatchSeq>, Option<SessionId>);
 
 impl DaemonTunnelHandle {
+    /// Atomically swaps the underlying WebSocket connection and pending map to a newly reconnected tunnel
+    /// so all existing `DaemonTunnelHandle` clones (heartbeat, ProcessManager, active hosts) seamlessly
+    /// use the new connection.
+    pub fn replace_connection(&self, other: &DaemonTunnelHandle) {
+        let new_inner = {
+            let guard = other.inner.lock().expect("other tunnel mutex poisoned");
+            TunnelInner {
+                out_tx: guard.out_tx.clone(),
+                pending: guard.pending.clone(),
+            }
+        };
+        *self.inner.lock().expect("self tunnel mutex poisoned") = new_inner;
+    }
+
     pub async fn call(
         &self,
         msg: DaemonToServerMessage,
     ) -> Result<ServerToDaemonMessage, ClientError> {
         let req_id = Self::extract_request_id(&msg).to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending
+        let (out_tx, pending) = {
+            let guard = self.inner.lock().expect("tunnel mutex poisoned");
+            (guard.out_tx.clone(), guard.pending.clone())
+        };
+
+        pending
             .lock()
             .expect("pending mutex poisoned")
             .insert(req_id.clone(), tx);
 
-        if self.out_tx.send(msg).is_err() {
-            self.pending
+        if out_tx.send(msg).is_err() {
+            pending
                 .lock()
                 .expect("pending mutex poisoned")
                 .remove(&req_id);
@@ -457,11 +483,23 @@ pub async fn connect_daemon_tunnel_with_token(
                         interaction_responses,
                     });
                 }
+                ServerToDaemonMessage::CleanupSession { session_id } => {
+                    let _ = push_tx.send(DaemonPushEvent::CleanupSession { session_id });
+                }
                 ServerToDaemonMessage::EventNotification { .. } => {}
             }
         }
+        pending_reader
+            .lock()
+            .expect("pending mutex poisoned")
+            .clear();
         let _ = push_tx.send(DaemonPushEvent::Disconnected);
     });
 
-    Ok((DaemonTunnelHandle { out_tx, pending }, push_rx))
+    Ok((
+        DaemonTunnelHandle {
+            inner: Arc::new(Mutex::new(TunnelInner { out_tx, pending })),
+        },
+        push_rx,
+    ))
 }

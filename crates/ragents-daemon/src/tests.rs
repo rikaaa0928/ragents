@@ -1278,3 +1278,248 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
     d_cancel.cancel();
     server_cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
+    use std::path::PathBuf;
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let shell_wasm = manifest_dir
+        .join("../../extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm");
+    assert!(
+        shell_wasm.exists(),
+        "ragent_shell_extension.wasm must exist"
+    );
+
+    let base_tmp = PathBuf::from("/tmp").join(format!("ragents_reconn_{}", uuid::Uuid::now_v7()));
+    let ws_dir = base_tmp.join("ws");
+    let db_path = base_tmp.join("state.db");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let store1 = SqliteStore::open(&db_path).unwrap();
+    let state1 = ApiServerState::new(store1, 5000);
+    let server_cancel_1 = CancellationToken::new();
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = serve_tcp(listener1, state1, server_cancel_1.clone())
+        .await
+        .unwrap();
+    let server_url = format!("http://{addr}");
+    let client = RagentsClient::new(&server_url);
+
+    struct ReconnectTestBackend {
+        step: Mutex<usize>,
+        captured_pid: Arc<Mutex<Option<u32>>>,
+    }
+
+    #[async_trait]
+    impl ModelBackend for ReconnectTestBackend {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            request: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            if let Some(openresponses_rust::Input::Items(items)) = &request.input {
+                for it in items {
+                    if let Item::FunctionCallOutput {
+                        output: openresponses_rust::FunctionOutput::Text(t),
+                        ..
+                    } = it
+                    {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+                            if let Some(pid) = v.get("pid").and_then(|p| p.as_u64()) {
+                                *self.captured_pid.lock().unwrap() = Some(pid as u32);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let s = {
+                let mut g = self.step.lock().unwrap();
+                *g += 1;
+                *g
+            };
+
+            let out = match s {
+                1 => vec![Item::FunctionCall {
+                    id: None,
+                    call_id: "call_bg_srv".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "sleep 60",
+                        "wait": false,
+                        "lifecycle": "session"
+                    })
+                    .to_string(),
+                    status: None,
+                }],
+                2 => vec![Item::assistant_message(
+                    "Session background process started.",
+                )],
+                _ => vec![Item::assistant_message(
+                    "Executed activation after daemon auto-reconnected!",
+                )],
+            };
+
+            Ok(make_openresponses_resource(
+                &format!("resp_reconn_{s}"),
+                "gpt-4.1",
+                out,
+                None,
+            ))
+        }
+    }
+
+    let captured_pid = Arc::new(Mutex::new(None));
+    let mut cfg = DaemonConfig::default_local("node_reconn", &server_url);
+    cfg.temp_root_dir = base_tmp.join("tmp");
+    cfg.extensions = vec![ExtensionSpec {
+        name: "shell".into(),
+        path: shell_wasm.to_string_lossy().to_string(),
+        enabled: true,
+        config: serde_json::json!({}),
+        allowed_dirs: vec![],
+    }];
+
+    let daemon = AgentDaemon::new(cfg).with_model_backend(Arc::new(ReconnectTestBackend {
+        step: Mutex::new(0),
+        captured_pid: captured_pid.clone(),
+    }));
+    let d_cancel = CancellationToken::new();
+    daemon.start(d_cancel.clone()).await.unwrap();
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_reconn_1")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_reconn"),
+                    workspace_path: ws_dir.clone(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("Start session background sleep")],
+                model_override: None,
+            }),
+        })
+        .await
+        .unwrap();
+    let sess_id = SessionId::new(created.session.metadata.id);
+    let act1_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+
+    let mut watch1 = client.watch_events(Some(&sess_id), 0).await.unwrap();
+    while let Some(Ok(env)) = watch1.next().await {
+        if env.activation_id.as_ref() == Some(&act1_id)
+            && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+        {
+            break;
+        }
+    }
+    drop(watch1);
+
+    let bg_pid = captured_pid
+        .lock()
+        .unwrap()
+        .expect("captured session-scoped background process pid");
+    let alive_before = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(bg_pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(
+        alive_before,
+        "session background process {bg_pid} must be alive"
+    );
+
+    // 1. Simulate `api-server` restart: shut down `server_cancel_1`, wait briefly, then bind `addr` again!
+    server_cancel_1.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let store2 = SqliteStore::open(&db_path).unwrap();
+    let state2 = ApiServerState::new(store2, 5000);
+    let server_cancel_2 = CancellationToken::new();
+    let listener2 = TcpListener::bind(addr).await.unwrap();
+    serve_tcp(listener2, state2, server_cancel_2.clone())
+        .await
+        .unwrap();
+
+    // Wait briefly for `AgentDaemon` exponential-backoff loop to reconnect and re-register
+    let mut watch2 = client.watch_events(Some(&sess_id), 0).await.unwrap();
+    let act2 = client
+        .create_activation(CreateActivationRequest {
+            activation_id: None,
+            labels: BTreeMap::new(),
+            spec: ActivationSpec {
+                session_id: sess_id.clone(),
+                submission_kind: SubmissionKind::Normal,
+                input: vec![Item::user_message(
+                    "Verify daemon reconnected after server restart",
+                )],
+                model_override: None,
+                desired_phase: DesiredActivationPhase::Running,
+                interaction_responses: BTreeMap::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let act2_id = ActivationId::new(act2.metadata.id);
+
+    while let Some(Ok(env)) = watch2.next().await {
+        if env.activation_id.as_ref() == Some(&act2_id)
+            && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+        {
+            break;
+        }
+    }
+
+    // 2. Now close `sess_id` via `patch_session` (`DesiredSessionPhase::Closed`)
+    // and verify that `AgentDaemon` receives `CleanupSession` and kills `bg_pid`!
+    let patched = client
+        .patch_session(
+            &sess_id,
+            PatchSessionSpecRequest {
+                desired_phase: Some(DesiredSessionPhase::Closed),
+                system_prompt: None,
+                model: None,
+                extensions: None,
+                permissions: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.status.phase, SessionPhase::Closed);
+
+    // Wait up to 1s for the background process group to be killed and session temp dir removed
+    let session_tmp = base_tmp.join("tmp").join("sessions").join(sess_id.as_str());
+    let mut killed = false;
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let still_alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(bg_pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !still_alive && !session_tmp.exists() {
+            killed = true;
+            break;
+        }
+    }
+    assert!(
+        killed,
+        "session-scoped background process pid {bg_pid} and session tmp dir {:?} must be cleaned up when session is closed",
+        session_tmp
+    );
+
+    d_cancel.cancel();
+    server_cancel_2.cancel();
+    let _ = std::fs::remove_dir_all(&base_tmp);
+}

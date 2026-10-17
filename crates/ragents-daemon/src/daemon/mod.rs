@@ -23,6 +23,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 struct ActiveActivationControl {
+    session_id: SessionId,
     cancel: CancellationToken,
     permission_waiters:
         Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionResolutionSpec>>>>,
@@ -134,17 +135,17 @@ impl AgentDaemon {
         });
 
         let daemon = self.clone();
+        let ws_url_for_loop = ws_url.clone();
         tokio::spawn(async move {
             loop {
-                tokio::select! {
+                let disconnected = tokio::select! {
                     maybe_push = push_rx.recv() => {
-                        let Some(push) = maybe_push else { break; };
-                        match push {
-                            DaemonPushEvent::DispatchActivation {
+                        match maybe_push {
+                            Some(DaemonPushEvent::DispatchActivation {
                                 session,
                                 activation,
                                 lease_epoch,
-                            } => {
+                            }) => {
                                 daemon.handle_dispatch(
                                     *session,
                                     *activation,
@@ -156,13 +157,14 @@ impl AgentDaemon {
                                     process_manager.clone(),
                                     shutdown.clone(),
                                 );
+                                false
                             }
-                            DaemonPushEvent::ReconcileActivation {
+                            Some(DaemonPushEvent::ReconcileActivation {
                                 activation_id,
                                 desired_phase,
                                 interaction_responses,
                                 ..
-                            } => {
+                            }) => {
                                 let maybe_ctrl = active_tasks
                                     .lock()
                                     .expect("active_tasks mutex poisoned")
@@ -183,11 +185,90 @@ impl AgentDaemon {
                                         }
                                     }
                                 }
+                                false
                             }
-                            DaemonPushEvent::Disconnected => break,
+                            Some(DaemonPushEvent::CleanupSession { session_id }) => {
+                                let cancels: Vec<CancellationToken> = active_tasks
+                                    .lock()
+                                    .expect("active_tasks mutex poisoned")
+                                    .values()
+                                    .filter(|c| c.session_id == session_id)
+                                    .map(|c| c.cancel.clone())
+                                    .collect();
+                                for c in cancels {
+                                    c.cancel();
+                                }
+                                process_manager.cleanup_session_processes(&session_id).await;
+                                daemon
+                                    .session_grants
+                                    .lock()
+                                    .expect("session_grants mutex poisoned")
+                                    .remove(&session_id);
+                                let _ = std::fs::remove_dir_all(
+                                    daemon
+                                        .config
+                                        .temp_root_dir
+                                        .join("sessions")
+                                        .join(session_id.as_str()),
+                                );
+                                let _ = std::fs::remove_dir_all(
+                                    daemon
+                                        .config
+                                        .temp_root_dir
+                                        .join("floating")
+                                        .join(session_id.as_str()),
+                                );
+                                false
+                            }
+                            Some(DaemonPushEvent::Disconnected) | None => true,
                         }
                     }
                     _ = shutdown.cancelled() => break,
+                };
+
+                if disconnected {
+                    let mut backoff_ms = 100u64;
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                            _ = shutdown.cancelled() => return,
+                        }
+                        if let Ok((new_tunnel, new_rx)) = connect_daemon_tunnel_with_token(
+                            &ws_url_for_loop,
+                            daemon.config.auth_token.as_deref(),
+                        )
+                        .await
+                        {
+                            let hostname = std::env::var("HOSTNAME")
+                                .unwrap_or_else(|_| "localhost".to_string());
+                            let os = std::env::consts::OS.to_string();
+                            let arch = std::env::consts::ARCH.to_string();
+                            if new_tunnel
+                                .register_node(
+                                    daemon.config.node_id.clone(),
+                                    hostname,
+                                    os,
+                                    arch,
+                                    daemon.config.labels.clone(),
+                                    daemon.config.supported_models(),
+                                    daemon.config.default_model.clone(),
+                                    daemon.config.installed_extension_names(),
+                                    daemon.config.max_concurrent_runners,
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                let count = active_runners.load(Ordering::Relaxed);
+                                let _ = new_tunnel
+                                    .heartbeat(daemon.config.node_id.clone(), count)
+                                    .await;
+                                tunnel.replace_connection(&new_tunnel);
+                                push_rx = new_rx;
+                                break;
+                            }
+                        }
+                        backoff_ms = (backoff_ms * 2).min(2000);
+                    }
                 }
             }
         });
@@ -262,6 +343,7 @@ impl AgentDaemon {
                 .insert(
                     act_id.clone(),
                     ActiveActivationControl {
+                        session_id: sess_id.clone(),
                         cancel: task_cancel.clone(),
                         permission_waiters: permission_waiters.clone(),
                     },

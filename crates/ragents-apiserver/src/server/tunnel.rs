@@ -55,7 +55,14 @@ async fn run_daemon_tunnel_socket(socket: WebSocket, state: ApiServerState) {
 
     let mut registered_node_id: Option<NodeId> = None;
 
-    while let Some(Ok(frame)) = ws_receiver.next().await {
+    loop {
+        let next_frame = tokio::select! {
+            f = ws_receiver.next() => f,
+            _ = state.shutdown.cancelled() => break,
+        };
+        let Some(Ok(frame)) = next_frame else {
+            break;
+        };
         let text = match frame {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => match String::from_utf8(b.to_vec()) {
@@ -75,11 +82,14 @@ async fn run_daemon_tunnel_socket(socket: WebSocket, state: ApiServerState) {
     }
 
     if let Some(node_id) = registered_node_id {
-        state
-            .daemon_peers
-            .lock()
-            .expect("peers mutex poisoned")
-            .remove(&node_id);
+        let mut guard = state.daemon_peers.lock().expect("peers mutex poisoned");
+        if guard
+            .get(&node_id)
+            .map(|existing| existing.same_channel(&out_tx))
+            .unwrap_or(false)
+        {
+            guard.remove(&node_id);
+        }
     }
     writer_task.abort();
 }

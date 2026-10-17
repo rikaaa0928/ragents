@@ -324,6 +324,8 @@ pub enum ServerToDaemonMessage {
         #[serde(default)]
         interaction_responses: BTreeMap<PermissionRequestId, PermissionResolutionSpec>,
     },
+    /// Server instructs daemon to clean up all background processes and temporary resources for a closed/archived session
+    CleanupSession { session_id: SessionId },
     /// Server notifies daemon that a session Event was committed (useful for local observers)
     EventNotification { envelope: Box<SessionEventEnvelope> },
 }

@@ -26,7 +26,7 @@ impl SqliteStore {
         }
 
         let mut events_to_publish = Vec::new();
-        let dispatches;
+        let mut dispatches;
         let node = {
             let mut conn = self.conn.lock().expect("store mutex poisoned");
             let tx = conn.transaction()?;
@@ -94,6 +94,45 @@ impl SqliteStore {
             )?;
 
             dispatches = Self::schedule_pending_in_tx(&tx, &mut events_to_publish)?;
+
+            // Also re-emit dispatches for any activations already in `scheduled` phase assigned to `node_id`
+            // (in case the daemon disconnected right before receiving `DispatchActivation`).
+            let scheduled_rows: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT activation_id, session_id FROM activations WHERE assigned_node = ?1 AND phase = 'scheduled' ORDER BY created_at ASC",
+                )?;
+                let rows = stmt.query_map(params![node_id.as_str()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                let mut list = Vec::new();
+                for r in rows {
+                    list.push(r?);
+                }
+                list
+            };
+            for (act_id_str, sess_id_str) in scheduled_rows {
+                if dispatches
+                    .iter()
+                    .any(|d| d.activation.metadata.id == act_id_str)
+                {
+                    continue;
+                }
+                let act_id = ActivationId::new(act_id_str);
+                let sess_id = SessionId::new(sess_id_str);
+                if let (Some(act), Some(sess)) = (
+                    Self::load_activation_in_tx(&tx, &act_id)?,
+                    Self::load_session_in_tx(&tx, &sess_id)?,
+                ) {
+                    let lease_epoch = act.status.lease_epoch;
+                    dispatches.push(ScheduledDispatch {
+                        node_id: node_id.clone(),
+                        session: sess,
+                        activation: act,
+                        lease_epoch,
+                    });
+                }
+            }
+
             tx.commit()?;
             node
         };
