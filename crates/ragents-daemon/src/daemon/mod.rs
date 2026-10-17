@@ -1,6 +1,6 @@
 mod host;
 
-use crate::config::{DaemonConfig, ExecutorMode};
+use crate::config::{DaemonConfig, ExecutorMode, LocalModelConfig};
 use crate::interceptors::{DaemonInterceptor, DaemonInterceptorChain, InterceptedModelBackend};
 use host::{DaemonCoreHost, DaemonProcessSink};
 use ragents_client::{
@@ -12,7 +12,7 @@ use ragents_core::{
     OpenResponsesModelBackend, ProcessManager, SandboxMode, SandboxState, SubprocessExecutor,
 };
 use ragents_protocol::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -32,6 +32,7 @@ struct ActiveActivationControl {
 #[derive(Clone)]
 pub struct AgentDaemon {
     config: Arc<DaemonConfig>,
+    discovered_models: Arc<Mutex<BTreeMap<String, LocalModelConfig>>>,
     executor: Arc<dyn CoreExecutor>,
     model_backend: Arc<dyn ModelBackend>,
     interceptor_chain: DaemonInterceptorChain,
@@ -52,6 +53,7 @@ impl AgentDaemon {
         let interceptor_chain = DaemonInterceptorChain::from_specs(&config.interceptors);
         Self {
             config: Arc::new(config),
+            discovered_models: Arc::new(Mutex::new(BTreeMap::new())),
             executor,
             model_backend: Arc::new(OpenResponsesModelBackend),
             interceptor_chain,
@@ -80,8 +82,33 @@ impl AgentDaemon {
         &self.config
     }
 
+    pub fn effective_supported_models(&self) -> Vec<String> {
+        let disc = self
+            .discovered_models
+            .lock()
+            .expect("discovered_models mutex poisoned");
+        self.config.supported_models_with_discovered(&disc)
+    }
+
+    pub fn effective_default_model(&self) -> Option<String> {
+        self.config
+            .default_model
+            .clone()
+            .or_else(|| self.effective_supported_models().into_iter().next())
+    }
+
     /// Connects to `api-server`, registers the node, starts heartbeat and reconcile loop in the background.
     pub async fn start(&self, shutdown: CancellationToken) -> Result<(), ClientError> {
+        if self.config.auto_discover_models {
+            let discovered = self.config.discover_provider_models().await;
+            if !discovered.is_empty() {
+                *self
+                    .discovered_models
+                    .lock()
+                    .expect("discovered_models mutex poisoned") = discovered;
+            }
+        }
+
         let client = RagentsClient::new(&self.config.server_url)
             .with_auth_token(self.config.auth_token.clone());
         let ws_url = client.ws_tunnel_url();
@@ -99,8 +126,8 @@ impl AgentDaemon {
                 os,
                 arch,
                 self.config.labels.clone(),
-                self.config.supported_models(),
-                self.config.default_model.clone(),
+                self.effective_supported_models(),
+                self.effective_default_model(),
                 self.config.installed_extension_names(),
                 self.config.max_concurrent_runners,
             )
@@ -250,8 +277,8 @@ impl AgentDaemon {
                                     os,
                                     arch,
                                     daemon.config.labels.clone(),
-                                    daemon.config.supported_models(),
-                                    daemon.config.default_model.clone(),
+                                    daemon.effective_supported_models(),
+                                    daemon.effective_default_model(),
                                     daemon.config.installed_extension_names(),
                                     daemon.config.max_concurrent_runners,
                                 )
@@ -294,8 +321,16 @@ impl AgentDaemon {
             let sess_id = SessionId::new(session.metadata.id.clone());
             let act_id = ActivationId::new(activation.metadata.id.clone());
 
-            let (effective_config, effective_permission, model_endpoint) =
-                match daemon.config.merge_for_activation(&session, &activation) {
+            let (effective_config, effective_permission, model_endpoint) = {
+                let disc = daemon
+                    .discovered_models
+                    .lock()
+                    .expect("discovered_models mutex poisoned")
+                    .clone();
+                match daemon
+                    .config
+                    .merge_for_activation_with_discovered(&disc, &session, &activation)
+                {
                     Ok(merged) => merged,
                     Err(err) => {
                         let _ = tunnel
@@ -311,7 +346,8 @@ impl AgentDaemon {
                             .await;
                         return;
                     }
-                };
+                }
+            };
 
             let workspace_root = match &session.spec.scheduling {
                 SchedulingMode::Pinned { workspace_path, .. } => workspace_path.clone(),

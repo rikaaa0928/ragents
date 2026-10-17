@@ -72,6 +72,7 @@ fn make_daemon_cfg(
         default_model: models.first().map(|s| s.to_string()),
         temp_root_dir: temp_root,
         labels: BTreeMap::new(),
+        auto_discover_models: false,
         models: model_map,
         extensions: vec![],
         interceptors: vec![],
@@ -1522,4 +1523,151 @@ async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
     d_cancel.cancel();
     server_cancel_2.cancel();
     let _ = std::fs::remove_dir_all(&base_tmp);
+}
+
+#[tokio::test]
+async fn test_daemon_auto_discover_models_from_v1_models_endpoint() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 1. Spawn a lightweight local HTTP server that responds to GET /v1/models
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    let mock_cancel = CancellationToken::new();
+    let mock_cancel_clone = mock_cancel.clone();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = mock_cancel_clone.cancelled() => break,
+                accept_res = mock_listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let mut buf = [0u8; 2048];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let req_str = String::from_utf8_lossy(&buf[..n]);
+                        if req_str.starts_with("GET /v1/models ") {
+                            let body = r#"{"object":"list","data":[{"id":"discovered-model-alpha"},{"id":"discovered-model-beta"},{"id":"configured-supplement-model"}]}"#;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                        } else {
+                            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 2. Start apiserver
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SqliteStore::open_in_memory().expect("open store");
+    let state = ApiServerState::new(store, 5_000);
+    let server_cancel = CancellationToken::new();
+    let apiserver_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let apiserver_addr = serve_tcp(apiserver_listener, state, server_cancel.clone())
+        .await
+        .expect("serve");
+    let server_url = format!("http://{apiserver_addr}");
+
+    // 3. Configure daemon with auto_discover_models = true and one supplemented model ("configured-only-model" + "configured-supplement-model")
+    let mut cfg = make_daemon_cfg(
+        "node_autodiscover",
+        &server_url,
+        vec![],
+        tmp.path().join("node_autodiscover"),
+    );
+    cfg.auto_discover_models = true;
+    cfg.default_model = Some("configured-supplement-model".to_string());
+    cfg.models.insert(
+        "configured-supplement-model".to_string(),
+        LocalModelConfig {
+            base_url: format!("http://{mock_addr}"),
+            api_key: Some("sk-test".to_string()),
+            api_key_env: None,
+            extra_headers: BTreeMap::new(),
+            default_temperature: Some(0.42),
+            default_max_output_tokens: Some(4096),
+        },
+    );
+    cfg.models.insert(
+        "configured-only-model".to_string(),
+        LocalModelConfig {
+            base_url: format!("http://{mock_addr}"),
+            api_key: Some("sk-test".to_string()),
+            api_key_env: None,
+            extra_headers: BTreeMap::new(),
+            default_temperature: Some(0.1),
+            default_max_output_tokens: Some(1024),
+        },
+    );
+
+    let seen_inputs = Arc::new(Mutex::new(Vec::new()));
+    let daemon_cancel = CancellationToken::new();
+    let daemon = AgentDaemon::new(cfg).with_model_backend(Arc::new(QueueModelBackend {
+        tag: "autodiscover".to_string(),
+        seen_inputs: seen_inputs.clone(),
+    }));
+    daemon
+        .start(daemon_cancel.clone())
+        .await
+        .expect("start daemon");
+
+    // 4. Verify node registration in apiserver includes BOTH discovered models and configured supplement models
+    let client = RagentsClient::new(&server_url);
+    let nodes = client.list_nodes().await.expect("list nodes");
+    assert_eq!(nodes.len(), 1);
+    let supported = &nodes[0].status.supported_models;
+    assert!(supported.contains(&"discovered-model-alpha".to_string()));
+    assert!(supported.contains(&"discovered-model-beta".to_string()));
+    assert!(supported.contains(&"configured-supplement-model".to_string()));
+    assert!(supported.contains(&"configured-only-model".to_string()));
+
+    // 5. Verify a session requesting "discovered-model-alpha" is scheduled and executed cleanly
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: None,
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Floating {
+                    node_selector: BTreeMap::new(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("discovered-model-alpha")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("hello discovered model")],
+                model_override: None,
+            }),
+        })
+        .await
+        .expect("create session on discovered model");
+
+    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let mut completed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Some(act) = client.get_activation(&act_id).await.unwrap() {
+            if act.status.phase == ActivationPhase::Succeeded {
+                completed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        completed,
+        "activation on discovered model must be scheduled and succeed"
+    );
+
+    daemon_cancel.cancel();
+    server_cancel.cancel();
+    mock_cancel.cancel();
 }

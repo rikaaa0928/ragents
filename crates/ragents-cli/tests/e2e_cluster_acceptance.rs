@@ -143,6 +143,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
         default_model: Some("gpt-4.1".to_string()),
         temp_root_dir: tmp.path().join("daemon_tmp"),
         labels: BTreeMap::new(),
+        auto_discover_models: false,
         models,
         extensions: vec![ExtensionSpec {
             name: "file_editor".to_string(),

@@ -77,6 +77,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             workdir,
             prompt,
             model,
+            auto_discover_models,
         } => {
             let store = SqliteStore::open(&db)?;
             let exts = build_apiserver_extensions(&auth_token, authn_wasm, authn_config)?;
@@ -93,6 +94,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             d_cfg.server_url = local_server_url.clone();
             if d_cfg.auth_token.is_none() {
                 d_cfg.auth_token = auth_token.clone();
+            }
+            if let Some(adm) = auto_discover_models {
+                d_cfg.auto_discover_models = adm;
             }
             let registered_node_id = d_cfg.node_id.clone();
 
@@ -178,7 +182,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             cancel.cancel();
             Ok(())
         }
-        Commands::Daemon { config, node_id } => {
+        Commands::Daemon {
+            config,
+            node_id,
+            auto_discover_models,
+        } => {
             let mut d_cfg = match config {
                 Some(path) => DaemonConfig::load_from_file(path)?,
                 None => DaemonConfig::default_local(NodeId::new(&node_id), &server_url),
@@ -188,6 +196,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
             if auth_token.is_some() {
                 d_cfg.auth_token = auth_token;
+            }
+            if let Some(adm) = auto_discover_models {
+                d_cfg.auto_discover_models = adm;
             }
             let cancel = CancellationToken::new();
             let daemon = AgentDaemon::new(d_cfg);

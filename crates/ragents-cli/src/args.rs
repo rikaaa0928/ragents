@@ -48,6 +48,9 @@ pub enum Commands {
         prompt: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// Override automatic `/v1/models` discovery on the local daemon (default: true)
+        #[arg(long)]
+        auto_discover_models: Option<bool>,
     },
     /// Run standalone control-plane api-server
     Apiserver {
@@ -70,6 +73,9 @@ pub enum Commands {
         config: Option<PathBuf>,
         #[arg(long, default_value = "node_local")]
         node_id: String,
+        /// Override automatic `/v1/models` discovery on the daemon (default: true)
+        #[arg(long)]
+        auto_discover_models: Option<bool>,
     },
     /// Inspect cluster nodes and their supported models
     Node {
