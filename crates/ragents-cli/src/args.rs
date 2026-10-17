@@ -34,6 +34,12 @@ pub enum Commands {
         node_id: String,
         #[arg(long)]
         daemon_config: Option<PathBuf>,
+        /// Optional WASM Authn plugin path (`ragent_authn_extension.wasm`) for api-server
+        #[arg(long)]
+        authn_wasm: Option<PathBuf>,
+        /// Optional JSON config for the Authn WASM plugin
+        #[arg(long)]
+        authn_config: Option<String>,
         /// Optional working directory for Pinned one-shot run
         #[arg(long)]
         workdir: Option<PathBuf>,
@@ -51,6 +57,12 @@ pub enum Commands {
         db: PathBuf,
         #[arg(long, default_value_t = DEFAULT_LEASE_TTL_MS)]
         lease_ttl_ms: u64,
+        /// Optional WASM Authn plugin path (`ragent_authn_extension.wasm`)
+        #[arg(long)]
+        authn_wasm: Option<PathBuf>,
+        /// Optional JSON config for the Authn WASM plugin
+        #[arg(long)]
+        authn_config: Option<String>,
     },
     /// Run standalone node agent-daemon (kubelet)
     Daemon {

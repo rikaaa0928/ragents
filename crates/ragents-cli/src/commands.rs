@@ -6,14 +6,53 @@ use crate::helpers::{
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use openresponses_rust::Item;
-use ragents_apiserver::{serve_tcp, ApiServerState, SqliteStore, DEFAULT_LEASE_TTL_MS};
+use ragents_apiserver::{
+    serve_tcp, ApiServerExtensions, ApiServerState, AuthnPluginSpec, ConfiguredAuthnPlugin,
+    SqliteStore, StaticTokenAuthnPlugin, DEFAULT_LEASE_TTL_MS,
+};
 use ragents_client::RagentsClient;
 use ragents_core::run_subprocess_worker;
 use ragents_daemon::{AgentDaemon, DaemonConfig};
 use ragents_protocol::*;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+
+fn build_apiserver_extensions(
+    auth_token: &Option<String>,
+    authn_wasm: Option<PathBuf>,
+    authn_config: Option<String>,
+) -> Result<ApiServerExtensions> {
+    let mut exts = ApiServerExtensions::new();
+    if let Some(wasm_path) = authn_wasm {
+        let cfg_val = match authn_config {
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|e| anyhow!("invalid --authn-config JSON: {e}"))?,
+            None => match auth_token {
+                Some(tok) => serde_json::json!({ "token": tok }),
+                None => serde_json::json!({}),
+            },
+        };
+        let plugin = ConfiguredAuthnPlugin::new(AuthnPluginSpec {
+            id: "wasm-authn".to_string(),
+            driver: ExtensionDriverConfig::Wasm {
+                path: wasm_path,
+                allowed_dirs: vec![],
+            },
+            scopes: vec![AuthScope::ClientHttp, AuthScope::DaemonTunnel],
+            timeout_ms: 2000,
+            config: cfg_val,
+        });
+        exts.add_authn(Arc::new(plugin));
+    } else if let Some(ref tok) = auth_token {
+        if !tok.trim().is_empty() {
+            exts.add_authn(Arc::new(StaticTokenAuthnPlugin::new(tok.clone())));
+        }
+    }
+    Ok(exts)
+}
 
 pub async fn run_cli(cli: Cli) -> Result<()> {
     let explicit_server = cli
@@ -33,12 +72,15 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             db,
             node_id,
             daemon_config,
+            authn_wasm,
+            authn_config,
             workdir,
             prompt,
             model,
         } => {
             let store = SqliteStore::open(&db)?;
-            let state = ApiServerState::new(store, DEFAULT_LEASE_TTL_MS);
+            let exts = build_apiserver_extensions(&auth_token, authn_wasm, authn_config)?;
+            let state = ApiServerState::new(store, DEFAULT_LEASE_TTL_MS).with_extensions(exts);
             let cancel = CancellationToken::new();
             let listener = TcpListener::bind(&bind).await?;
             let addr = serve_tcp(listener, state, cancel.clone()).await?;
@@ -49,6 +91,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 None => DaemonConfig::default_local(NodeId::new(&node_id), &local_server_url),
             };
             d_cfg.server_url = local_server_url.clone();
+            if d_cfg.auth_token.is_none() {
+                d_cfg.auth_token = auth_token.clone();
+            }
             let registered_node_id = d_cfg.node_id.clone();
 
             let daemon = AgentDaemon::new(d_cfg);
@@ -60,7 +105,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             );
 
             if let Some(prompt_text) = prompt {
-                let up_client = RagentsClient::new(&local_server_url);
+                let up_client =
+                    RagentsClient::new(&local_server_url).with_auth_token(auth_token.clone());
                 let scheduling = match workdir {
                     Some(w) => {
                         let abs_w = if w.is_absolute() {
@@ -118,9 +164,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             bind,
             db,
             lease_ttl_ms,
+            authn_wasm,
+            authn_config,
         } => {
             let store = SqliteStore::open(&db)?;
-            let state = ApiServerState::new(store, lease_ttl_ms);
+            let exts = build_apiserver_extensions(&auth_token, authn_wasm, authn_config)?;
+            let state = ApiServerState::new(store, lease_ttl_ms).with_extensions(exts);
             let cancel = CancellationToken::new();
             let listener = TcpListener::bind(&bind).await?;
             let addr = serve_tcp(listener, state, cancel.clone()).await?;

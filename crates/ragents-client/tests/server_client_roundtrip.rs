@@ -472,3 +472,97 @@ async fn test_apiserver_authn_authz_multitenant_isolation_and_mutating_validatin
 
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_wasm_authn_extension_and_static_token_authn() {
+    use ragents_apiserver::{AuthnPluginSpec, ConfiguredAuthnPlugin};
+    use ragents_client::connect_daemon_tunnel_with_token;
+    use std::path::PathBuf;
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let authn_wasm = manifest_dir
+        .join("../../extensions/authn/target/wasm32-wasip2/release/ragent_authn_extension.wasm");
+    assert!(
+        authn_wasm.exists(),
+        "ragent_authn_extension.wasm must be built"
+    );
+
+    let store = SqliteStore::open_in_memory().unwrap();
+    let mut exts = ragents_apiserver::ApiServerExtensions::new();
+    exts.add_authn(std::sync::Arc::new(ConfiguredAuthnPlugin::new(
+        AuthnPluginSpec {
+            id: "wasm-authn".into(),
+            driver: ExtensionDriverConfig::Wasm {
+                path: authn_wasm,
+                allowed_dirs: vec![],
+            },
+            scopes: vec![AuthScope::ClientHttp, AuthScope::DaemonTunnel],
+            timeout_ms: 2000,
+            config: serde_json::json!({
+                "tokens": [
+                    {
+                        "token": "sk-client-only",
+                        "subject": "chatroom-server",
+                        "scopes": ["client_http"]
+                    },
+                    {
+                        "token": "sk-daemon-only",
+                        "subject": "node-vps",
+                        "scopes": ["daemon_tunnel"]
+                    }
+                ]
+            }),
+        },
+    )));
+
+    let state = ApiServerState::new(store, 5000).with_extensions(exts);
+    let cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = serve_tcp(listener, state, cancel.clone()).await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    // 1. Unauthenticated client request is rejected with 401
+    let anon_client = RagentsClient::new(&base_url);
+    assert!(anon_client.list_nodes().await.is_err());
+
+    // 2. Daemon-only token used on ClientHttp is rejected with 401
+    let wrong_scope_client =
+        RagentsClient::new(&base_url).with_auth_token(Some("sk-daemon-only".into()));
+    assert!(wrong_scope_client.list_nodes().await.is_err());
+
+    // 3. Client-only token succeeds on ClientHttp
+    let valid_client = RagentsClient::new(&base_url).with_auth_token(Some("sk-client-only".into()));
+    let nodes = valid_client.list_nodes().await.expect("valid client authn");
+    assert!(nodes.is_empty());
+
+    // 4. Client-only token used on DaemonTunnel is rejected, while daemon-only token succeeds
+    let ws_url = valid_client.ws_tunnel_url();
+    assert!(
+        connect_daemon_tunnel_with_token(&ws_url, Some("sk-client-only"))
+            .await
+            .is_err()
+    );
+    let (tunnel, _rx) = connect_daemon_tunnel_with_token(&ws_url, Some("sk-daemon-only"))
+        .await
+        .expect("valid daemon tunnel authn");
+    let (_, _) = tunnel
+        .register_node(
+            NodeId::new("node_vps"),
+            "vps".into(),
+            "linux".into(),
+            "x86_64".into(),
+            BTreeMap::new(),
+            vec!["gemini-3.8-flash".into()],
+            Some("gemini-3.8-flash".into()),
+            vec![],
+            2,
+        )
+        .await
+        .unwrap();
+
+    let nodes_after = valid_client.list_nodes().await.unwrap();
+    assert_eq!(nodes_after.len(), 1);
+    assert_eq!(nodes_after[0].metadata.id, "node_vps");
+
+    cancel.cancel();
+}
