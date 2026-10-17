@@ -173,6 +173,31 @@ fn handle_agent_prepare(mut draft: serde_json::Value) -> Result<String, String> 
             ));
         }
         prompt_additions.push_str("</available_skills>\n</skills>");
+
+        let tools = draft
+            .get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or("agent.prepare payload has no tools array")?;
+
+        tools.push(serde_json::json!({
+            "enabled": true,
+            "name": "load_skill",
+            "description": "Load the full instructions (SKILL.md) or a supporting file from an installed agent skill listed in <available_skills>.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact name of the skill from <available_skills>"
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "Optional relative file path within the skill directory (defaults to 'SKILL.md')"
+                    }
+                },
+                "required": ["name"]
+            }
+        }));
     }
 
     if !prompt_additions.is_empty() {
@@ -184,31 +209,6 @@ fn handle_agent_prepare(mut draft: serde_json::Value) -> Result<String, String> 
             draft["system_prompt"] = serde_json::Value::String(format!("{sys}{prompt_additions}"));
         }
     }
-
-    let tools = draft
-        .get_mut("tools")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or("agent.prepare payload has no tools array")?;
-
-    tools.push(serde_json::json!({
-        "enabled": true,
-        "name": "load_skill",
-        "description": "Load the full instructions (SKILL.md) or a supporting file from an installed agent skill.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Name of the skill from <available_skills> (e.g. 'find-skills', 'agent-browser')"
-                },
-                "file": {
-                    "type": "string",
-                    "description": "Optional relative file path within the skill directory (defaults to 'SKILL.md')"
-                }
-            },
-            "required": ["name"]
-        }
-    }));
 
     Ok(serde_json::json!({"action": "continue", "payload": draft}).to_string())
 }
