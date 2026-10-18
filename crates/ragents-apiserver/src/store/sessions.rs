@@ -41,7 +41,10 @@ impl SqliteStore {
             }
 
             let bound_node_id = match &req.spec.scheduling {
-                SchedulingMode::Pinned { node_id, .. } => {
+                SchedulingMode::Pinned {
+                    node_id,
+                    workspace_path,
+                } => {
                     if let Some(node) = Self::load_node_in_tx(&tx, node_id)? {
                         if let Some(ref model_spec) = req.spec.model {
                             if !node.status.supported_models.contains(&model_spec.name) {
@@ -51,6 +54,20 @@ impl SqliteStore {
                                     supported: node.status.supported_models,
                                 });
                             }
+                        }
+                        if !node.status.allowed_workspace_dirs.is_empty()
+                            && !is_workspace_path_allowed(
+                                workspace_path,
+                                &node.status.allowed_workspace_dirs,
+                            )
+                        {
+                            return Err(StoreError::Validation(
+                                ProtocolValidationError::DisallowedWorkspacePath {
+                                    node_id: node_id.to_string(),
+                                    workspace_path: workspace_path.display().to_string(),
+                                    allowed: node.status.allowed_workspace_dirs,
+                                },
+                            ));
                         }
                     }
                     Some(node_id.clone())

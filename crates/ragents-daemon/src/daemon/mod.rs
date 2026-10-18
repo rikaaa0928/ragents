@@ -120,7 +120,7 @@ impl AgentDaemon {
         let arch = std::env::consts::ARCH.to_string();
 
         let (lease_ttl_ms, _rv) = tunnel
-            .register_node(
+            .register_node_with_workspace_dirs(
                 self.config.node_id.clone(),
                 hostname,
                 os,
@@ -129,6 +129,7 @@ impl AgentDaemon {
                 self.effective_supported_models(),
                 self.effective_default_model(),
                 self.config.installed_extension_names(),
+                self.config.effective_allowed_workspace_dir_strings(),
                 self.config.max_concurrent_runners,
             )
             .await?;
@@ -271,7 +272,7 @@ impl AgentDaemon {
                             let os = std::env::consts::OS.to_string();
                             let arch = std::env::consts::ARCH.to_string();
                             if new_tunnel
-                                .register_node(
+                                .register_node_with_workspace_dirs(
                                     daemon.config.node_id.clone(),
                                     hostname,
                                     os,
@@ -280,6 +281,7 @@ impl AgentDaemon {
                                     daemon.effective_supported_models(),
                                     daemon.effective_default_model(),
                                     daemon.config.installed_extension_names(),
+                                    daemon.config.effective_allowed_workspace_dir_strings(),
                                     daemon.config.max_concurrent_runners,
                                 )
                                 .await

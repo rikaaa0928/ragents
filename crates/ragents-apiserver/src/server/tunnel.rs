@@ -111,6 +111,7 @@ fn handle_daemon_message(
             supported_models,
             default_model,
             installed_extensions,
+            allowed_workspace_dirs,
             max_concurrent_runners,
         } => {
             state
@@ -120,7 +121,18 @@ fn handle_daemon_message(
                 .insert(node_id.clone(), out_tx.clone());
             *registered_node_id = Some(node_id.clone());
 
-            match state.store.register_node(
+            let effective_dirs = if allowed_workspace_dirs.is_empty() {
+                let mut d = vec!["/tmp".to_string()];
+                let sys_tmp = std::env::temp_dir().to_string_lossy().to_string();
+                if !d.contains(&sys_tmp) {
+                    d.push(sys_tmp);
+                }
+                d
+            } else {
+                allowed_workspace_dirs
+            };
+
+            match state.store.register_node_with_workspace_dirs(
                 node_id.clone(),
                 hostname,
                 os,
@@ -129,6 +141,7 @@ fn handle_daemon_message(
                 supported_models,
                 default_model,
                 installed_extensions,
+                effective_dirs,
                 max_concurrent_runners,
                 state.lease_ttl_ms,
             ) {

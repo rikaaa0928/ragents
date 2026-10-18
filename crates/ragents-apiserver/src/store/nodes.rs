@@ -19,6 +19,41 @@ impl SqliteStore {
         max_concurrent_runners: u32,
         lease_ttl_ms: u64,
     ) -> Result<(Node, Vec<ScheduledDispatch>), StoreError> {
+        let mut default_dirs = vec!["/tmp".to_string()];
+        let sys_tmp = std::env::temp_dir().to_string_lossy().to_string();
+        if !default_dirs.contains(&sys_tmp) {
+            default_dirs.push(sys_tmp);
+        }
+        self.register_node_with_workspace_dirs(
+            node_id,
+            hostname,
+            os,
+            arch,
+            labels,
+            supported_models,
+            default_model,
+            installed_extensions,
+            default_dirs,
+            max_concurrent_runners,
+            lease_ttl_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_node_with_workspace_dirs(
+        &self,
+        node_id: NodeId,
+        hostname: String,
+        os: String,
+        arch: String,
+        labels: BTreeMap<String, String>,
+        supported_models: Vec<String>,
+        default_model: Option<String>,
+        installed_extensions: Vec<String>,
+        allowed_workspace_dirs: Vec<String>,
+        max_concurrent_runners: u32,
+        lease_ttl_ms: u64,
+    ) -> Result<(Node, Vec<ScheduledDispatch>), StoreError> {
         if !node_id.is_safe_identifier() {
             return Err(StoreError::Validation(
                 ProtocolValidationError::InvalidIdentifier(node_id.to_string()),
@@ -64,6 +99,7 @@ impl SqliteStore {
                 supported_models,
                 default_model,
                 installed_extensions,
+                allowed_workspace_dirs,
                 max_concurrent_runners: max_concurrent_runners.max(1),
                 active_runners: active_count,
                 last_heartbeat_at: now,

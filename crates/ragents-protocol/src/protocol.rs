@@ -125,6 +125,8 @@ pub enum DaemonToServerMessage {
         default_model: Option<String>,
         #[serde(default)]
         installed_extensions: Vec<String>,
+        #[serde(default)]
+        allowed_workspace_dirs: Vec<String>,
         max_concurrent_runners: u32,
     },
     Heartbeat {

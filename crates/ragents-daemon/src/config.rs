@@ -23,6 +23,14 @@ pub enum DaemonConfigError {
     },
     #[error("missing api_key for model '{0}'")]
     MissingApiKey(String),
+    #[error(
+        "workspace_path '{workspace_path}' is not under any allowed workspace directory on node '{node_id}' (allowed: {allowed:?})"
+    )]
+    DisallowedWorkspacePath {
+        node_id: String,
+        workspace_path: String,
+        allowed: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +98,10 @@ pub struct DaemonConfig {
     pub default_model: Option<String>,
     #[serde(default = "default_temp_root")]
     pub temp_root_dir: PathBuf,
+    /// Allowed parent directories for Pinned session `workspace_path` (e.g. `["/a/b/c", "/a/b/d"]`).
+    /// `/tmp` (and system temp dir) is always included by default.
+    #[serde(default = "default_allowed_workspace_dirs")]
+    pub allowed_workspace_dirs: Vec<PathBuf>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     /// Automatically query provider `/v1/models` endpoint(s) to discover available models,
@@ -120,6 +132,37 @@ fn default_system_prompt() -> String {
 
 fn default_temp_root() -> PathBuf {
     std::env::temp_dir().join("ragents")
+}
+
+pub fn default_allowed_workspace_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("/tmp")];
+    let sys_tmp = std::env::temp_dir();
+    if !dirs.contains(&sys_tmp) {
+        dirs.push(sys_tmp);
+    }
+    dirs
+}
+
+pub fn parse_workspace_dirs_csv(raw: &str) -> Vec<PathBuf> {
+    let mut dirs = default_allowed_workspace_dirs();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    dirs
+}
+
+fn ensure_default_tmp_in_allowed_dirs(dirs: &mut Vec<PathBuf>) {
+    for d in default_allowed_workspace_dirs() {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
 }
 
 fn default_auto_discover_models() -> bool {
@@ -178,6 +221,12 @@ impl DaemonConfig {
                 _ => {}
             }
         }
+        if let Ok(raw_dirs) = std::env::var("RAGENTS_ALLOWED_WORKSPACE_DIRS") {
+            if !raw_dirs.trim().is_empty() {
+                cfg.allowed_workspace_dirs = parse_workspace_dirs_csv(&raw_dirs);
+            }
+        }
+        ensure_default_tmp_in_allowed_dirs(&mut cfg.allowed_workspace_dirs);
         Ok(cfg)
     }
 
@@ -201,6 +250,12 @@ impl DaemonConfig {
             },
         );
 
+        let allowed_workspace_dirs = std::env::var("RAGENTS_ALLOWED_WORKSPACE_DIRS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| parse_workspace_dirs_csv(&s))
+            .unwrap_or_else(default_allowed_workspace_dirs);
+
         Self {
             node_id: node_id.into(),
             server_url: server_url.into(),
@@ -211,12 +266,42 @@ impl DaemonConfig {
             default_system_prompt: default_system_prompt(),
             default_model: Some(model_name),
             temp_root_dir: default_temp_root(),
+            allowed_workspace_dirs,
             labels: BTreeMap::new(),
             auto_discover_models: default_auto_discover_models(),
             models,
             extensions: Vec::new(),
             interceptors: Vec::new(),
             default_permissions: PermissionPolicyLayer::default(),
+        }
+    }
+
+    pub fn effective_allowed_workspace_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = self.allowed_workspace_dirs.clone();
+        ensure_default_tmp_in_allowed_dirs(&mut dirs);
+        if !dirs.contains(&self.temp_root_dir) {
+            dirs.push(self.temp_root_dir.clone());
+        }
+        dirs
+    }
+
+    pub fn effective_allowed_workspace_dir_strings(&self) -> Vec<String> {
+        self.effective_allowed_workspace_dirs()
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect()
+    }
+
+    pub fn validate_workspace_path(&self, workspace_path: &Path) -> Result<(), DaemonConfigError> {
+        let allowed = self.effective_allowed_workspace_dirs();
+        if is_workspace_path_allowed(workspace_path, &allowed) {
+            Ok(())
+        } else {
+            Err(DaemonConfigError::DisallowedWorkspacePath {
+                node_id: self.node_id.to_string(),
+                workspace_path: workspace_path.display().to_string(),
+                allowed: self.effective_allowed_workspace_dir_strings(),
+            })
         }
     }
 
@@ -364,6 +449,10 @@ impl DaemonConfig {
         session: &Session,
         activation: &Activation,
     ) -> Result<(ConfigRevision, PermissionSnapshot, ModelEndpointConfig), DaemonConfigError> {
+        if let SchedulingMode::Pinned { workspace_path, .. } = &session.spec.scheduling {
+            self.validate_workspace_path(workspace_path)?;
+        }
+
         let requested_model_name = activation
             .spec
             .model_override

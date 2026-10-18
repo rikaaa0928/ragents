@@ -51,6 +51,9 @@ pub enum Commands {
         /// Override automatic `/v1/models` discovery on the local daemon (default: true)
         #[arg(long)]
         auto_discover_models: Option<bool>,
+        /// Comma-separated allowed parent directories for session `workspace_path` (e.g. `/a/b/c,/a/b/d`, `/tmp` is always included)
+        #[arg(long)]
+        allowed_workspace_dirs: Option<String>,
     },
     /// Run standalone control-plane api-server
     Apiserver {
@@ -76,6 +79,9 @@ pub enum Commands {
         /// Override automatic `/v1/models` discovery on the daemon (default: true)
         #[arg(long)]
         auto_discover_models: Option<bool>,
+        /// Comma-separated allowed parent directories for session `workspace_path` (e.g. `/a/b/c,/a/b/d`, `/tmp` is always included)
+        #[arg(long)]
+        allowed_workspace_dirs: Option<String>,
     },
     /// Inspect cluster nodes and their supported models
     Node {

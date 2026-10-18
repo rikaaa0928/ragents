@@ -12,7 +12,7 @@ use ragents_apiserver::{
 };
 use ragents_client::RagentsClient;
 use ragents_core::run_subprocess_worker;
-use ragents_daemon::{AgentDaemon, DaemonConfig};
+use ragents_daemon::{parse_workspace_dirs_csv, AgentDaemon, DaemonConfig};
 use ragents_protocol::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -78,6 +78,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             prompt,
             model,
             auto_discover_models,
+            allowed_workspace_dirs,
         } => {
             let store = SqliteStore::open(&db)?;
             let exts = build_apiserver_extensions(&auth_token, authn_wasm, authn_config)?;
@@ -97,6 +98,18 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
             if let Some(adm) = auto_discover_models {
                 d_cfg.auto_discover_models = adm;
+            }
+            if let Some(ref raw_dirs) = allowed_workspace_dirs {
+                d_cfg.allowed_workspace_dirs = parse_workspace_dirs_csv(raw_dirs);
+            } else if let Some(ref w) = workdir {
+                let abs_w = if w.is_absolute() {
+                    w.clone()
+                } else {
+                    std::env::current_dir()?.join(w)
+                };
+                if !d_cfg.allowed_workspace_dirs.contains(&abs_w) {
+                    d_cfg.allowed_workspace_dirs.push(abs_w);
+                }
             }
             let registered_node_id = d_cfg.node_id.clone();
 
@@ -186,6 +199,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             config,
             node_id,
             auto_discover_models,
+            allowed_workspace_dirs,
         } => {
             let mut d_cfg = match config {
                 Some(path) => DaemonConfig::load_from_file(path)?,
@@ -199,6 +213,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
             if let Some(adm) = auto_discover_models {
                 d_cfg.auto_discover_models = adm;
+            }
+            if let Some(ref raw_dirs) = allowed_workspace_dirs {
+                d_cfg.allowed_workspace_dirs = parse_workspace_dirs_csv(raw_dirs);
             }
             let cancel = CancellationToken::new();
             let daemon = AgentDaemon::new(d_cfg);

@@ -5,7 +5,9 @@ use ragents_apiserver::{serve_tcp, ApiServerState, SqliteStore, DEFAULT_LEASE_TT
 use ragents_cli::build_scheduling_mode;
 use ragents_client::RagentsClient;
 use ragents_core::make_openresponses_resource;
-use ragents_daemon::{AgentDaemon, DaemonConfig, ExecutorMode, LocalModelConfig};
+use ragents_daemon::{
+    default_allowed_workspace_dirs, AgentDaemon, DaemonConfig, ExecutorMode, LocalModelConfig,
+};
 use ragents_protocol::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -142,6 +144,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
         default_system_prompt: "Default node system prompt.".to_string(),
         default_model: Some("gpt-4.1".to_string()),
         temp_root_dir: tmp.path().join("daemon_tmp"),
+        allowed_workspace_dirs: default_allowed_workspace_dirs(),
         labels: BTreeMap::new(),
         auto_discover_models: false,
         models,

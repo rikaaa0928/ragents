@@ -71,6 +71,7 @@ fn make_daemon_cfg(
         default_system_prompt: format!("System prompt from {node_id}"),
         default_model: models.first().map(|s| s.to_string()),
         temp_root_dir: temp_root,
+        allowed_workspace_dirs: default_allowed_workspace_dirs(),
         labels: BTreeMap::new(),
         auto_discover_models: false,
         models: model_map,
@@ -1671,3 +1672,140 @@ async fn test_daemon_auto_discover_models_from_v1_models_endpoint() {
     server_cancel.cancel();
     mock_cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SqliteStore::open_in_memory().expect("open store");
+    let state = ApiServerState::new(store.clone(), 5_000);
+    let server_cancel = CancellationToken::new();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = serve_tcp(listener, state, server_cancel.clone())
+        .await
+        .expect("serve");
+    let server_url = format!("http://{addr}");
+    let client = RagentsClient::new(&server_url);
+
+    let mut cfg = make_daemon_cfg(
+        "node_ws_guard",
+        &server_url,
+        vec!["gpt-4.1"],
+        tmp.path().join("daemon_tmp"),
+    );
+    cfg.executor_mode = ExecutorMode::InProcess;
+    // Configure `/a/b/c,/a/b/d` — `/tmp` must also be included automatically by default!
+    cfg.allowed_workspace_dirs = parse_workspace_dirs_csv("/a/b/c,/a/b/d");
+
+    // 1. Direct unit validation checks on DaemonConfig
+    assert!(
+        cfg.validate_workspace_path(std::path::Path::new("/a/b/c/agent_1"))
+            .is_ok(),
+        "subdirectory of /a/b/c must be allowed"
+    );
+    assert!(
+        cfg.validate_workspace_path(std::path::Path::new("/a/b/d/project/sub"))
+            .is_ok(),
+        "subdirectory of /a/b/d must be allowed"
+    );
+    assert!(
+        cfg.validate_workspace_path(std::path::Path::new("/tmp/my_agent_ws"))
+            .is_ok(),
+        "/tmp must be allowed by default"
+    );
+    assert!(
+        cfg.validate_workspace_path(std::path::Path::new("/a/b/e/forbidden"))
+            .is_err(),
+        "/a/b/e must be rejected"
+    );
+    assert!(
+        cfg.validate_workspace_path(std::path::Path::new("/a/b/c/../e/escape"))
+            .is_err(),
+        ".. path traversal escaping /a/b/c must be rejected"
+    );
+    assert!(
+        cfg.validate_workspace_path(std::path::Path::new("/a/b/cde"))
+            .is_err(),
+        "sibling prefix /a/b/cde must not match /a/b/c"
+    );
+
+    // 2. Start daemon and verify `create_session` on apiserver rejects disallowed `workspace_path`
+    let daemon_cancel = CancellationToken::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let daemon = AgentDaemon::new(cfg).with_model_backend(Arc::new(QueueModelBackend {
+        tag: "ws_guard".to_string(),
+        seen_inputs: seen,
+    }));
+    daemon.start(daemon_cancel.clone()).await.expect("start daemon");
+
+    let nodes = client.list_nodes().await.expect("list nodes");
+    assert_eq!(nodes.len(), 1);
+    assert!(nodes[0]
+        .status
+        .allowed_workspace_dirs
+        .contains(&"/a/b/c".to_string()));
+    assert!(nodes[0]
+        .status
+        .allowed_workspace_dirs
+        .contains(&"/a/b/d".to_string()));
+    assert!(nodes[0]
+        .status
+        .allowed_workspace_dirs
+        .contains(&"/tmp".to_string()));
+
+    // Disallowed workspace `/var/forbidden_ws` must be rejected at session creation time
+    let bad_res = client
+        .create_session(CreateSessionRequest {
+            session_id: None,
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_ws_guard"),
+                    workspace_path: std::path::PathBuf::from("/var/forbidden_ws"),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+            },
+            initial_activation: None,
+        })
+        .await;
+    assert!(
+        bad_res.is_err(),
+        "creating a session with workspace outside allowed_workspace_dirs must fail"
+    );
+
+    // Allowed workspace under `/tmp` must succeed
+    let ok_res = client
+        .create_session(CreateSessionRequest {
+            session_id: None,
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_ws_guard"),
+                    workspace_path: tmp.path().join("allowed_sub_ws"),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+            },
+            initial_activation: None,
+        })
+        .await;
+    assert!(
+        ok_res.is_ok(),
+        "creating a session under allowed /tmp dir must succeed"
+    );
+
+    daemon_cancel.cancel();
+    server_cancel.cancel();
+}
+

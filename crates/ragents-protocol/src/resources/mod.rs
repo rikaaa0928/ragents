@@ -30,6 +30,14 @@ pub enum ProtocolValidationError {
     EmptyActivationInput,
     #[error("model name cannot be empty when specified")]
     EmptyModelName,
+    #[error(
+        "workspace_path '{workspace_path}' is not under any allowed workspace directory on node '{node_id}' (allowed: {allowed:?})"
+    )]
+    DisallowedWorkspacePath {
+        node_id: String,
+        workspace_path: String,
+        allowed: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

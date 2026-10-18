@@ -96,6 +96,40 @@ impl DaemonTunnelHandle {
         installed_extensions: Vec<String>,
         max_concurrent_runners: u32,
     ) -> Result<(u64, ResourceVersion), ClientError> {
+        let mut default_dirs = vec!["/tmp".to_string()];
+        let sys_tmp = std::env::temp_dir().to_string_lossy().to_string();
+        if !default_dirs.contains(&sys_tmp) {
+            default_dirs.push(sys_tmp);
+        }
+        self.register_node_with_workspace_dirs(
+            node_id,
+            hostname,
+            os,
+            arch,
+            labels,
+            supported_models,
+            default_model,
+            installed_extensions,
+            default_dirs,
+            max_concurrent_runners,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_node_with_workspace_dirs(
+        &self,
+        node_id: NodeId,
+        hostname: String,
+        os: String,
+        arch: String,
+        labels: BTreeMap<String, String>,
+        supported_models: Vec<String>,
+        default_model: Option<String>,
+        installed_extensions: Vec<String>,
+        allowed_workspace_dirs: Vec<String>,
+        max_concurrent_runners: u32,
+    ) -> Result<(u64, ResourceVersion), ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::RegisterNode {
@@ -108,6 +142,7 @@ impl DaemonTunnelHandle {
                 supported_models,
                 default_model,
                 installed_extensions,
+                allowed_workspace_dirs,
                 max_concurrent_runners,
             })
             .await?;
