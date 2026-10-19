@@ -89,15 +89,29 @@ pub fn normalize_and_resolve_workspace_path(path: &std::path::Path) -> std::path
     base
 }
 
+fn strip_macos_private_tmp(p: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(rest) = p.strip_prefix("/private/tmp") {
+        if rest.as_os_str().is_empty() {
+            std::path::PathBuf::from("/tmp")
+        } else {
+            std::path::Path::new("/tmp").join(rest)
+        }
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// Returns `true` if `workspace_path` is equal to or a subdirectory of at least one entry in `allowed_dirs`.
 pub fn is_workspace_path_allowed(
     workspace_path: &std::path::Path,
     allowed_dirs: &[impl AsRef<std::path::Path>],
 ) -> bool {
     let resolved_ws = normalize_and_resolve_workspace_path(workspace_path);
+    let alt_ws = strip_macos_private_tmp(&resolved_ws);
     for dir in allowed_dirs {
         let resolved_dir = normalize_and_resolve_workspace_path(dir.as_ref());
-        if resolved_ws.starts_with(&resolved_dir) {
+        let alt_dir = strip_macos_private_tmp(&resolved_dir);
+        if resolved_ws.starts_with(&resolved_dir) || alt_ws.starts_with(&alt_dir) {
             return true;
         }
     }

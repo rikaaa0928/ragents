@@ -1748,10 +1748,13 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
         .status
         .allowed_workspace_dirs
         .contains(&"/a/b/d".to_string()));
+    let expected_tmp = ragents_protocol::normalize_and_resolve_workspace_path(std::path::Path::new("/tmp"))
+        .to_string_lossy()
+        .to_string();
     assert!(nodes[0]
         .status
         .allowed_workspace_dirs
-        .contains(&"/tmp".to_string()));
+        .contains(&expected_tmp));
 
     // Disallowed workspace `/var/forbidden_ws` must be rejected at session creation time
     let bad_res = client
@@ -1779,7 +1782,7 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
         "creating a session with workspace outside allowed_workspace_dirs must fail"
     );
 
-    // Allowed workspace under `/tmp` must succeed
+    // Allowed workspace under `/tmp` (and `/private/tmp` on macOS) must succeed
     let ok_res = client
         .create_session(CreateSessionRequest {
             session_id: None,
@@ -1787,7 +1790,7 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
             spec: SessionSpec {
                 scheduling: SchedulingMode::Pinned {
                     node_id: NodeId::new("node_ws_guard"),
-                    workspace_path: tmp.path().join("allowed_sub_ws"),
+                    workspace_path: std::path::PathBuf::from("/private/tmp/allowed_sub_ws"),
                 },
                 sources: vec![],
                 producer: None,
@@ -1802,7 +1805,7 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
         .await;
     assert!(
         ok_res.is_ok(),
-        "creating a session under allowed /tmp dir must succeed"
+        "creating a session under allowed /tmp (/private/tmp) dir must succeed"
     );
 
     daemon_cancel.cancel();

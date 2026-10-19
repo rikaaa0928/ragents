@@ -79,8 +79,19 @@ impl DaemonTunnelHandle {
             return Err(ClientError::Tunnel("tunnel write channel closed".into()));
         }
 
-        rx.await
-            .map_err(|_| ClientError::Tunnel("tunnel response channel dropped".into()))
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_)) => Err(ClientError::Tunnel(
+                "tunnel response channel dropped".into(),
+            )),
+            Err(_) => {
+                pending
+                    .lock()
+                    .expect("pending mutex poisoned")
+                    .remove(&req_id);
+                Err(ClientError::Tunnel("tunnel call timed out".into()))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -135,12 +135,7 @@ fn default_temp_root() -> PathBuf {
 }
 
 pub fn default_allowed_workspace_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("/tmp")];
-    let sys_tmp = std::env::temp_dir();
-    if !dirs.contains(&sys_tmp) {
-        dirs.push(sys_tmp);
-    }
-    dirs
+    vec![ragents_protocol::normalize_and_resolve_workspace_path(Path::new("/tmp"))]
 }
 
 pub fn parse_workspace_dirs_csv(raw: &str) -> Vec<PathBuf> {
@@ -148,7 +143,7 @@ pub fn parse_workspace_dirs_csv(raw: &str) -> Vec<PathBuf> {
     for part in raw.split(',') {
         let trimmed = part.trim();
         if !trimmed.is_empty() {
-            let p = PathBuf::from(trimmed);
+            let p = ragents_protocol::normalize_and_resolve_workspace_path(Path::new(trimmed));
             if !dirs.contains(&p) {
                 dirs.push(p);
             }
@@ -158,11 +153,19 @@ pub fn parse_workspace_dirs_csv(raw: &str) -> Vec<PathBuf> {
 }
 
 fn ensure_default_tmp_in_allowed_dirs(dirs: &mut Vec<PathBuf>) {
+    let mut normalized = Vec::with_capacity(dirs.len() + 1);
     for d in default_allowed_workspace_dirs() {
-        if !dirs.contains(&d) {
-            dirs.push(d);
+        if !normalized.contains(&d) {
+            normalized.push(d);
         }
     }
+    for d in dirs.drain(..) {
+        let resolved = ragents_protocol::normalize_and_resolve_workspace_path(&d);
+        if !normalized.contains(&resolved) {
+            normalized.push(resolved);
+        }
+    }
+    *dirs = normalized;
 }
 
 fn default_auto_discover_models() -> bool {
@@ -279,9 +282,6 @@ impl DaemonConfig {
     pub fn effective_allowed_workspace_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = self.allowed_workspace_dirs.clone();
         ensure_default_tmp_in_allowed_dirs(&mut dirs);
-        if !dirs.contains(&self.temp_root_dir) {
-            dirs.push(self.temp_root_dir.clone());
-        }
         dirs
     }
 
@@ -529,13 +529,38 @@ impl DaemonConfig {
             _ => self.default_system_prompt.clone(),
         };
 
-        // Merge daemon extensions with session extensions (session overrides by name)
+        // Merge daemon extensions with session extensions (session overrides by name,
+        // while resolving non-existent container paths against the daemon's local wasm dir)
+        let local_wasm_dirs: Vec<PathBuf> = self
+            .extensions
+            .iter()
+            .filter_map(|e| Path::new(&e.path).parent().map(|p| p.to_path_buf()))
+            .collect();
         let mut ext_map: BTreeMap<String, ExtensionSpec> = BTreeMap::new();
         for ext in &self.extensions {
             ext_map.insert(ext.name.clone(), ext.clone());
         }
         for ext in &session.spec.extensions {
-            ext_map.insert(ext.name.clone(), ext.clone());
+            let mut merged = ext.clone();
+            if !Path::new(&merged.path).exists() {
+                if let Some(existing) = ext_map.get(&ext.name) {
+                    if Path::new(&existing.path).exists() {
+                        merged.path = existing.path.clone();
+                    }
+                }
+                if !Path::new(&merged.path).exists() {
+                    if let Some(fname) = Path::new(&merged.path).file_name() {
+                        for dir in &local_wasm_dirs {
+                            let cand = dir.join(fname);
+                            if cand.exists() {
+                                merged.path = cand.to_string_lossy().to_string();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            ext_map.insert(merged.name.clone(), merged);
         }
         let effective_extensions: Vec<ExtensionSpec> = ext_map.into_values().collect();
 
