@@ -68,6 +68,11 @@ fn evaluate_path_rules(
     let norm_ws = normalize_path(workspace_root, workspace_root);
     let norm_tmp = normalize_path(session_tmp_dir, workspace_root);
 
+    let is_default_safe = norm_target.starts_with(&norm_ws)
+        || norm_target.starts_with(&norm_tmp)
+        || norm_target.starts_with(Path::new("/tmp"))
+        || norm_target.starts_with(Path::new("/private/tmp"));
+
     if let Some(rule_set) = rules {
         if let Some(ref denies) = rule_set.deny {
             for pattern in denies {
@@ -76,6 +81,9 @@ fn evaluate_path_rules(
                     return PolicyEvalResult::Deny;
                 }
             }
+        }
+        if is_default_safe {
+            return PolicyEvalResult::Allow;
         }
         if let Some(ref allows) = rule_set.allow {
             for pattern in allows {
@@ -94,9 +102,9 @@ fn evaluate_path_rules(
         }
     }
 
-    // Default safe boundary: allow paths inside workspace_root or session_tmp_dir;
-    // paths outside workspace_root default to Ask so the user can interactively approve or deny.
-    if norm_target.starts_with(&norm_ws) || norm_target.starts_with(&norm_tmp) {
+    // Default safe boundary: allow paths inside workspace_root, session_tmp_dir, or /tmp;
+    // paths outside default to Ask so the user can interactively approve or deny.
+    if is_default_safe {
         PolicyEvalResult::Allow
     } else {
         PolicyEvalResult::Ask

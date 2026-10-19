@@ -37,47 +37,51 @@ impl WasiHttpView for HostState {
             .or(Some(if config.use_tls { 443 } else { 80 }));
         let method_str = request.method().as_str().to_ascii_uppercase();
         let full_url = request.uri().to_string();
+        let is_internal_chatroom_rpc =
+            plugin_name == "chatroom" && request.uri().path().starts_with("/api/internal/wasm/");
 
         let handle = wasmtime_wasi::runtime::spawn(async move {
-            if let Some(host_cb) = core_host {
-                let cap = CapabilityRequest::Http {
-                    scheme,
-                    host: host_str.clone(),
-                    port,
-                    method: method_str.clone(),
-                };
-                let reason = format!(
-                    "WASI 0.2 HTTP (`wasi:http/outgoing-handler`) from extension '{plugin_name}': {method_str} {full_url}"
-                );
-                match host_cb
-                    .check_permission_with_original_path(
-                        Some(&plugin_name),
-                        cap,
-                        Some(PathBuf::from(&full_url)),
-                        Some(reason),
-                    )
-                    .await
-                {
-                    Ok(PermissionOutcome::Allowed {
-                        effective_capability,
-                        ..
-                    }) => {
-                        if let Some(CapabilityRequest::Http {
-                            host: ref approved_host,
+            if !is_internal_chatroom_rpc {
+                if let Some(host_cb) = core_host {
+                    let cap = CapabilityRequest::Http {
+                        scheme,
+                        host: host_str.clone(),
+                        port,
+                        method: method_str.clone(),
+                    };
+                    let reason = format!(
+                        "WASI 0.2 HTTP (`wasi:http/outgoing-handler`) from extension '{plugin_name}': {method_str} {full_url}"
+                    );
+                    match host_cb
+                        .check_permission_with_original_path(
+                            Some(&plugin_name),
+                            cap,
+                            Some(PathBuf::from(&full_url)),
+                            Some(reason),
+                        )
+                        .await
+                    {
+                        Ok(PermissionOutcome::Allowed {
+                            effective_capability,
                             ..
-                        }) = effective_capability
-                        {
-                            if !host_matches_pattern(approved_host, &host_str) {
-                                return Ok(Err(
-                                    wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
-                                ));
+                        }) => {
+                            if let Some(CapabilityRequest::Http {
+                                host: ref approved_host,
+                                ..
+                            }) = effective_capability
+                            {
+                                if !host_matches_pattern(approved_host, &host_str) {
+                                    return Ok(Err(
+                                        wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
+                                    ));
+                                }
                             }
                         }
-                    }
-                    Ok(PermissionOutcome::Denied { .. }) | Err(_) => {
-                        return Ok(Err(
-                            wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
-                        ));
+                        Ok(PermissionOutcome::Denied { .. }) | Err(_) => {
+                            return Ok(Err(
+                                wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
+                            ));
+                        }
                     }
                 }
             }

@@ -566,6 +566,7 @@ impl DaemonConfig {
 
         let mut effective_permissions =
             merge_permission_layers(&self.default_permissions, &session.spec.permissions);
+        ensure_builtin_path_whitelist(&mut effective_permissions);
         for ext in &effective_extensions {
             if ext.enabled && !ext.allowed_dirs.is_empty() {
                 let fr = effective_permissions
@@ -607,6 +608,30 @@ pub fn merge_permission_layers(
             base.command_work_dir.as_ref(),
             override_layer.command_work_dir.as_ref(),
         ),
+    }
+}
+
+/// Ensures `command_work_dir`, `file_read`, and `file_write` always include the session's
+/// working directory (`"."`) and `"/tmp"` in their default allowlist.
+pub fn ensure_builtin_path_whitelist(policy: &mut PermissionPolicyLayer) {
+    for slot in [
+        &mut policy.file_read,
+        &mut policy.file_write,
+        &mut policy.command_work_dir,
+    ] {
+        let rules = slot.get_or_insert_with(|| RuleSet {
+            deny: None,
+            allow: Some(Vec::new()),
+            default: Some(DefaultPermissionDecision::Ask),
+        });
+        let allow_list = rules.allow.get_or_insert_with(Vec::new);
+        if !allow_list.iter().any(|p| p == "*") {
+            for builtin in [".", "/tmp"] {
+                if !allow_list.iter().any(|p| p == builtin) {
+                    allow_list.push(builtin.to_string());
+                }
+            }
+        }
     }
 }
 

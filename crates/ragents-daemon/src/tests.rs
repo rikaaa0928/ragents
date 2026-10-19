@@ -71,7 +71,14 @@ fn make_daemon_cfg(
         default_system_prompt: format!("System prompt from {node_id}"),
         default_model: models.first().map(|s| s.to_string()),
         temp_root_dir: temp_root,
-        allowed_workspace_dirs: default_allowed_workspace_dirs(),
+        allowed_workspace_dirs: {
+            let mut dirs = default_allowed_workspace_dirs();
+            let env_tmp = ragents_protocol::normalize_and_resolve_workspace_path(&std::env::temp_dir());
+            if !dirs.contains(&env_tmp) {
+                dirs.push(env_tmp);
+            }
+            dirs
+        },
         labels: BTreeMap::new(),
         auto_discover_models: false,
         models: model_map,
@@ -454,7 +461,7 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
     let server_url = format!("http://{addr}");
     let client = RagentsClient::new(&server_url);
 
-    let base_tmp = std::env::temp_dir().join(format!("ragents-bg-proc-{}", uuid::Uuid::now_v7()));
+    let base_tmp = std::path::PathBuf::from("/tmp").join(format!("ragents-bg-proc-{}", uuid::Uuid::now_v7()));
     let ws_root = base_tmp.join("ws");
     std::fs::create_dir_all(&ws_root).unwrap();
 
@@ -1035,7 +1042,7 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
         }
     }
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("ragents-compact-").tempdir_in("/tmp").unwrap();
     let ws_dir = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_dir).unwrap();
     std::fs::write(

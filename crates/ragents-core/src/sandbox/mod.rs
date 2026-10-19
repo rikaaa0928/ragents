@@ -7,7 +7,7 @@ pub(crate) use violation::{
 };
 
 use crate::host::CoreRunSpec;
-use ragents_protocol::{CapabilityRequest, PermissionPolicyLayer};
+use ragents_protocol::{CapabilityRequest, DefaultPermissionDecision, PermissionPolicyLayer};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -48,6 +48,7 @@ pub struct SandboxState {
     mode: SandboxMode,
     workspace_root: PathBuf,
     session_tmp_dir: PathBuf,
+    restrict_reads: bool,
     writable_paths: Mutex<Vec<PathBuf>>,
     denied_write_paths: Mutex<Vec<PathBuf>>,
     denied_read_paths: Mutex<Vec<PathBuf>>,
@@ -111,6 +112,7 @@ impl SandboxState {
             }
         }
 
+        let mut restrict_reads = false;
         if let Some(ref fr) = policy.file_read {
             if let Some(ref denies) = fr.deny {
                 for pat in denies {
@@ -119,6 +121,11 @@ impl SandboxState {
                     }
                 }
             }
+            let has_wildcard = fr
+                .allow
+                .as_ref()
+                .map(|a| a.iter().any(|p| p == "*"))
+                .unwrap_or(false);
             if let Some(ref allows) = fr.allow {
                 for pat in allows {
                     if pat != "*" {
@@ -126,12 +133,21 @@ impl SandboxState {
                     }
                 }
             }
+            if !has_wildcard
+                && matches!(
+                    fr.default,
+                    Some(DefaultPermissionDecision::Ask | DefaultPermissionDecision::Deny)
+                )
+            {
+                restrict_reads = true;
+            }
         }
 
         Self {
             mode,
             workspace_root: workspace_root.to_path_buf(),
             session_tmp_dir: session_tmp_dir.to_path_buf(),
+            restrict_reads,
             writable_paths: Mutex::new(writable_paths),
             denied_write_paths: Mutex::new(denied_write_paths),
             denied_read_paths: Mutex::new(denied_read_paths),
@@ -314,7 +330,18 @@ impl SandboxState {
                     let combined = format!("{stderr}\n{stdout}");
                     for raw_path in extract_eperm_paths_from_text(&combined) {
                         let req_dir = normalize_violation_to_request_dir(&raw_path);
-                        let cap = CapabilityRequest::FileWrite { path: req_dir };
+                        let is_read_violation = !self.is_path_readable(&raw_path) && raw_path.exists();
+                        let (cap, op) = if is_read_violation {
+                            (
+                                CapabilityRequest::FileRead { path: req_dir },
+                                "file-read-data".to_string(),
+                            )
+                        } else {
+                            (
+                                CapabilityRequest::FileWrite { path: req_dir },
+                                "file-write".to_string(),
+                            )
+                        };
                         if !violations
                             .iter()
                             .any(|v: &SandboxViolation| v.capability == cap)
@@ -322,7 +349,7 @@ impl SandboxState {
                             violations.push(SandboxViolation {
                                 capability: cap,
                                 raw_path,
-                                operation: "file-write".to_string(),
+                                operation: op,
                             });
                         }
                     }
@@ -399,6 +426,7 @@ impl SandboxState {
                 &denied_write,
                 &denied_read,
                 &allowed_read,
+                self.restrict_reads,
                 trace_tag,
             );
             let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
@@ -552,6 +580,7 @@ pub fn build_macos_seatbelt_profile(
     denied_write_paths: &[PathBuf],
     denied_read_paths: &[PathBuf],
     allowed_read_paths: &[PathBuf],
+    restrict_reads: bool,
     trace_tag: &str,
 ) -> String {
     let tag = escape_sbpl(trace_tag);
@@ -581,6 +610,27 @@ pub fn build_macos_seatbelt_profile(
             profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(&p)));
         }
         profile.push_str(")\n");
+    }
+
+    if restrict_reads {
+        profile.push_str(&format!(
+            "(deny file-read-data (with message \"{tag}\")\n\
+               (subpath \"/Users\")\n\
+               (subpath \"/Volumes\")\n\
+               (subpath \"/private/tmp\")\n\
+               (subpath \"/tmp\")\n\
+             )\n"
+        ));
+        let mut readable_all = writable_paths.to_vec();
+        readable_all.extend_from_slice(allowed_read_paths);
+        let expanded_readable = expand_canonical_paths(&readable_all);
+        if !expanded_readable.is_empty() {
+            profile.push_str("(allow file-read-data\n");
+            for p in expanded_readable {
+                profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(&p)));
+            }
+            profile.push_str(")\n");
+        }
     }
 
     let expanded_denied_read = expand_canonical_paths(denied_read_paths);

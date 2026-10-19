@@ -367,7 +367,19 @@ impl ProcessManager {
                     let mut violations = Vec::new();
                     for raw_path in extract_eperm_paths_from_text(&combined) {
                         let req_dir = normalize_violation_to_request_dir(&raw_path);
-                        let cap = CapabilityRequest::FileWrite { path: req_dir };
+                        let is_read_violation =
+                            !sandbox_state.is_path_readable(&raw_path) && raw_path.exists();
+                        let (cap, op) = if is_read_violation {
+                            (
+                                CapabilityRequest::FileRead { path: req_dir },
+                                "file-read-data".to_string(),
+                            )
+                        } else {
+                            (
+                                CapabilityRequest::FileWrite { path: req_dir },
+                                "file-write".to_string(),
+                            )
+                        };
                         if !violations
                             .iter()
                             .any(|v: &SandboxViolation| v.capability == cap)
@@ -375,7 +387,7 @@ impl ProcessManager {
                             violations.push(SandboxViolation {
                                 capability: cap,
                                 raw_path,
-                                operation: "file-write".to_string(),
+                                operation: op,
                             });
                         }
                     }
