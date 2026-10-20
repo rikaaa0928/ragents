@@ -107,10 +107,8 @@ pub enum PermissionDecision {
     /// Effective for all Activations within the current Session
     AllowSession,
     /// Effective for all Sessions sharing the same workspace_root directory on the node
-    #[serde(alias = "allow_project")]
     AllowWorkspace,
     /// Effective for all tasks across the entire Node (agent-daemon)
-    #[serde(alias = "allow_always")]
     AllowNode,
 }
 

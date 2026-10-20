@@ -5,9 +5,7 @@ use ragents_apiserver::{serve_tcp, ApiServerState, SqliteStore, DEFAULT_LEASE_TT
 use ragents_cli::build_scheduling_mode;
 use ragents_client::RagentsClient;
 use ragents_core::make_openresponses_resource;
-use ragents_daemon::{
-    default_allowed_workspace_dirs, AgentDaemon, DaemonConfig, ExecutorMode, LocalModelConfig,
-};
+use ragents_daemon::{AgentDaemon, DaemonConfig, ExecutorMode, LocalModelConfig};
 use ragents_protocol::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -86,6 +84,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
     let tmp = tempfile::tempdir().expect("tempdir");
     let workspace_dir = tmp.path().join("project_ws");
     std::fs::create_dir_all(&workspace_dir).unwrap();
+    let outside_file = tmp.path().join("approved.txt");
 
     // 1. Start mock OpenResponses HTTP server
     let fc_item = Item::FunctionCall {
@@ -93,7 +92,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
         call_id: "call_e2e_1".to_string(),
         name: "write_file".to_string(),
         arguments: serde_json::json!({
-            "path": "approved.txt",
+            "path": outside_file.to_string_lossy(),
             "content": "approved via declarative api-server!"
         })
         .to_string(),
@@ -144,7 +143,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
         default_system_prompt: "Default node system prompt.".to_string(),
         default_model: Some("gpt-4.1".to_string()),
         temp_root_dir: tmp.path().join("daemon_tmp"),
-        allowed_workspace_dirs: default_allowed_workspace_dirs(),
+        allowed_workspace_dirs: vec![tmp.path().to_path_buf()],
         labels: BTreeMap::new(),
         auto_discover_models: false,
         models,
@@ -153,7 +152,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
             path: wasm_path.to_string_lossy().to_string(),
             enabled: true,
             config: serde_json::json!({}),
-            allowed_dirs: vec![],
+            allowed_dirs: vec![tmp.path().to_string_lossy().to_string()],
         }],
         interceptors: vec![],
         default_permissions: PermissionPolicyLayer::default(),
@@ -232,7 +231,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
         approved,
         "permission prompt should have been triggered and approved"
     );
-    let content = std::fs::read_to_string(workspace_dir.join("approved.txt")).unwrap();
+    let content = std::fs::read_to_string(&outside_file).unwrap();
     assert_eq!(content, "approved via declarative api-server!");
 
     cluster_cancel.cancel();

@@ -38,7 +38,7 @@ impl WasiHttpView for HostState {
         let method_str = request.method().as_str().to_ascii_uppercase();
         let full_url = request.uri().to_string();
         let is_internal_chatroom_rpc =
-            plugin_name == "chatroom" && request.uri().path().starts_with("/api/internal/wasm/");
+            plugin_name == "chatroom" && request.uri().path().starts_with("/api/v1/internal/");
 
         let handle = wasmtime_wasi::runtime::spawn(async move {
             if !is_internal_chatroom_rpc {

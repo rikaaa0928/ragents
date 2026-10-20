@@ -40,7 +40,7 @@ fn test_pinned_session_never_migrates_across_nodes() {
             spec: SessionSpec {
                 scheduling: SchedulingMode::Pinned {
                     node_id: NodeId::new("node_a"),
-                    workspace_path: PathBuf::from("/workspace/proj"),
+                    workspace_path: PathBuf::from("/tmp/workspace/proj"),
                 },
                 sources: vec![],
                 producer: None,

@@ -9,7 +9,6 @@ impl SqliteStore {
                 value TEXT NOT NULL
             );
 
-            INSERT OR IGNORE INTO store_meta (key, value) VALUES ('schema_version', '1');
             INSERT OR IGNORE INTO store_meta (key, value) VALUES ('global_resource_version', '0');
 
             CREATE TABLE IF NOT EXISTS nodes (
