@@ -328,9 +328,17 @@ impl SandboxState {
 
                 if exit_code != 0 && self.mode != SandboxMode::Disabled {
                     let combined = format!("{stderr}\n{stdout}");
-                    for raw_path in extract_eperm_paths_from_text(&combined) {
+                    let extracted = extract_eperm_paths_from_text(&combined);
+                    let has_unreadable = extracted
+                        .iter()
+                        .any(|p| !self.is_path_readable(p) && p.exists());
+                    for raw_path in extracted {
+                        let is_read_violation =
+                            !self.is_path_readable(&raw_path) && raw_path.exists();
+                        if has_unreadable && !is_read_violation && raw_path.exists() {
+                            continue;
+                        }
                         let req_dir = normalize_violation_to_request_dir(&raw_path);
-                        let is_read_violation = !self.is_path_readable(&raw_path) && raw_path.exists();
                         let (cap, op) = if is_read_violation {
                             (
                                 CapabilityRequest::FileRead { path: req_dir },

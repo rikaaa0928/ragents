@@ -365,10 +365,17 @@ impl ProcessManager {
                         .combined_buf
                         .clone();
                     let mut violations = Vec::new();
-                    for raw_path in extract_eperm_paths_from_text(&combined) {
-                        let req_dir = normalize_violation_to_request_dir(&raw_path);
+                    let extracted = extract_eperm_paths_from_text(&combined);
+                    let has_unreadable = extracted
+                        .iter()
+                        .any(|p| !sandbox_state.is_path_readable(p) && p.exists());
+                    for raw_path in extracted {
                         let is_read_violation =
                             !sandbox_state.is_path_readable(&raw_path) && raw_path.exists();
+                        if has_unreadable && !is_read_violation && raw_path.exists() {
+                            continue;
+                        }
+                        let req_dir = normalize_violation_to_request_dir(&raw_path);
                         let (cap, op) = if is_read_violation {
                             (
                                 CapabilityRequest::FileRead { path: req_dir },

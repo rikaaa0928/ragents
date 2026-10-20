@@ -105,20 +105,31 @@ pub(crate) fn extract_eperm_paths_from_text(text: &str) -> Vec<PathBuf> {
 
 fn split_path_candidates(line: &str) -> Vec<&str> {
     let mut candidates = Vec::new();
-    for part in line.split(['`', '\'', '"']) {
-        let trimmed = part.trim().trim_end_matches(':');
-        if trimmed.starts_with('/') {
+    for token in line.split_whitespace() {
+        let trimmed = token
+            .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ':' | '(' | ')' | ',' | ';'))
+            .trim_end_matches(':');
+        if trimmed.starts_with('/') && trimmed.len() > 1 && !trimmed.starts_with("//") {
             candidates.push(trimmed);
         }
     }
-    if candidates.is_empty() {
-        for token in line.split_whitespace() {
-            let trimmed = token
-                .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ':' | '(' | ')' | ','))
-                .trim_end_matches(':');
-            if trimmed.starts_with('/') {
-                candidates.push(trimmed);
+    for quote in ['`', '\'', '"'] {
+        let mut rest = line;
+        while let Some(start) = rest.find(quote) {
+            let after_open = &rest[start + 1..];
+            let Some(end) = after_open.find(quote) else {
+                break;
+            };
+            let inside = after_open[..end].trim().trim_end_matches(':');
+            if inside.starts_with('/')
+                && inside.len() > 1
+                && !inside.starts_with("//")
+                && !inside.contains(": ")
+                && !candidates.contains(&inside)
+            {
+                candidates.push(inside);
             }
+            rest = &after_open[end + 1..];
         }
     }
     candidates

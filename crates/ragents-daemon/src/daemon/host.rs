@@ -250,6 +250,12 @@ impl CoreHost for DaemonCoreHost {
         if self.is_covered_by_grants(&capability) {
             return Ok(PermissionOutcome::allowed());
         }
+        if let Some(ref orig) = original_path {
+            let exact_cap = capability.with_override_path(Some(orig.as_path()));
+            if self.is_covered_by_grants(&exact_cap) {
+                return Ok(PermissionOutcome::allowed_with(exact_cap, true));
+            }
+        }
 
         let mut forced_eval: Option<PolicyEvalResult> = None;
         if !self.interceptor_chain.is_empty() {
@@ -280,16 +286,37 @@ impl CoreHost for DaemonCoreHost {
         }
 
         let eval = forced_eval.unwrap_or_else(|| {
-            evaluate_capability_policy(
+            let primary = evaluate_capability_policy(
                 &self.effective_policy,
                 &self.workspace_root,
                 &self.session_tmp_dir,
                 &capability,
-            )
+            );
+            if primary == PolicyEvalResult::Ask {
+                if let Some(ref orig) = original_path {
+                    let exact_cap = capability.with_override_path(Some(orig.as_path()));
+                    let exact_eval = evaluate_capability_policy(
+                        &self.effective_policy,
+                        &self.workspace_root,
+                        &self.session_tmp_dir,
+                        &exact_cap,
+                    );
+                    if exact_eval != PolicyEvalResult::Ask {
+                        return exact_eval;
+                    }
+                }
+            }
+            primary
         });
 
         match eval {
-            PolicyEvalResult::Allow => Ok(PermissionOutcome::allowed()),
+            PolicyEvalResult::Allow => {
+                if let Some(ref orig) = original_path {
+                    let exact_cap = capability.with_override_path(Some(orig.as_path()));
+                    return Ok(PermissionOutcome::allowed_with(exact_cap, true));
+                }
+                Ok(PermissionOutcome::allowed())
+            }
             PolicyEvalResult::Deny => Ok(PermissionOutcome::Denied {
                 reason: format!("Denied by permission policy for {capability:?}"),
             }),
