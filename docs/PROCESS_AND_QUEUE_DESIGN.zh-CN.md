@@ -13,7 +13,7 @@
 
 本设计遵循以下核心原则：
 1. **最小宿主复杂度**：进程托管统一收口在节点常驻的 `agent-daemon` 中，通过现有的单 Daemon 共享 UDS（`SharedIpcHub`）向 Worker 子进程暴露能力。
-2. **向后兼容的默认行为**：`wait` 默认为 `true`（同步阻塞等待完成），`lifecycle` 默认为 `"activation"`（随单次 Activation 结束自动回收）。
+2. **安全的默认行为**：`wait` 默认为 `true`（同步阻塞等待完成），`lifecycle` 默认为 `"activation"`（随单次 Activation 结束自动回收）。
 3. **整棵进程树干净回收**：使用独立进程组（Process Group / `pgid`）管理后台命令，停止或超时清理时按进程组清理，杜绝 `sh -c` 派生子进程残留为孤儿进程。
 4. **与 OS 内核沙箱无缝协同**：后台命令（`wait = false`）同样运行在 macOS `sandbox-exec` / Linux `bwrap` 内核沙箱中，若启动瞬间因沙箱越界报错，同样支持自动捕获受阻路径并发起权限审批。
 

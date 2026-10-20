@@ -437,8 +437,8 @@ world control-plugin {
 ```
 
 > **设计考量**：为什么 WIT 层使用单一的 `invoke-hook(hook-name, plugin-config-json, payload-json) -> hook-result`？
-> 1. **极高的协议演进弹性**：新增模型字段或扩展上下文字段时，无需破坏二进制 WIT 签名，旧版 `.wasm` 插件由于 `serde(default)` 仍可平滑兼容。
-> 2. **WASM 与 Webhook 100% 载荷同构**：Webhook 驱动只需向目标 HTTP/UDS 发送完全相同的 `{ "hook_name": "...", "plugin_config": {...}, "payload": {...} }` POST 请求即可，开发者甚至可以用同一套 Rust 代码同时编译出 `.wasm` 组件与 HTTP 微服务。
+> 1. **精简统一的接口签名**：所有控制面与守护面钩子复用单一 WIT 入口函数，避免为每个钩子重复定义复杂的 WIT 类型映射。
+> 2. **WASM 与 Webhook 100% 载荷同构**：Webhook 驱动只需向目标 HTTP/UDS 发送完全相同的 `{ "hook_name": "...", "plugin_config": {...}, "payload": {...} }` POST 请求即可，开发者可以用同一套数据结构编写 `.wasm` 组件与 HTTP 微服务。
 
 ---
 
