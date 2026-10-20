@@ -634,8 +634,23 @@ pub fn build_macos_seatbelt_profile(
         let expanded_readable = expand_canonical_paths(&readable_all);
         if !expanded_readable.is_empty() {
             profile.push_str("(allow file-read-data\n");
-            for p in expanded_readable {
-                profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(&p)));
+            let mut ancestor_literals = std::collections::BTreeSet::new();
+            for p in &expanded_readable {
+                profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(p)));
+                let mut cur = Path::new(p).parent();
+                while let Some(anc) = cur {
+                    let anc_str = anc.to_string_lossy();
+                    if anc_str.is_empty() || anc_str == "/" {
+                        break;
+                    }
+                    if !expanded_readable.contains(anc_str.as_ref()) {
+                        ancestor_literals.insert(anc_str.into_owned());
+                    }
+                    cur = anc.parent();
+                }
+            }
+            for anc in ancestor_literals {
+                profile.push_str(&format!("  (literal \"{}\")\n", escape_sbpl(&anc)));
             }
             profile.push_str(")\n");
         }

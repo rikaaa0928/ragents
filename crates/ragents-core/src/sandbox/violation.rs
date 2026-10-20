@@ -165,9 +165,15 @@ pub(crate) async fn query_macos_sandbox_violations(trace_tag: &str) -> Vec<(Stri
                 if let Some(close_paren) = after_deny.find(") ") {
                     let op_and_path = after_deny[close_paren + 2..].trim();
                     if let Some((op, path)) = op_and_path.split_once(' ') {
-                        let key = format!("{op}:{path}");
+                        let trimmed_path = path.trim();
+                        if op.starts_with("file-read")
+                            && is_broad_top_or_home_dir(Path::new(trimmed_path))
+                        {
+                            continue;
+                        }
+                        let key = format!("{op}:{trimmed_path}");
                         if seen.insert(key) {
-                            results.push((op.to_string(), path.trim().to_string()));
+                            results.push((op.to_string(), trimmed_path.to_string()));
                         }
                     }
                 }
