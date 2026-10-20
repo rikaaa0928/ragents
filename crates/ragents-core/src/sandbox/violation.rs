@@ -45,7 +45,7 @@ pub fn normalize_violation_to_request_dir(raw_path: &Path) -> PathBuf {
     let dir = if raw_path.exists() && raw_path.is_dir() {
         raw_path.to_path_buf()
     } else if let Some(parent) = raw_path.parent() {
-        if !parent.as_os_str().is_empty() {
+        if !parent.as_os_str().is_empty() && !is_broad_top_or_home_dir(parent) {
             parent.to_path_buf()
         } else {
             raw_path.to_path_buf()
@@ -55,6 +55,33 @@ pub fn normalize_violation_to_request_dir(raw_path: &Path) -> PathBuf {
     };
 
     canonicalize_with_nonexistent_tail(&dir).unwrap_or(dir)
+}
+
+/// Returns `true` if `dir` is `/` or a user home directory (`/Users/<user>`, `/home/<user>`, `$HOME`)
+/// or top-level mount point (`/Users`, `/home`, `/Volumes`) that must never be auto-suggested as a
+/// broad directory grant when a single file directly inside it (e.g. `~/.gitconfig`) is accessed.
+fn is_broad_top_or_home_dir(dir: &Path) -> bool {
+    if let Ok(home) = std::env::var("HOME") {
+        if dir == Path::new(&home) {
+            return true;
+        }
+    }
+    let normal_parts: Vec<String> = dir
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    match normal_parts.len() {
+        0 => true,
+        1 => matches!(
+            normal_parts[0].as_str(),
+            "Users" | "home" | "Volumes" | "root" | "var" | "private"
+        ),
+        2 => matches!(normal_parts[0].as_str(), "Users" | "home" | "Volumes"),
+        _ => false,
+    }
 }
 
 /// Fast-path extraction of absolute paths from error lines containing `Operation not permitted` / `os error 1`.
