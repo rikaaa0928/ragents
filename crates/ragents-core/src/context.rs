@@ -34,13 +34,14 @@ pub fn strip_reasoning_summary(item: Item) -> Item {
         Item::Reasoning {
             id,
             status,
+            summary,
             encrypted_content,
             ..
         } => Item::Reasoning {
             id,
             status,
             content: None,
-            summary: vec![],
+            summary,
             encrypted_content,
         },
         other => other,
