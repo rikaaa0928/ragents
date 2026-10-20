@@ -190,13 +190,35 @@ impl HookManager {
         iteration: Option<usize>,
         draft: AgentDraft,
     ) -> Result<(AgentDraft, FlowControl), CoreError> {
-        let mut payload = serde_json::to_value(draft)?;
+        let (draft, _ext_prompts, control) = self.prepare_extensions(hook, iteration, draft).await?;
+        Ok((draft, control))
+    }
+
+    pub async fn prepare_extensions(
+        &self,
+        hook: &str,
+        iteration: Option<usize>,
+        mut draft: AgentDraft,
+    ) -> Result<
+        (
+            AgentDraft,
+            std::collections::BTreeMap<String, String>,
+            FlowControl,
+        ),
+        CoreError,
+    > {
+        let mut extension_prompts = std::collections::BTreeMap::new();
+        let mut names: HashSet<String> = draft
+            .tools
+            .iter()
+            .map(|t| t.definition.name.clone())
+            .collect();
+
         for sub in self.subscribers(hook, HookKind::Transform) {
-            let before_value = payload.clone();
-            let before: AgentDraft = serde_json::from_value(before_value.clone())?;
+            let ext_id = sub.plugin.metadata().id.clone();
             let response = sub
                 .plugin
-                .invoke(&self.request(hook, iteration, before_value))
+                .invoke(&self.request(hook, iteration, serde_json::json!({})))
                 .await
                 .and_then(parse_hook_result);
             let result = match response {
@@ -209,14 +231,58 @@ impl HookManager {
                     let candidate = result
                         .payload
                         .ok_or_else(|| extension_error(&sub, hook, "continue requires payload"))?;
-                    match serde_json::from_value::<AgentDraft>(candidate).and_then(|mut draft| {
-                        self.validate_agent_draft(&before, &mut draft, &sub.plugin.metadata().id)
-                            .map(|_| serde_json::to_value(draft).expect("serializable draft"))
-                            .map_err(serde_json::Error::io)
-                    }) {
-                        Ok(v) => payload = v,
+                    let output: ExtensionPrepareOutput = match serde_json::from_value(candidate) {
+                        Ok(v) => v,
                         Err(_) if sub.subscription.failure == HookFailurePolicy::Ignore => continue,
                         Err(e) => return Err(extension_error(&sub, hook, e)),
+                    };
+                    if let Some(append_prompt) = output.append_system_prompt {
+                        let trimmed = append_prompt.trim();
+                        if !trimmed.is_empty() {
+                            extension_prompts.insert(ext_id.clone(), trimmed.to_string());
+                            if draft.system_prompt.trim().is_empty() {
+                                draft.system_prompt = trimmed.to_string();
+                            } else {
+                                draft.system_prompt =
+                                    format!("{}\n\n{}", draft.system_prompt.trim_end(), trimmed);
+                            }
+                        }
+                    }
+                    let mut validated_tools = Vec::new();
+                    let mut tool_err: Option<std::io::Error> = None;
+                    for mut tool in output.tools {
+                        if tool.definition.name.trim().is_empty() {
+                            tool_err = Some(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "tool name must not be empty",
+                            ));
+                            break;
+                        }
+                        if names.contains(&tool.definition.name)
+                            || validated_tools
+                                .iter()
+                                .any(|t: &ToolEntry| t.definition.name == tool.definition.name)
+                        {
+                            tool_err = Some(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "duplicate tool name",
+                            ));
+                            break;
+                        }
+                        let id = format!("tool-{}", self.tool_id.fetch_add(1, Ordering::Relaxed));
+                        tool.id = Some(id);
+                        tool.owner = Some(ext_id.clone());
+                        validated_tools.push(tool);
+                    }
+                    if let Some(err) = tool_err {
+                        if sub.subscription.failure == HookFailurePolicy::Ignore {
+                            continue;
+                        }
+                        return Err(extension_error(&sub, hook, err));
+                    }
+                    for tool in validated_tools {
+                        names.insert(tool.definition.name.clone());
+                        draft.tools.push(tool);
                     }
                     FlowControl::Continue
                 }
@@ -224,70 +290,17 @@ impl HookManager {
                 HookAction::Reject => {
                     return Err(CoreError::HookRejected {
                         hook: hook.into(),
-                        reason: result
-                            .reason
-                            .unwrap_or_else(|| sub.plugin.metadata().id.clone()),
+                        reason: result.reason.unwrap_or(ext_id),
                     })
                 }
                 HookAction::Skip => FlowControl::Skip,
                 HookAction::Stop => FlowControl::Stop,
             };
             if control != FlowControl::Continue {
-                return Ok((serde_json::from_value(payload)?, control));
+                return Ok((draft, extension_prompts, control));
             }
         }
-        let draft: AgentDraft = serde_json::from_value(payload)?;
-        Ok((draft, FlowControl::Continue))
-    }
-
-    fn validate_agent_draft(
-        &self,
-        before: &AgentDraft,
-        after: &mut AgentDraft,
-        current_extension: &str,
-    ) -> Result<(), std::io::Error> {
-        after.context = before.context.clone();
-        if after.system_prompt.trim().is_empty() {
-            return invalid("system_prompt must not be empty");
-        }
-        if after.model.name.trim().is_empty() {
-            return invalid("model name must not be empty");
-        }
-        let existing: HashMap<_, _> = before
-            .tools
-            .iter()
-            .filter_map(|t| t.id.as_ref().map(|id| (id.clone(), t.owner.clone())))
-            .collect();
-        let mut ids = HashSet::new();
-        let mut names = HashSet::new();
-        for tool in &mut after.tools {
-            if tool.definition.name.trim().is_empty() {
-                return invalid("tool name must not be empty");
-            }
-            match &tool.id {
-                Some(id) => {
-                    let owner = existing.get(id).ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("extension supplied unknown tool id '{id}'"),
-                        )
-                    })?;
-                    tool.owner = owner.clone();
-                }
-                None => {
-                    let id = format!("tool-{}", self.tool_id.fetch_add(1, Ordering::Relaxed));
-                    tool.id = Some(id);
-                    tool.owner = Some(current_extension.to_string());
-                }
-            }
-            if !ids.insert(tool.id.clone().unwrap()) {
-                return invalid("duplicate tool id");
-            }
-            if !names.insert(tool.definition.name.clone()) {
-                return invalid("duplicate tool name");
-            }
-        }
-        Ok(())
+        Ok((draft, extension_prompts, FlowControl::Continue))
     }
 
     pub async fn action(
@@ -404,12 +417,5 @@ fn extension_error(sub: &Subscriber, hook: &str, error: impl std::fmt::Display) 
     CoreError::ToolError(format!(
         "extension '{}' failed at '{hook}': {error}",
         sub.plugin.metadata().id
-    ))
-}
-
-fn invalid<T>(message: impl Into<String>) -> Result<T, std::io::Error> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        message.into(),
     ))
 }

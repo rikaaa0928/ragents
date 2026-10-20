@@ -79,6 +79,8 @@ pub struct ActivationSpec {
     pub input: Vec<Item>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<ModelRequestSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
     #[serde(default)]
     pub desired_phase: DesiredActivationPhase,
     #[serde(default)]

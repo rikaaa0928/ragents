@@ -157,6 +157,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         initial_activation: Some(InitialActivationRequest {
                             input: vec![Item::user_message(prompt_text)],
                             model_override: None,
+                            disabled_tools: vec![],
                         }),
                     })
                     .await?;
@@ -287,6 +288,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         initial_activation: prompt.map(|p| InitialActivationRequest {
                             input: vec![Item::user_message(p)],
                             model_override: None,
+                            disabled_tools: vec![],
                         }),
                     })
                     .await?;
@@ -387,6 +389,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             submission_kind: SubmissionKind::Normal,
                             input: vec![Item::user_message(prompt)],
                             model_override: model.map(ModelRequestSpec::new),
+                            disabled_tools: vec![],
                             desired_phase: DesiredActivationPhase::Running,
                             interaction_responses: BTreeMap::new(),
                         },
@@ -413,6 +416,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         initial_activation: Some(InitialActivationRequest {
                             input: vec![Item::user_message(prompt)],
                             model_override: None,
+                            disabled_tools: vec![],
                         }),
                     })
                     .await?;
@@ -443,7 +447,13 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 .map(|text| openresponses_rust::MessageContent::InputText { text })
                 .collect();
             let resp = client
-                .push_realtime_message(&sess_id, PushRealtimeMessageRequest { content: blocks })
+                .push_realtime_message(
+                    &sess_id,
+                    PushRealtimeMessageRequest {
+                        content: blocks,
+                        disabled_tools: vec![],
+                    },
+                )
                 .await?;
             let effective_sid = resp.target_session_id.as_ref().unwrap_or(&sess_id);
             if let Some(ref act_id) = resp.spawned_activation_id {

@@ -331,6 +331,7 @@ pub enum AdmissionOperation {
     PatchSession,
     CreateActivation,
     PatchActivation,
+    PushRealtimeMessage,
     RegisterNode,
 }
 

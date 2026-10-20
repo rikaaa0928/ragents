@@ -86,6 +86,8 @@ pub(crate) struct DaemonCoreHost {
     pub(crate) workspace_root: PathBuf,
     pub(crate) norm_workspace_key: PathBuf,
     pub(crate) session_tmp_dir: PathBuf,
+    pub(crate) effective_config: ConfigRevision,
+    pub(crate) effective_permission: PermissionSnapshot,
     pub(crate) effective_policy: PermissionPolicyLayer,
     pub(crate) interceptor_chain: DaemonInterceptorChain,
     pub(crate) activation_grants: Arc<Mutex<Vec<CapabilityRequest>>>,
@@ -154,6 +156,34 @@ impl DaemonCoreHost {
 
 #[async_trait]
 impl CoreHost for DaemonCoreHost {
+    async fn report_prepared_config(
+        &self,
+        extension_prompts: std::collections::BTreeMap<String, String>,
+        effective_tools: Vec<String>,
+    ) -> Result<(), CoreError> {
+        let mut prompt_parts = self.effective_config.prompt_parts.clone();
+        prompt_parts.extension_prompts = extension_prompts;
+        let system_prompt = prompt_parts.assemble();
+        let updated_cfg = ConfigRevision::new_merged_with_parts(
+            prompt_parts,
+            system_prompt,
+            self.effective_config.model.clone(),
+            self.effective_config.extensions.clone(),
+            effective_tools,
+        );
+        self.tunnel
+            .accept_activation(
+                self.session_id.clone(),
+                self.activation_id.clone(),
+                self.lease_epoch,
+                updated_cfg,
+                self.effective_permission.clone(),
+            )
+            .await
+            .map_err(|e| CoreError::HostError(e.to_string()))?;
+        Ok(())
+    }
+
     async fn load_effective_context(&self) -> Result<Vec<Item>, CoreError> {
         self.tunnel
             .fetch_effective_context(self.session_id.clone())

@@ -17,6 +17,10 @@ pub enum WorkerToParentMessage {
     Hello {
         ipc_token: String,
     },
+    ReportPreparedConfig {
+        extension_prompts: std::collections::BTreeMap<String, String>,
+        effective_tools: Vec<String>,
+    },
     LoadEffectiveContext,
     CommitModelOutput {
         turn_id: TurnId,
@@ -70,6 +74,9 @@ pub enum WorkerToParentMessage {
 pub enum ParentToWorkerMessage {
     Start {
         run_spec: Box<CoreRunSpec>,
+    },
+    ReportPreparedConfigReply {
+        result: Result<(), String>,
     },
     EffectiveContextReply {
         result: Result<Vec<Item>, String>,

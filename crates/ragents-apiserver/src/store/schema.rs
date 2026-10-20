@@ -10,6 +10,7 @@ impl SqliteStore {
             );
 
             INSERT OR IGNORE INTO store_meta (key, value) VALUES ('global_resource_version', '0');
+            INSERT OR IGNORE INTO store_meta (key, value) VALUES ('cluster_system_prompt', '');
 
             CREATE TABLE IF NOT EXISTS nodes (
                 node_id          TEXT PRIMARY KEY,

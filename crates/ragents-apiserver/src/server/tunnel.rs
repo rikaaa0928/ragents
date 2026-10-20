@@ -110,6 +110,8 @@ fn handle_daemon_message(
             labels,
             supported_models,
             default_model,
+            default_system_prompt,
+            default_permissions,
             installed_extensions,
             allowed_workspace_dirs,
             max_concurrent_runners,
@@ -132,7 +134,7 @@ fn handle_daemon_message(
                 allowed_workspace_dirs
             };
 
-            match state.store.register_node_with_workspace_dirs(
+            match state.store.register_node_with_seed(
                 node_id.clone(),
                 hostname,
                 os,
@@ -140,6 +142,8 @@ fn handle_daemon_message(
                 labels,
                 supported_models,
                 default_model,
+                default_system_prompt,
+                default_permissions,
                 installed_extensions,
                 effective_dirs,
                 max_concurrent_runners,

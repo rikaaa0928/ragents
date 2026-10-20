@@ -378,29 +378,41 @@ async fn run_react_loop(
         context: None,
     };
 
-    let (draft, _) = tokio::select! {
-        res = hook_manager.transform_agent_draft(HOOK_AGENT_PREPARE, None, initial_draft) => res?,
+    let (mut draft, extension_prompts, _) = tokio::select! {
+        res = hook_manager.prepare_extensions(HOOK_AGENT_PREPARE, None, initial_draft) => res?,
         _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
     };
 
-    let _ = hook_manager
-        .transform_validated(
-            HOOK_INPUT_PREPARE,
-            None,
-            serde_json::json!({
-                "session_id": run_spec.session_id,
-                "activation_id": run_spec.activation_id,
-            }),
-            |_| Ok(()),
-        )
-        .await?;
+    let mut prompt_parts = cfg.prompt_parts.clone();
+    if prompt_parts.system_prompt.is_empty()
+        && prompt_parts.node_prompt.is_empty()
+        && prompt_parts.client_prompt.is_empty()
+    {
+        prompt_parts.client_prompt = cfg.system_prompt.clone();
+    }
+    prompt_parts.extension_prompts = extension_prompts.clone();
+    draft.system_prompt = prompt_parts.assemble();
 
     let active_tools = draft
         .tools
         .iter()
-        .filter(|t| t.enabled)
+        .filter(|t| {
+            t.enabled
+                && !run_spec
+                    .disabled_tools
+                    .iter()
+                    .any(|disabled| disabled == &t.definition.name)
+        })
         .cloned()
         .collect::<Vec<_>>();
+
+    let active_tool_names = active_tools
+        .iter()
+        .map(|t| t.definition.name.clone())
+        .collect::<Vec<_>>();
+
+    host.report_prepared_config(extension_prompts, active_tool_names)
+        .await?;
 
     let request_tools = active_tools
         .iter()
@@ -429,25 +441,6 @@ async fn run_react_loop(
 
         let turn_id = TurnId::generate();
         last_turn_id = Some(turn_id.clone());
-
-        let turn_prep = hook_manager
-            .transform_validated(
-                HOOK_TURN_PREPARE,
-                Some(iteration),
-                serde_json::json!({
-                    "session_id": run_spec.session_id,
-                    "activation_id": run_spec.activation_id,
-                    "turn_id": turn_id,
-                    "iteration": iteration,
-                }),
-                |_| Ok(()),
-            )
-            .await?;
-        match turn_prep.control {
-            FlowControl::Continue => {}
-            FlowControl::Skip => continue,
-            FlowControl::Stop => break,
-        }
 
         // Drain all pending real-time messages (background process exit notifications, steer messages)
         // in one atomic batch before loading the effective context for this Turn.
@@ -510,7 +503,7 @@ async fn run_react_loop(
         );
         turn_metadata.insert("ragents.turn_id".to_string(), turn_id.to_string());
 
-        let initial_request = AgentCore::build_request(
+        let prepared_request = AgentCore::build_request(
             &draft.system_prompt,
             &projection,
             &draft.model.name,
@@ -520,8 +513,6 @@ async fn run_react_loop(
             request_tools.clone(),
             Some(turn_metadata),
         );
-        let prepared_request =
-            apply_model_request_hook(hook_manager, iteration, initial_request).await?;
 
         let raw_step = tokio::select! {
             res = AgentCore::execute_request_streaming(
@@ -558,10 +549,8 @@ async fn run_react_loop(
             )
             .await?;
 
-        let prepared_output_items =
-            apply_model_response_hook(hook_manager, iteration, raw_step.output_items).await?;
         let step = AgentCore::parse_output_items(
-            prepared_output_items,
+            raw_step.output_items,
             raw_step.response_id,
             raw_step.usage,
         );
@@ -570,13 +559,10 @@ async fn run_react_loop(
             final_text = step.text.clone();
         }
 
-        let model_items_to_commit =
-            apply_context_append_hook(hook_manager, iteration, step.output_items.clone()).await?;
-
         host.commit_model_output(
             &turn_id,
             step.response_id.clone(),
-            model_items_to_commit,
+            step.output_items.clone(),
             step.usage.clone(),
         )
         .await?;
@@ -609,16 +595,13 @@ async fn run_react_loop(
                 };
 
                 let duration_ms = started_at.elapsed().as_millis() as u64;
-                let tool_items_to_commit =
-                    apply_context_append_hook(hook_manager, iteration, vec![tool_output_item])
-                        .await?;
                 host.commit_tool_output(
                     &turn_id,
                     &call.call_id,
                     &call.name,
                     success,
                     duration_ms,
-                    tool_items_to_commit,
+                    vec![tool_output_item],
                 )
                 .await?;
             }
@@ -700,9 +683,7 @@ async fn apply_context_projection_hook(
             return Ok(ContextProjectionOutcome::CompactionRequested(plan));
         }
     }
-    Ok(ContextProjectionOutcome::Projected(
-        serde_json::from_value(transformed.payload).unwrap_or(items),
-    ))
+    Ok(ContextProjectionOutcome::Projected(items))
 }
 
 async fn execute_compaction_plan(
@@ -815,54 +796,6 @@ async fn execute_compaction_plan(
     }
 
     Ok((combined_prompt, formatted, total_usage))
-}
-
-async fn apply_model_request_hook(
-    hook_manager: &HookManager,
-    iteration: usize,
-    request: CreateResponseBody,
-) -> Result<CreateResponseBody, CoreError> {
-    let payload = serde_json::to_value(&request)?;
-    let transformed = hook_manager
-        .transform_validated(HOOK_MODEL_REQUEST_PREPARE, Some(iteration), payload, |_| {
-            Ok(())
-        })
-        .await?;
-    Ok(serde_json::from_value(transformed.payload).unwrap_or(request))
-}
-
-async fn apply_model_response_hook(
-    hook_manager: &HookManager,
-    iteration: usize,
-    items: Vec<Item>,
-) -> Result<Vec<Item>, CoreError> {
-    let payload = serde_json::to_value(&items)?;
-    let transformed = hook_manager
-        .transform_validated(
-            HOOK_MODEL_RESPONSE_PREPARE,
-            Some(iteration),
-            payload,
-            |_| Ok(()),
-        )
-        .await?;
-    Ok(serde_json::from_value(transformed.payload).unwrap_or(items))
-}
-
-async fn apply_context_append_hook(
-    hook_manager: &HookManager,
-    iteration: usize,
-    items: Vec<Item>,
-) -> Result<Vec<Item>, CoreError> {
-    let payload = serde_json::to_value(&items)?;
-    let transformed = hook_manager
-        .transform_validated(
-            HOOK_CONTEXT_APPEND_PREPARE,
-            Some(iteration),
-            payload,
-            |_| Ok(()),
-        )
-        .await?;
-    Ok(serde_json::from_value(transformed.payload).unwrap_or(items))
 }
 
 async fn execute_tool_call(

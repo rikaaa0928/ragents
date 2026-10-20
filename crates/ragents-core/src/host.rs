@@ -61,6 +61,8 @@ pub struct CoreRunSpec {
     pub effective_config: ConfigRevision,
     #[serde(default)]
     pub effective_permissions: PermissionPolicyLayer,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
     pub model_endpoint: ModelEndpointConfig,
     pub max_turns: Option<usize>,
 }
@@ -79,6 +81,15 @@ pub struct CoreRunSummary {
 #[async_trait]
 pub trait CoreHost: Send + Sync {
     async fn load_effective_context(&self) -> Result<Vec<Item>, CoreError>;
+
+    /// Reports the prepared extension prompts and effective tool names right after `agent.prepare`.
+    async fn report_prepared_config(
+        &self,
+        _extension_prompts: std::collections::BTreeMap<String, String>,
+        _effective_tools: Vec<String>,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
 
     async fn commit_model_output(
         &self,

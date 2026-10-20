@@ -103,6 +103,19 @@ impl SqliteStore {
                 DesiredSessionPhase::Closed => SessionPhase::Closed,
                 DesiredSessionPhase::Archived => SessionPhase::Archived,
             };
+            let cluster_prompt = Self::load_cluster_system_prompt_in_tx(&tx)?;
+            let node_prompt = match &bound_node_id {
+                Some(nid) => Self::load_node_in_tx(&tx, nid)?
+                    .and_then(|n| n.spec.node_prompt)
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            status.latest_prompt_parts = Some(PromptParts {
+                system_prompt: cluster_prompt,
+                node_prompt,
+                client_prompt: req.spec.system_prompt.clone().unwrap_or_default(),
+                extension_prompts: BTreeMap::new(),
+            });
 
             let scheduling_mode_str = if req.spec.scheduling.is_pinned() {
                 "pinned"
@@ -181,6 +194,7 @@ impl SqliteStore {
                             submission_kind: SubmissionKind::Normal,
                             input: init_req.input,
                             model_override: init_req.model_override,
+                            disabled_tools: init_req.disabled_tools,
                             desired_phase: DesiredActivationPhase::Running,
                             interaction_responses: BTreeMap::new(),
                         },
@@ -308,6 +322,23 @@ impl SqliteStore {
                 session.spec.model = Some(model.clone());
             }
             if let Some(prompt) = patch.system_prompt {
+                if let Some(ref mut parts) = session.status.latest_prompt_parts {
+                    parts.client_prompt = prompt.clone();
+                } else {
+                    let cluster_prompt = Self::load_cluster_system_prompt_in_tx(&tx)?;
+                    let node_prompt = match &session.status.bound_node_id {
+                        Some(nid) => Self::load_node_in_tx(&tx, nid)?
+                            .and_then(|n| n.spec.node_prompt)
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    session.status.latest_prompt_parts = Some(PromptParts {
+                        system_prompt: cluster_prompt,
+                        node_prompt,
+                        client_prompt: prompt.clone(),
+                        extension_prompts: BTreeMap::new(),
+                    });
+                }
                 session.spec.system_prompt = Some(prompt);
             }
             if let Some(exts) = patch.extensions {

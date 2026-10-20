@@ -138,6 +138,7 @@ async fn test_in_process_executor_single_turn_without_tools() {
         session_tmp_dir: tmp.path().join("tmp"),
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -225,6 +226,7 @@ async fn test_in_process_executor_with_wasm_file_editor_extension() {
         session_tmp_dir: tmp.path().join("tmp"),
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -314,6 +316,7 @@ async fn test_subprocess_executor_with_wasm_file_editor_extension() {
         session_tmp_dir: tmp.path().join("tmp_subproc"),
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local-secret".to_string(),
@@ -553,6 +556,7 @@ async fn test_multi_directory_auto_permission_escalation_loop_in_single_shell_ca
         session_tmp_dir: sess_tmp,
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -723,6 +727,7 @@ async fn test_wasm_external_file_dynamic_mount_and_http_fetch_permission_unifica
         session_tmp_dir: sess_tmp.clone(),
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -973,6 +978,7 @@ async fn test_blocking_shell_timeout_preserves_partial_output_and_kills_process_
         session_tmp_dir: sess_tmp,
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -1157,6 +1163,7 @@ async fn test_file_editor_pagination_non_overlapping_edits_and_shell_output_trun
         session_tmp_dir: sess_tmp.clone(),
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -1287,6 +1294,7 @@ async fn test_openresponses_sse_streaming_deltas_and_transient_retry() {
         session_tmp_dir: sess_tmp,
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: format!("http://{addr}/v1"),
             api_key: "sk-local".to_string(),
@@ -1333,7 +1341,10 @@ async fn test_openresponses_sse_streaming_deltas_and_transient_retry() {
 async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
     let skills_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm");
-    if !skills_wasm_path.exists() {
+    let agents_md_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/agents_md/target/wasm32-wasip2/release/ragent_agents_md_extension.wasm",
+    );
+    if !skills_wasm_path.exists() || !agents_md_wasm_path.exists() {
         return;
     }
 
@@ -1412,16 +1423,25 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
     let cfg = ConfigRevision::new_merged(
         "You are a coding assistant.".to_string(),
         ModelRequestSpec::new("gpt-4.1"),
-        vec![ExtensionSpec {
-            name: "skills".to_string(),
-            path: skills_wasm_path.to_string_lossy().to_string(),
-            enabled: true,
-            config: serde_json::json!({
-                "include_global": false,
-                "skill_dirs": [&ext_skills_str],
-            }),
-            allowed_dirs: vec![ext_skills_str],
-        }],
+        vec![
+            ExtensionSpec {
+                name: "agents_md".to_string(),
+                path: agents_md_wasm_path.to_string_lossy().to_string(),
+                enabled: true,
+                config: serde_json::json!({}),
+                allowed_dirs: vec![],
+            },
+            ExtensionSpec {
+                name: "skills".to_string(),
+                path: skills_wasm_path.to_string_lossy().to_string(),
+                enabled: true,
+                config: serde_json::json!({
+                    "include_global": false,
+                    "skill_dirs": [&ext_skills_str],
+                }),
+                allowed_dirs: vec![ext_skills_str],
+            },
+        ],
     );
 
     let run_spec = CoreRunSpec {
@@ -1431,6 +1451,7 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
         session_tmp_dir: sess_tmp,
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),

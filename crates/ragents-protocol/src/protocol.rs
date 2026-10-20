@@ -26,6 +26,8 @@ pub struct InitialActivationRequest {
     pub input: Vec<Item>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<ModelRequestSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,12 +87,15 @@ pub struct WatchQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushRealtimeMessageRequest {
     pub content: Vec<MessageContent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
 }
 
 impl PushRealtimeMessageRequest {
     pub fn from_text(text: impl Into<String>) -> Self {
         Self {
             content: vec![MessageContent::InputText { text: text.into() }],
+            disabled_tools: Vec::new(),
         }
     }
 }
@@ -123,6 +128,10 @@ pub enum DaemonToServerMessage {
         supported_models: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         default_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_system_prompt: Option<String>,
+        #[serde(default)]
+        default_permissions: PermissionPolicyLayer,
         #[serde(default)]
         installed_extensions: Vec<String>,
         #[serde(default)]
@@ -316,6 +325,10 @@ pub enum ServerToDaemonMessage {
         session: Box<Session>,
         activation: Box<Activation>,
         lease_epoch: LeaseEpoch,
+        #[serde(default)]
+        cluster_system_prompt: String,
+        #[serde(default)]
+        node_spec: Box<NodeSpec>,
     },
     /// Server pushes declarative spec updates (e.g. desired_phase=Cancelled or permission resolutions)
     ReconcileActivation {

@@ -107,11 +107,7 @@ impl exports::ragent::extension::lifecycle::Guest for FileEditorExtension {
         let request: HookRequest = serde_json::from_str(&request).map_err(|e| e.to_string())?;
         match request.hook.as_str() {
             AGENT_PREPARE_HOOK => {
-                let mut draft = request.payload;
-                let tools = draft
-                    .get_mut("tools")
-                    .and_then(serde_json::Value::as_array_mut)
-                    .ok_or("agent.prepare payload has no tools array")?;
+                let mut tools = Vec::new();
 
                 tools.push(serde_json::json!({
                     "enabled": true,
@@ -193,7 +189,7 @@ impl exports::ragent::extension::lifecycle::Guest for FileEditorExtension {
                     }
                 }));
 
-                Ok(serde_json::json!({"action": "continue", "payload": draft}).to_string())
+                Ok(serde_json::json!({"action": "continue", "payload": {"tools": tools}}).to_string())
             }
             TOOLS_CALL_HOOK => call_tool(request.payload),
             hook => Err(format!("unsupported hook: {hook}")),

@@ -63,6 +63,7 @@ async fn test_http_sse_and_ws_daemon_tunnel_roundtrip() {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("ping over cluster")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .await
@@ -75,6 +76,7 @@ async fn test_http_sse_and_ws_daemon_tunnel_roundtrip() {
             session,
             activation,
             lease_epoch,
+            ..
         } => (*session, *activation, lease_epoch),
         other => panic!("expected DispatchActivation, got {other:?}"),
     };

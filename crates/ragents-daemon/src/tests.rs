@@ -138,6 +138,7 @@ async fn test_multi_daemon_floating_failover_and_context_continuity() {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("hello turn 1")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .await
@@ -186,6 +187,7 @@ async fn test_multi_daemon_floating_failover_and_context_continuity() {
                 submission_kind: SubmissionKind::FollowUp,
                 input: vec![Item::user_message("hello turn 2 after failover")],
                 model_override: None,
+                disabled_tools: vec![],
                 desired_phase: DesiredActivationPhase::Running,
                 interaction_responses: BTreeMap::new(),
             },
@@ -380,6 +382,7 @@ async fn test_daemon_model_interceptor_mutates_params_headers_and_vendor_fields(
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("test model interceptor")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .await
@@ -727,6 +730,7 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
                 submission_kind: SubmissionKind::Normal,
                 input: vec![Item::user_message("Start background services")],
                 model_override: None,
+                disabled_tools: vec![],
                 desired_phase: DesiredActivationPhase::Running,
                 interaction_responses: BTreeMap::new(),
             },
@@ -792,6 +796,7 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
                 submission_kind: SubmissionKind::FollowUp,
                 input: vec![Item::user_message("Check and stop session process")],
                 model_override: None,
+                disabled_tools: vec![],
                 desired_phase: DesiredActivationPhase::Running,
                 interaction_responses: BTreeMap::new(),
             },
@@ -1109,6 +1114,7 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
                     "Please inspect config.toml and write output_v1.txt with the initial payload.",
                 )],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .await
@@ -1207,6 +1213,7 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
                     "Now read schema.sql and update output_v1.txt for phase 2.",
                 )],
                 model_override: None,
+                disabled_tools: vec![],
                 desired_phase: DesiredActivationPhase::Running,
                 interaction_responses: BTreeMap::new(),
             },
@@ -1416,6 +1423,7 @@ async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("Start session background sleep")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .await
@@ -1473,6 +1481,7 @@ async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
                     "Verify daemon reconnected after server restart",
                 )],
                 model_override: None,
+                disabled_tools: vec![],
                 desired_phase: DesiredActivationPhase::Running,
                 interaction_responses: BTreeMap::new(),
             },
@@ -1654,6 +1663,7 @@ async fn test_daemon_auto_discover_models_from_v1_models_endpoint() {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("hello discovered model")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .await
@@ -1661,7 +1671,7 @@ async fn test_daemon_auto_discover_models_from_v1_models_endpoint() {
 
     let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
     let mut completed = false;
-    for _ in 0..30 {
+    for _ in 0..80 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         if let Some(act) = client.get_activation(&act_id).await.unwrap() {
             if act.status.phase == ActivationPhase::Succeeded {
@@ -1814,6 +1824,175 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
         ok_res.is_ok(),
         "creating a session under allowed /tmp (/private/tmp) dir must succeed"
     );
+
+    daemon_cancel.cancel();
+    server_cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_four_segment_system_prompt_ssot_permissions_and_disabled_tools() {
+    let agents_md_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/agents_md/target/wasm32-wasip2/release/ragent_agents_md_extension.wasm",
+    );
+    let editor_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+    );
+    if !agents_md_wasm.exists() || !editor_wasm.exists() {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws_dir = tmp.path().join("ws_ssot");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(ws_dir.join("AGENTS.md"), "Workspace Rule: Use uv only.").unwrap();
+
+    let store = SqliteStore::open_in_memory().expect("open store");
+    store
+        .set_cluster_system_prompt("Cluster Base Prompt v1")
+        .expect("set cluster prompt");
+    let state = ApiServerState::new(store.clone(), 5_000);
+    let server_cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = serve_tcp(listener, state, server_cancel.clone())
+        .await
+        .expect("serve");
+    let server_url = format!("http://{addr}");
+
+    let mut cfg = make_daemon_cfg(
+        "node_ssot",
+        &server_url,
+        vec!["gpt-4.1"],
+        tmp.path().join("node_ssot"),
+    );
+    cfg.executor_mode = ExecutorMode::InProcess;
+    cfg.default_system_prompt = "Node Environment Prompt (macOS)".to_string();
+    cfg.allowed_workspace_dirs.push(tmp.path().to_path_buf());
+    cfg.extensions = vec![
+        ExtensionSpec {
+            name: "agents_md".to_string(),
+            path: agents_md_wasm.to_string_lossy().to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+            allowed_dirs: vec![],
+        },
+        ExtensionSpec {
+            name: "file_editor".to_string(),
+            path: editor_wasm.to_string_lossy().to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+            allowed_dirs: vec![],
+        },
+    ];
+
+    struct InspectingBackend {
+        seen_instructions: Mutex<Vec<String>>,
+        seen_tools: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelBackend for InspectingBackend {
+        async fn create_response(
+            &self,
+            _endpoint: & ragents_core::ModelEndpointConfig,
+            request: openresponses_rust::CreateResponseBody,
+        ) -> Result<openresponses_rust::ResponseResource, CoreError> {
+            self.seen_instructions
+                .lock()
+                .unwrap()
+                .push(request.instructions.unwrap_or_default());
+            let tool_names: Vec<String> = request
+                .tools
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| match t {
+                    openresponses_rust::Tool::Function { name, .. } => name,
+                    _ => String::new(),
+                })
+                .collect();
+            self.seen_tools.lock().unwrap().push(tool_names);
+            Ok(make_openresponses_resource(
+                "resp_ssot",
+                "gpt-4.1",
+                vec![Item::assistant_message("Done.")],
+                None,
+            ))
+        }
+    }
+
+    let backend = Arc::new(InspectingBackend {
+        seen_instructions: Mutex::new(Vec::new()),
+        seen_tools: Mutex::new(Vec::new()),
+    });
+    let daemon_cancel = CancellationToken::new();
+    let daemon = AgentDaemon::new(cfg).with_model_backend(backend.clone());
+    daemon.start(daemon_cancel.clone()).await.unwrap();
+
+    let client = RagentsClient::new(&server_url);
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_ssot")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_ssot"),
+                    workspace_path: ws_dir.clone(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: Some("Client Role Prompt: Architect".to_string()),
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("hello")],
+                model_override: None,
+                disabled_tools: vec!["write_file".to_string()],
+            }),
+        })
+        .await
+        .unwrap();
+
+    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        if let Some(act) = client.get_activation(&act_id).await.unwrap() {
+            if act.status.phase == ActivationPhase::Succeeded {
+                break;
+            }
+        }
+    }
+
+    let sess = client
+        .get_session(&SessionId::new("sess_ssot"))
+        .await
+        .unwrap()
+        .unwrap();
+    let parts = sess
+        .status
+        .latest_prompt_parts
+        .expect("latest_prompt_parts must be persisted on SessionStatus");
+    assert_eq!(parts.system_prompt, "Cluster Base Prompt v1");
+    assert_eq!(parts.node_prompt, "Node Environment Prompt (macOS)");
+    assert_eq!(parts.client_prompt, "Client Role Prompt: Architect");
+    assert!(parts
+        .extension_prompts
+        .get("agents_md")
+        .unwrap()
+        .contains("Workspace Rule: Use uv only."));
+
+    let seen_inst = backend.seen_instructions.lock().unwrap();
+    assert_eq!(seen_inst.len(), 1);
+    assert_eq!(seen_inst[0], parts.assemble());
+
+    let seen_t = backend.seen_tools.lock().unwrap();
+    assert!(seen_t[0].contains(&"read_file".to_string()));
+    assert!(
+        !seen_t[0].contains(&"write_file".to_string()),
+        "write_file was in disabled_tools and must be stripped"
+    );
+    assert_eq!(sess.status.effective_tools, seen_t[0]);
 
     daemon_cancel.cancel();
     server_cancel.cancel();

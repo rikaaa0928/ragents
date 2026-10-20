@@ -120,7 +120,7 @@ impl AgentDaemon {
         let arch = std::env::consts::ARCH.to_string();
 
         let (lease_ttl_ms, _rv) = tunnel
-            .register_node_with_workspace_dirs(
+            .register_node_with_seed(
                 self.config.node_id.clone(),
                 hostname,
                 os,
@@ -128,6 +128,8 @@ impl AgentDaemon {
                 self.config.labels.clone(),
                 self.effective_supported_models(),
                 self.effective_default_model(),
+                Some(self.config.default_system_prompt.clone()),
+                self.config.default_permissions.clone(),
                 self.config.installed_extension_names(),
                 self.config.effective_allowed_workspace_dir_strings(),
                 self.config.max_concurrent_runners,
@@ -173,11 +175,15 @@ impl AgentDaemon {
                                 session,
                                 activation,
                                 lease_epoch,
+                                cluster_system_prompt,
+                                node_spec,
                             }) => {
                                 daemon.handle_dispatch(
                                     *session,
                                     *activation,
                                     lease_epoch,
+                                    cluster_system_prompt,
+                                    *node_spec,
                                     tunnel.clone(),
                                     active_runners.clone(),
                                     active_tasks.clone(),
@@ -272,7 +278,7 @@ impl AgentDaemon {
                             let os = std::env::consts::OS.to_string();
                             let arch = std::env::consts::ARCH.to_string();
                             if new_tunnel
-                                .register_node_with_workspace_dirs(
+                                .register_node_with_seed(
                                     daemon.config.node_id.clone(),
                                     hostname,
                                     os,
@@ -280,6 +286,8 @@ impl AgentDaemon {
                                     daemon.config.labels.clone(),
                                     daemon.effective_supported_models(),
                                     daemon.effective_default_model(),
+                                    Some(daemon.config.default_system_prompt.clone()),
+                                    daemon.config.default_permissions.clone(),
                                     daemon.config.installed_extension_names(),
                                     daemon.config.effective_allowed_workspace_dir_strings(),
                                     daemon.config.max_concurrent_runners,
@@ -311,6 +319,8 @@ impl AgentDaemon {
         session: Session,
         activation: Activation,
         lease_epoch: LeaseEpoch,
+        cluster_system_prompt: String,
+        node_spec: NodeSpec,
         tunnel: DaemonTunnelHandle,
         active_runners: Arc<AtomicU32>,
         active_tasks: Arc<Mutex<HashMap<ActivationId, ActiveActivationControl>>>,
@@ -329,10 +339,13 @@ impl AgentDaemon {
                     .lock()
                     .expect("discovered_models mutex poisoned")
                     .clone();
-                match daemon
-                    .config
-                    .merge_for_activation_with_discovered(&disc, &session, &activation)
-                {
+                match daemon.config.merge_for_activation_with_context(
+                    &disc,
+                    &cluster_system_prompt,
+                    &node_spec,
+                    &session,
+                    &activation,
+                ) {
                     Ok(merged) => merged,
                     Err(err) => {
                         let _ = tunnel
@@ -492,6 +505,8 @@ impl AgentDaemon {
                 workspace_root: workspace_root.clone(),
                 norm_workspace_key: norm_ws_key,
                 session_tmp_dir: session_tmp_dir.clone(),
+                effective_config: effective_config.clone(),
+                effective_permission: effective_permission.clone(),
                 effective_policy: runtime_permissions.clone(),
                 interceptor_chain: daemon.interceptor_chain.clone(),
                 activation_grants: Arc::new(Mutex::new(Vec::new())),
@@ -512,6 +527,7 @@ impl AgentDaemon {
                 session_tmp_dir,
                 effective_config,
                 effective_permissions: runtime_permissions,
+                disabled_tools: activation.spec.disabled_tools.clone(),
                 model_endpoint,
                 max_turns: daemon.config.max_turns,
             };

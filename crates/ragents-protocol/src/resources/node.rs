@@ -1,6 +1,7 @@
-use super::ObjectMeta;
+use super::{ObjectMeta, PermissionPolicyLayer};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
@@ -13,6 +14,15 @@ pub struct Node {
 pub struct NodeSpec {
     #[serde(default)]
     pub unschedulable: bool,
+    /// Node-level environment System Prompt (segment 2: `node_prompt`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_prompt: Option<String>,
+    /// Node-wide permission policy (seeded from `daemon.toml` on first registration, updated via `AllowNode`)
+    #[serde(default)]
+    pub permissions: PermissionPolicyLayer,
+    /// Workspace-scoped permission policies keyed by normalized `workspace_path` (updated via `AllowWorkspace`)
+    #[serde(default)]
+    pub workspace_permissions: BTreeMap<String, PermissionPolicyLayer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -61,6 +61,8 @@ impl ApiServerState {
                 session,
                 activation,
                 lease_epoch,
+                cluster_system_prompt,
+                node_spec,
             }) = dispatch_rx.recv().await
             {
                 let maybe_tx = peers_for_dispatch
@@ -73,6 +75,8 @@ impl ApiServerState {
                         session: Box::new(session),
                         activation: Box::new(activation),
                         lease_epoch,
+                        cluster_system_prompt,
+                        node_spec: Box::new(node_spec),
                     });
                 }
             }

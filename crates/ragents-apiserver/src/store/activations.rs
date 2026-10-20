@@ -215,26 +215,33 @@ impl SqliteStore {
                 .clone()
                 .unwrap_or_else(|| NodeId::new("unknown"));
 
-            act.status.phase = ActivationPhase::Running;
+            let is_initial_accept = act.status.phase == ActivationPhase::Scheduled;
+            if is_initial_accept {
+                act.status.phase = ActivationPhase::Running;
+                act.status.started_at = Some(Utc::now());
+            }
             act.status.effective_config_ref = Some(effective_config.config_ref.clone());
             act.status.effective_permission_ref =
                 Some(effective_permission.permission_snapshot_ref.clone());
-            act.status.started_at = Some(Utc::now());
+            session.status.latest_prompt_parts = Some(effective_config.prompt_parts.clone());
+            session.status.effective_tools = effective_config.effective_tools.clone();
 
-            let ev = Self::append_event_in_tx(
-                &tx,
-                session_id,
-                Some(activation_id.clone()),
-                None,
-                None,
-                SessionEvent::ActivationStarted {
-                    node_id,
-                    config_ref: effective_config.config_ref,
-                    permission_snapshot_ref: effective_permission.permission_snapshot_ref,
-                },
-            )?;
-            session.status.event_count = ev.event_seq.value() + 1;
-            events_to_publish.push(ev);
+            if is_initial_accept {
+                let ev = Self::append_event_in_tx(
+                    &tx,
+                    session_id,
+                    Some(activation_id.clone()),
+                    None,
+                    None,
+                    SessionEvent::ActivationStarted {
+                        node_id,
+                        config_ref: effective_config.config_ref,
+                        permission_snapshot_ref: effective_permission.permission_snapshot_ref,
+                    },
+                )?;
+                session.status.event_count = ev.event_seq.value() + 1;
+                events_to_publish.push(ev);
+            }
 
             Self::save_activation_in_tx(&tx, &mut act)?;
             Self::save_session_in_tx(&tx, &mut session)?;
@@ -633,6 +640,7 @@ impl SqliteStore {
                     submission_kind: SubmissionKind::Normal,
                     input: vec![Item::user_message(req.compaction_prompt.clone())],
                     model_override: None,
+                    disabled_tools: vec![],
                     desired_phase: DesiredActivationPhase::Running,
                     interaction_responses: BTreeMap::new(),
                 },
@@ -875,6 +883,7 @@ impl SqliteStore {
                         submission_kind: SubmissionKind::Continuation,
                         input: vec![],
                         model_override: from_act.spec.model_override.clone(),
+                        disabled_tools: from_act.spec.disabled_tools.clone(),
                         desired_phase: DesiredActivationPhase::Running,
                         interaction_responses: BTreeMap::new(),
                     },
@@ -962,18 +971,100 @@ impl SqliteStore {
             let mut should_notify_daemon = false;
 
             for (req_id, res_spec) in patch.interaction_responses {
-                if act
+                if let Some(pending_req) = act
                     .status
                     .pending_interactions
                     .iter()
-                    .any(|p| p.id == req_id)
+                    .find(|p| p.id == req_id)
+                    .cloned()
                 {
                     act.status.pending_interactions.retain(|p| p.id != req_id);
                     act.spec
                         .interaction_responses
                         .insert(req_id.clone(), res_spec.clone());
-                    let snap =
-                        PermissionSnapshot::from_effective_policy(session.spec.permissions.clone());
+
+                    let effective_cap = pending_req
+                        .capability
+                        .with_override_path(res_spec.override_path.as_deref());
+                    let target_node_id = act
+                        .status
+                        .assigned_node
+                        .clone()
+                        .or_else(|| session.status.bound_node_id.clone());
+
+                    match res_spec.decision {
+                        PermissionDecision::AllowSession => {
+                            session.spec.permissions.grant_capability(&effective_cap);
+                        }
+                        PermissionDecision::AllowWorkspace => {
+                            match (
+                                &session.spec.scheduling,
+                                target_node_id
+                                    .as_ref()
+                                    .and_then(|nid| Self::load_node_in_tx(&tx, nid).ok().flatten()),
+                            ) {
+                                (
+                                    SchedulingMode::Pinned { workspace_path, .. },
+                                    Some(mut node),
+                                ) => {
+                                    let ws_key =
+                                        normalize_and_resolve_workspace_path(workspace_path)
+                                            .to_string_lossy()
+                                            .into_owned();
+                                    node.spec
+                                        .workspace_permissions
+                                        .entry(ws_key)
+                                        .or_default()
+                                        .grant_capability(&effective_cap);
+                                    Self::save_node_spec_in_tx(&tx, &mut node)?;
+                                }
+                                _ => {
+                                    session.spec.permissions.grant_capability(&effective_cap);
+                                }
+                            }
+                        }
+                        PermissionDecision::AllowNode => {
+                            if let Some(nid) = target_node_id.as_ref() {
+                                if let Some(mut node) = Self::load_node_in_tx(&tx, nid)? {
+                                    node.spec.permissions.grant_capability(&effective_cap);
+                                    Self::save_node_spec_in_tx(&tx, &mut node)?;
+                                }
+                            }
+                        }
+                        PermissionDecision::Deny
+                        | PermissionDecision::AllowOnce
+                        | PermissionDecision::AllowActivation => {}
+                    }
+
+                    let mut combined_policy = PermissionPolicyLayer::default();
+                    if let Some(nid) = target_node_id.as_ref() {
+                        if let Some(node) = Self::load_node_in_tx(&tx, nid)? {
+                            combined_policy.merge_from(&node.spec.permissions);
+                            if let SchedulingMode::Pinned { workspace_path, .. } =
+                                &session.spec.scheduling
+                            {
+                                let ws_key = normalize_and_resolve_workspace_path(workspace_path)
+                                    .to_string_lossy()
+                                    .into_owned();
+                                if let Some(ws_pol) = node.spec.workspace_permissions.get(&ws_key) {
+                                    combined_policy.merge_from(ws_pol);
+                                }
+                            }
+                        }
+                    }
+                    combined_policy.merge_from(&session.spec.permissions);
+                    let snap = PermissionSnapshot::from_effective_policy(combined_policy);
+                    tx.execute(
+                        "INSERT OR IGNORE INTO permission_snapshots (permission_ref, created_at, payload_json) VALUES (?1, ?2, ?3)",
+                        params![
+                            snap.permission_snapshot_ref.as_str(),
+                            snap.created_at.to_rfc3339(),
+                            serde_json::to_string(&snap)?,
+                        ],
+                    )?;
+                    act.status.effective_permission_ref =
+                        Some(snap.permission_snapshot_ref.clone());
+
                     let ev = Self::append_event_in_tx(
                         &tx,
                         &sess_id,

@@ -13,6 +13,7 @@ exclude = [
     "extensions/file_editor",
     "extensions/image_viewer",
     "extensions/skills",
+    "extensions/agents_md",
     "extensions/compaction",
     "extensions/authn",
 ]

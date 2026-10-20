@@ -1,5 +1,6 @@
 use super::{
-    default_true, empty_json_object, ObjectMeta, PermissionPolicyLayer, ProtocolValidationError,
+    default_true, empty_json_object, ObjectMeta, PermissionPolicyLayer, PromptParts,
+    ProtocolValidationError,
 };
 use crate::ids::*;
 use openresponses_rust::ReasoningConfig;
@@ -258,6 +259,10 @@ pub struct SessionStatus {
     pub event_count: u64,
     #[serde(default)]
     pub compaction: SessionCompactionInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_prompt_parts: Option<PromptParts>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_tools: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -275,6 +280,8 @@ impl SessionStatus {
             batch_count: 0,
             event_count: 0,
             compaction: SessionCompactionInfo::default(),
+            latest_prompt_parts: None,
+            effective_tools: Vec::new(),
             last_error: None,
         }
     }

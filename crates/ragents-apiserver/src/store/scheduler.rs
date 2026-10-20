@@ -81,7 +81,9 @@ impl SqliteStore {
                 }
             };
 
+            let mut target_node_spec = NodeSpec::default();
             if let Some(mut node) = Self::load_node_in_tx(tx, &target_node_id)? {
+                target_node_spec = node.spec.clone();
                 node.status.active_runners = node.status.active_runners.saturating_add(1);
                 tx.execute(
                     "UPDATE nodes SET status_json = ?1 WHERE node_id = ?2",
@@ -91,6 +93,7 @@ impl SqliteStore {
                     ],
                 )?;
             }
+            let cluster_system_prompt = Self::load_cluster_system_prompt_in_tx(tx)?;
 
             let was_rescheduled_from = if session.spec.scheduling.is_floating() {
                 previous_assigned.filter(|prev| prev != &target_node_id)
@@ -107,6 +110,18 @@ impl SqliteStore {
             session.status.bound_node_id = Some(target_node_id.clone());
             session.status.queued_activation_count =
                 session.status.queued_activation_count.saturating_sub(1);
+            let existing_ext_prompts = session
+                .status
+                .latest_prompt_parts
+                .as_ref()
+                .map(|p| p.extension_prompts.clone())
+                .unwrap_or_default();
+            session.status.latest_prompt_parts = Some(PromptParts {
+                system_prompt: cluster_system_prompt.clone(),
+                node_prompt: target_node_spec.node_prompt.clone().unwrap_or_default(),
+                client_prompt: session.spec.system_prompt.clone().unwrap_or_default(),
+                extension_prompts: existing_ext_prompts,
+            });
 
             let sched_event = if let Some(from_node) = was_rescheduled_from {
                 SessionEvent::ActivationRescheduled {
@@ -141,6 +156,8 @@ impl SqliteStore {
                 session,
                 activation,
                 lease_epoch: next_epoch,
+                cluster_system_prompt,
+                node_spec: target_node_spec,
             });
         }
 

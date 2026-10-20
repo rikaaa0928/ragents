@@ -192,6 +192,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("please write approved.txt")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .await

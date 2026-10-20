@@ -94,6 +94,28 @@ struct IpcCoreHostProxy {
 
 #[async_trait]
 impl CoreHost for IpcCoreHostProxy {
+    async fn report_prepared_config(
+        &self,
+        extension_prompts: std::collections::BTreeMap<String, String>,
+        effective_tools: Vec<String>,
+    ) -> Result<(), CoreError> {
+        let mut ch = self.channel.lock().await;
+        match ch
+            .call(&WorkerToParentMessage::ReportPreparedConfig {
+                extension_prompts,
+                effective_tools,
+            })
+            .await?
+        {
+            ParentToWorkerMessage::ReportPreparedConfigReply { result } => {
+                result.map_err(CoreError::HostError)
+            }
+            other => Err(CoreError::HostError(format!(
+                "unexpected reply to ReportPreparedConfig: {other:?}"
+            ))),
+        }
+    }
+
     async fn load_effective_context(&self) -> Result<Vec<Item>, CoreError> {
         let mut ch = self.channel.lock().await;
         match ch

@@ -46,6 +46,8 @@ pub struct ScheduledDispatch {
     pub session: Session,
     pub activation: Activation,
     pub lease_epoch: LeaseEpoch,
+    pub cluster_system_prompt: String,
+    pub node_spec: NodeSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +101,25 @@ impl SqliteStore {
 
         Self::init_schema(&conn)?;
 
+        if let Ok(env_prompt) = std::env::var("RAGENTS_SYSTEM_PROMPT") {
+            let trimmed = env_prompt.trim();
+            if !trimmed.is_empty() {
+                let current: String = conn
+                    .query_row(
+                        "SELECT value FROM store_meta WHERE key = 'cluster_system_prompt'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                if current.trim().is_empty() {
+                    let _ = conn.execute(
+                        "UPDATE store_meta SET value = ?1 WHERE key = 'cluster_system_prompt'",
+                        params![trimmed],
+                    );
+                }
+            }
+        }
+
         let (event_tx, _) = broadcast::channel(4096);
         let (dispatch_tx, _) = broadcast::channel(1024);
         let (reconcile_tx, _) = broadcast::channel(1024);
@@ -149,6 +170,41 @@ impl SqliteStore {
         Ok(ResourceVersion::new(
             current_str.parse::<u64>().unwrap_or(0),
         ))
+    }
+
+    pub(crate) fn load_cluster_system_prompt_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<String, StoreError> {
+        let val: Option<String> = tx
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'cluster_system_prompt'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(val.unwrap_or_default())
+    }
+
+    pub fn get_cluster_system_prompt(&self) -> Result<String, StoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let val: Option<String> = conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'cluster_system_prompt'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(val.unwrap_or_default())
+    }
+
+    pub fn set_cluster_system_prompt(&self, prompt: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES ('cluster_system_prompt', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![prompt],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn append_event_in_tx(
@@ -275,6 +331,23 @@ impl SqliteStore {
             })),
             None => Ok(None),
         }
+    }
+
+    pub(crate) fn save_node_spec_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        node: &mut Node,
+    ) -> Result<(), StoreError> {
+        let rv = Self::next_resource_version(tx)?;
+        node.metadata.resource_version = rv;
+        tx.execute(
+            "UPDATE nodes SET resource_version = ?1, spec_json = ?2 WHERE node_id = ?3",
+            params![
+                rv.value() as i64,
+                serde_json::to_string(&node.spec)?,
+                node.metadata.id,
+            ],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn load_session_in_tx(

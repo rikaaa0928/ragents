@@ -54,6 +54,40 @@ impl SqliteStore {
         max_concurrent_runners: u32,
         lease_ttl_ms: u64,
     ) -> Result<(Node, Vec<ScheduledDispatch>), StoreError> {
+        self.register_node_with_seed(
+            node_id,
+            hostname,
+            os,
+            arch,
+            labels,
+            supported_models,
+            default_model,
+            None,
+            PermissionPolicyLayer::default(),
+            installed_extensions,
+            allowed_workspace_dirs,
+            max_concurrent_runners,
+            lease_ttl_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_node_with_seed(
+        &self,
+        node_id: NodeId,
+        hostname: String,
+        os: String,
+        arch: String,
+        labels: BTreeMap<String, String>,
+        supported_models: Vec<String>,
+        default_model: Option<String>,
+        default_system_prompt: Option<String>,
+        default_permissions: PermissionPolicyLayer,
+        installed_extensions: Vec<String>,
+        allowed_workspace_dirs: Vec<String>,
+        max_concurrent_runners: u32,
+        lease_ttl_ms: u64,
+    ) -> Result<(Node, Vec<ScheduledDispatch>), StoreError> {
         if !node_id.is_safe_identifier() {
             return Err(StoreError::Validation(
                 ProtocolValidationError::InvalidIdentifier(node_id.to_string()),
@@ -83,9 +117,16 @@ impl SqliteStore {
                 )
                 .optional()?;
 
+            // Seed-Only principle: only populate NodeSpec from daemon defaults on first registration.
+            // If the node already exists in `api-server`, preserve `api-server`'s stored NodeSpec (SSOT).
             let spec = match existing {
                 Some((spec_json, _)) => serde_json::from_str::<NodeSpec>(&spec_json)?,
-                None => NodeSpec::default(),
+                None => NodeSpec {
+                    unschedulable: false,
+                    node_prompt: default_system_prompt,
+                    permissions: default_permissions,
+                    workspace_permissions: BTreeMap::new(),
+                },
             };
 
             let mut meta = ObjectMeta::new(node_id.as_str(), rv);
@@ -160,11 +201,14 @@ impl SqliteStore {
                     Self::load_session_in_tx(&tx, &sess_id)?,
                 ) {
                     let lease_epoch = act.status.lease_epoch;
+                    let cluster_system_prompt = Self::load_cluster_system_prompt_in_tx(&tx)?;
                     dispatches.push(ScheduledDispatch {
                         node_id: node_id.clone(),
                         session: sess,
                         activation: act,
                         lease_epoch,
+                        cluster_system_prompt,
+                        node_spec: node.spec.clone(),
                     });
                 }
             }

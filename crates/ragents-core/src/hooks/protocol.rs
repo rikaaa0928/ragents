@@ -113,6 +113,14 @@ impl ModelDraft {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtensionPrepareOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append_system_prompt: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<ToolEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDraft {
     pub system_prompt: String,

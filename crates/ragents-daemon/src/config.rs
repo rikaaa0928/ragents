@@ -449,6 +449,23 @@ impl DaemonConfig {
         session: &Session,
         activation: &Activation,
     ) -> Result<(ConfigRevision, PermissionSnapshot, ModelEndpointConfig), DaemonConfigError> {
+        self.merge_for_activation_with_context(
+            discovered,
+            "",
+            &NodeSpec::default(),
+            session,
+            activation,
+        )
+    }
+
+    pub fn merge_for_activation_with_context(
+        &self,
+        discovered: &BTreeMap<String, LocalModelConfig>,
+        cluster_system_prompt: &str,
+        node_spec: &NodeSpec,
+        session: &Session,
+        activation: &Activation,
+    ) -> Result<(ConfigRevision, PermissionSnapshot, ModelEndpointConfig), DaemonConfigError> {
         if let SchedulingMode::Pinned { workspace_path, .. } = &session.spec.scheduling {
             self.validate_workspace_path(workspace_path)?;
         }
@@ -524,10 +541,18 @@ impl DaemonConfig {
             reasoning,
         };
 
-        let effective_system_prompt = match &session.spec.system_prompt {
-            Some(s) if !s.trim().is_empty() => s.clone(),
-            _ => self.default_system_prompt.clone(),
+        let node_prompt = node_spec
+            .node_prompt
+            .clone()
+            .unwrap_or_else(|| self.default_system_prompt.clone());
+        let client_prompt = session.spec.system_prompt.clone().unwrap_or_default();
+        let prompt_parts = PromptParts {
+            system_prompt: cluster_system_prompt.to_string(),
+            node_prompt,
+            client_prompt,
+            extension_prompts: BTreeMap::new(),
         };
+        let effective_system_prompt = prompt_parts.assemble();
 
         // Merge daemon extensions with session extensions (session overrides by name,
         // while resolving non-existent container paths against the daemon's local wasm dir)
@@ -564,8 +589,18 @@ impl DaemonConfig {
         }
         let effective_extensions: Vec<ExtensionSpec> = ext_map.into_values().collect();
 
-        let mut effective_permissions =
-            merge_permission_layers(&self.default_permissions, &session.spec.permissions);
+        let mut base_node_permissions = self.default_permissions.clone();
+        base_node_permissions.merge_from(&node_spec.permissions);
+        if let SchedulingMode::Pinned { workspace_path, .. } = &session.spec.scheduling {
+            let ws_key = normalize_and_resolve_workspace_path(workspace_path)
+                .to_string_lossy()
+                .into_owned();
+            if let Some(ws_pol) = node_spec.workspace_permissions.get(&ws_key) {
+                base_node_permissions.merge_from(ws_pol);
+            }
+        }
+        base_node_permissions.merge_from(&session.spec.permissions);
+        let mut effective_permissions = base_node_permissions;
         ensure_builtin_path_whitelist(&mut effective_permissions);
         for ext in &effective_extensions {
             if ext.enabled && !ext.allowed_dirs.is_empty() {
@@ -585,10 +620,12 @@ impl DaemonConfig {
             }
         }
 
-        let config_rev = ConfigRevision::new_merged(
+        let config_rev = ConfigRevision::new_merged_with_parts(
+            prompt_parts,
             effective_system_prompt,
             effective_model,
             effective_extensions,
+            Vec::new(),
         );
         let perm_snap = PermissionSnapshot::from_effective_policy(effective_permissions);
 

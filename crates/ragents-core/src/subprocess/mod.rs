@@ -257,7 +257,7 @@ impl SubprocessExecutor {
 
         if let Some(deps_dir) = current_exe.parent() {
             if let Some(target_profile_dir) = deps_dir.parent() {
-                for candidate_name in ["ragents", "ragents-core-worker"] {
+                for candidate_name in ["ragents-core-worker", "ragents"] {
                     let candidate = target_profile_dir.join(candidate_name);
                     if candidate.exists() {
                         return Ok((candidate, true));
@@ -351,6 +351,20 @@ impl CoreExecutor for SubprocessExecutor {
                 let msg: WorkerToParentMessage = serde_json::from_str(&line)?;
                 match msg {
                     WorkerToParentMessage::Hello { .. } => {}
+                    WorkerToParentMessage::ReportPreparedConfig {
+                        extension_prompts,
+                        effective_tools,
+                    } => {
+                        let res = tokio::select! {
+                            r = host.report_prepared_config(extension_prompts, effective_tools) => r.map_err(|e| e.to_string()),
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        };
+                        send_jsonl(
+                            &mut writer,
+                            &ParentToWorkerMessage::ReportPreparedConfigReply { result: res },
+                        )
+                        .await?;
+                    }
                     WorkerToParentMessage::LoadEffectiveContext => {
                         let res = tokio::select! {
                             r = host.load_effective_context() => r.map_err(|e| e.to_string()),

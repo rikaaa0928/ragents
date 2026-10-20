@@ -3,6 +3,7 @@ use crate::ids::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +97,70 @@ pub struct PermissionPolicyLayer {
     pub command_work_dir: Option<RuleSet<String>>,
 }
 
+impl PermissionPolicyLayer {
+    pub fn grant_capability(&mut self, cap: &CapabilityRequest) {
+        fn push_allow(slot: &mut Option<RuleSet<String>>, rule: String) {
+            let rs = slot.get_or_insert_with(RuleSet::default);
+            let allow = rs.allow.get_or_insert_with(Vec::new);
+            if !allow.contains(&rule) {
+                allow.push(rule);
+            }
+        }
+        match cap {
+            CapabilityRequest::FileRead { path } => {
+                push_allow(&mut self.file_read, path.to_string_lossy().into_owned());
+            }
+            CapabilityRequest::FileWrite { path } => {
+                let s = path.to_string_lossy().into_owned();
+                push_allow(&mut self.file_read, s.clone());
+                push_allow(&mut self.file_write, s);
+            }
+            CapabilityRequest::Http { host, .. } => {
+                push_allow(&mut self.http_hosts, host.clone());
+            }
+            CapabilityRequest::CommandWorkDir { work_dir } => {
+                let s = work_dir.to_string_lossy().into_owned();
+                push_allow(&mut self.file_read, s.clone());
+                push_allow(&mut self.command_work_dir, s);
+            }
+        }
+    }
+
+    pub fn merge_from(&mut self, other: &PermissionPolicyLayer) {
+        fn merge_ruleset(target: &mut Option<RuleSet<String>>, src: &Option<RuleSet<String>>) {
+            let Some(s) = src else { return };
+            let t = target.get_or_insert_with(RuleSet::default);
+            if let Some(ref deny) = s.deny {
+                let list = t.deny.get_or_insert_with(Vec::new);
+                for item in deny {
+                    if !list.contains(item) {
+                        list.push(item.clone());
+                    }
+                }
+            }
+            if let Some(ref allow) = s.allow {
+                let list = t.allow.get_or_insert_with(Vec::new);
+                if list.iter().any(|x| x == "*") && !allow.iter().any(|x| x == "*") {
+                    *list = allow.clone();
+                } else {
+                    for item in allow {
+                        if !list.contains(item) {
+                            list.push(item.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(def) = s.default {
+                t.default = Some(def);
+            }
+        }
+        merge_ruleset(&mut self.file_read, &other.file_read);
+        merge_ruleset(&mut self.file_write, &other.file_write);
+        merge_ruleset(&mut self.http_hosts, &other.http_hosts);
+        merge_ruleset(&mut self.command_work_dir, &other.command_work_dir);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
@@ -164,6 +229,57 @@ impl PermissionSnapshot {
     }
 }
 
+/// Four-segment composable System Prompt persisted in `api-server`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptParts {
+    /// 1. System-wide base prompt configured on `api-server`
+    #[serde(default)]
+    pub system_prompt: String,
+    /// 2. Node-level environment prompt configured on `NodeSpec`
+    #[serde(default)]
+    pub node_prompt: String,
+    /// 3. Client/Role prompt configured on `SessionSpec`
+    #[serde(default)]
+    pub client_prompt: String,
+    /// 4. Extension-contributed prompts keyed by extension id (e.g. `agents_md`, `skills`, `chatroom`)
+    #[serde(default)]
+    pub extension_prompts: BTreeMap<String, String>,
+}
+
+impl PromptParts {
+    /// Deterministically assembles the 4 segments from most static to most dynamic.
+    pub fn assemble(&self) -> String {
+        let mut sections = Vec::new();
+        if !self.system_prompt.trim().is_empty() {
+            sections.push(self.system_prompt.trim().to_string());
+        }
+        if !self.node_prompt.trim().is_empty() {
+            sections.push(self.node_prompt.trim().to_string());
+        }
+        if !self.client_prompt.trim().is_empty() {
+            sections.push(self.client_prompt.trim().to_string());
+        }
+        if let Some(agents_md) = self.extension_prompts.get("agents_md") {
+            if !agents_md.trim().is_empty() {
+                sections.push(agents_md.trim().to_string());
+            }
+        }
+        for (ext_id, text) in &self.extension_prompts {
+            if ext_id == "agents_md" {
+                continue;
+            }
+            if !text.trim().is_empty() {
+                sections.push(text.trim().to_string());
+            }
+        }
+        if sections.is_empty() {
+            "You are a helpful assistant.".to_string()
+        } else {
+            sections.join("\n\n")
+        }
+    }
+}
+
 /// Frozen, content-addressed effective configuration merged by `agent-daemon`.
 /// Strictly excludes sensitive credentials (`api_key`, `base_url`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,9 +288,13 @@ pub struct ConfigRevision {
     pub config_ref: ConfigRef,
     pub created_at: DateTime<Utc>,
     pub system_prompt: String,
+    #[serde(default)]
+    pub prompt_parts: PromptParts,
     pub model: ModelRequestSpec,
     #[serde(default)]
     pub extensions: Vec<ExtensionSpec>,
+    #[serde(default)]
+    pub effective_tools: Vec<String>,
 }
 
 impl ConfigRevision {
@@ -183,11 +303,27 @@ impl ConfigRevision {
         model: ModelRequestSpec,
         extensions: Vec<ExtensionSpec>,
     ) -> Self {
+        let prompt_parts = PromptParts {
+            client_prompt: system_prompt.clone(),
+            ..Default::default()
+        };
+        Self::new_merged_with_parts(prompt_parts, system_prompt, model, extensions, Vec::new())
+    }
+
+    pub fn new_merged_with_parts(
+        prompt_parts: PromptParts,
+        system_prompt: String,
+        model: ModelRequestSpec,
+        extensions: Vec<ExtensionSpec>,
+        effective_tools: Vec<String>,
+    ) -> Self {
         let canonical = canonicalize_json(&serde_json::json!({
             "format_version": 1,
             "system_prompt": &system_prompt,
+            "prompt_parts": &prompt_parts,
             "model": &model,
             "extensions": &extensions,
+            "effective_tools": &effective_tools,
         }));
         let digest = sha256_hex(&canonical);
         Self {
@@ -195,8 +331,10 @@ impl ConfigRevision {
             config_ref: ConfigRef::new(format!("cfg_sha256:{digest}")),
             created_at: Utc::now(),
             system_prompt,
+            prompt_parts,
             model,
             extensions,
+            effective_tools,
         }
     }
 }

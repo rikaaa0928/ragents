@@ -11,6 +11,15 @@ impl SqliteStore {
         session_id: &SessionId,
         content: Vec<openresponses_rust::MessageContent>,
     ) -> Result<PushRealtimeMessageResponse, StoreError> {
+        self.push_realtime_message_with_options(session_id, content, Vec::new())
+    }
+
+    pub fn push_realtime_message_with_options(
+        &self,
+        session_id: &SessionId,
+        content: Vec<openresponses_rust::MessageContent>,
+        disabled_tools: Vec<String>,
+    ) -> Result<PushRealtimeMessageResponse, StoreError> {
         let mut events_to_publish = Vec::new();
         let mut dispatches = Vec::new();
         let response = {
@@ -73,6 +82,7 @@ impl SqliteStore {
                             submission_kind: SubmissionKind::Continuation,
                             input: vec![],
                             model_override: None,
+                            disabled_tools,
                             desired_phase: DesiredActivationPhase::Running,
                             interaction_responses: BTreeMap::new(),
                         },

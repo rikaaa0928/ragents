@@ -53,6 +53,7 @@ fn test_pinned_session_never_migrates_across_nodes() {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("edit main.rs")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .expect("create pinned session");
@@ -87,6 +88,7 @@ fn test_pinned_session_never_migrates_across_nodes() {
                 submission_kind: SubmissionKind::FollowUp,
                 input: vec![Item::user_message("try again")],
                 model_override: None,
+                disabled_tools: vec![],
                 desired_phase: DesiredActivationPhase::Running,
                 interaction_responses: BTreeMap::new(),
             },
@@ -120,6 +122,7 @@ fn test_floating_session_failover_and_fencing_token() {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("analyze algorithm")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .expect("create floating session");
@@ -233,6 +236,7 @@ fn test_cross_session_source_lineage_context_resolution() {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("turn 1 user")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .expect("create parent");
@@ -279,6 +283,7 @@ fn test_cross_session_source_lineage_context_resolution() {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("child follow-up")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .expect("create child session");

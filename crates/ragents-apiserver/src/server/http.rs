@@ -353,7 +353,15 @@ pub(crate) async fn handle_push_realtime_message(
             &sess.metadata.labels,
         )
         .await?;
-    let resp = state.store.push_realtime_message(&id, req.content)?;
+    let admitted = state
+        .extensions
+        .admit(&principal, AdmissionOperation::PushRealtimeMessage, req)
+        .await?;
+    let resp = state.store.push_realtime_message_with_options(
+        &id,
+        admitted.content,
+        admitted.disabled_tools,
+    )?;
     Ok((StatusCode::CREATED, Json(resp)))
 }
 

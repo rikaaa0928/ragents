@@ -20,8 +20,6 @@ struct SkillsConfig {
     include_workspace: bool,
     #[serde(default = "default_true")]
     include_global: bool,
-    #[serde(default = "default_true")]
-    include_agents_md: bool,
 }
 
 fn default_true() -> bool {
@@ -41,7 +39,6 @@ thread_local! {
         skill_dirs: Vec::new(),
         include_workspace: true,
         include_global: true,
-        include_agents_md: true,
     });
     static DISCOVERED_SKILLS: RefCell<BTreeMap<String, SkillEntry>> = const { RefCell::new(BTreeMap::new()) };
 }
@@ -118,7 +115,6 @@ impl exports::ragent::extension::lifecycle::Guest for SkillsExtension {
                 skill_dirs: Vec::new(),
                 include_workspace: true,
                 include_global: true,
-                include_agents_md: true,
             }
         } else {
             serde_json::from_value(value).map_err(|e| e.to_string())?
@@ -130,7 +126,7 @@ impl exports::ragent::extension::lifecycle::Guest for SkillsExtension {
     fn invoke(request: String) -> Result<String, String> {
         let request: HookRequest = serde_json::from_str(&request).map_err(|e| e.to_string())?;
         match request.hook.as_str() {
-            AGENT_PREPARE_HOOK => handle_agent_prepare(request.payload),
+            AGENT_PREPARE_HOOK => handle_agent_prepare(),
             TOOLS_CALL_HOOK => handle_tools_call(request.payload),
             hook => Err(format!("unsupported hook: {hook}")),
         }
@@ -139,78 +135,56 @@ impl exports::ragent::extension::lifecycle::Guest for SkillsExtension {
     fn shutdown() {}
 }
 
-fn handle_agent_prepare(mut draft: serde_json::Value) -> Result<String, String> {
+fn handle_agent_prepare() -> Result<String, String> {
     let cfg = CONFIG.with(|c| c.borrow().clone());
     let skills = discover_all_skills(&cfg);
     DISCOVERED_SKILLS.with(|s| *s.borrow_mut() = skills.clone());
 
-    let mut prompt_additions = String::new();
-
-    if cfg.include_agents_md {
-        for candidate in ["AGENTS.md", "CLAUDE.md"] {
-            if let Ok(content) = fs::read_to_string(candidate) {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    prompt_additions.push_str(&format!(
-                        "\n\n<workspace_instructions file=\"{candidate}\">\n{trimmed}\n</workspace_instructions>"
-                    ));
-                    break;
-                }
-            }
-        }
+    if skills.is_empty() {
+        return Ok(serde_json::json!({ "action": "unchanged" }).to_string());
     }
 
-    if !skills.is_empty() {
-        prompt_additions.push_str(
-            "\n\n<skills>\nThe following skills provide specialized instructions for specific tasks.\nUse `load_skill` (or `read_file`) to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n",
-        );
-        for skill in skills.values() {
-            prompt_additions.push_str(&format!(
-                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
-                escape_xml(&skill.name),
-                escape_xml(&skill.description),
-                escape_xml(&skill.location),
-            ));
-        }
-        prompt_additions.push_str("</available_skills>\n</skills>");
+    let mut prompt_additions = String::from(
+        "<skills>\nThe following skills provide specialized instructions for specific tasks.\nUse `load_skill` (or `read_file`) to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n",
+    );
+    for skill in skills.values() {
+        prompt_additions.push_str(&format!(
+            "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
+            escape_xml(&skill.name),
+            escape_xml(&skill.description),
+            escape_xml(&skill.location),
+        ));
+    }
+    prompt_additions.push_str("</available_skills>\n</skills>");
 
-        let tools = draft
-            .get_mut("tools")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or("agent.prepare payload has no tools array")?;
-
-        tools.push(serde_json::json!({
-            "enabled": true,
-            "name": "load_skill",
-            "description": "Load the full instructions (SKILL.md) or a supporting file from an installed agent skill listed in <available_skills>.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Exact name of the skill from <available_skills>"
-                    },
-                    "file": {
-                        "type": "string",
-                        "description": "Optional relative file path within the skill directory (defaults to 'SKILL.md')"
-                    }
+    let tools = vec![serde_json::json!({
+        "enabled": true,
+        "name": "load_skill",
+        "description": "Load the full instructions (SKILL.md) or a supporting file from an installed agent skill listed in <available_skills>.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact name of the skill from <available_skills>"
                 },
-                "required": ["name"]
-            }
-        }));
-    }
-
-    if !prompt_additions.is_empty() {
-        if let Some(sys) = draft
-            .get("system_prompt")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-        {
-            draft["system_prompt"] = serde_json::Value::String(format!("{sys}{prompt_additions}"));
+                "file": {
+                    "type": "string",
+                    "description": "Optional relative file path within the skill directory (defaults to 'SKILL.md')"
+                }
+            },
+            "required": ["name"]
         }
-    }
+    })];
 
-    Ok(serde_json::json!({"action": "continue", "payload": draft}).to_string())
+    Ok(serde_json::json!({
+        "action": "continue",
+        "payload": {
+            "append_system_prompt": prompt_additions,
+            "tools": tools
+        }
+    })
+    .to_string())
 }
 
 fn handle_tools_call(payload: serde_json::Value) -> Result<String, String> {
