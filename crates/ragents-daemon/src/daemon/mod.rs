@@ -97,6 +97,55 @@ impl AgentDaemon {
             .or_else(|| self.effective_supported_models().into_iter().next())
     }
 
+    pub fn sync_grants_from_node_spec(&self, node_spec: &NodeSpec) {
+        {
+            let mut n_guard = self.node_grants.lock().expect("node_grants mutex poisoned");
+            for cap in policy_layer_to_capability_grants(&node_spec.permissions) {
+                if !n_guard.contains(&cap) {
+                    n_guard.push(cap);
+                }
+            }
+        }
+        {
+            let mut w_guard = self
+                .workspace_grants
+                .lock()
+                .expect("workspace_grants mutex poisoned");
+            for (ws_str, pol) in &node_spec.workspace_permissions {
+                let raw_path = PathBuf::from(ws_str);
+                let canon_path = raw_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| raw_path.clone());
+                let grants = policy_layer_to_capability_grants(pol);
+                for key in [raw_path, canon_path] {
+                    let entry = w_guard.entry(key).or_default();
+                    for cap in &grants {
+                        if !entry.contains(cap) {
+                            entry.push(cap.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn sync_session_grants(&self, session_id: &SessionId, policy: &PermissionPolicyLayer) {
+        let grants = policy_layer_to_capability_grants(policy);
+        if grants.is_empty() {
+            return;
+        }
+        let mut s_guard = self
+            .session_grants
+            .lock()
+            .expect("session_grants mutex poisoned");
+        let entry = s_guard.entry(session_id.clone()).or_default();
+        for cap in grants {
+            if !entry.contains(&cap) {
+                entry.push(cap);
+            }
+        }
+    }
+
     /// Connects to `api-server`, registers the node, starts heartbeat and reconcile loop in the background.
     pub async fn start(&self, shutdown: CancellationToken) -> Result<(), ClientError> {
         if self.config.auto_discover_models {
@@ -119,7 +168,7 @@ impl AgentDaemon {
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
 
-        let (lease_ttl_ms, _rv) = tunnel
+        let (lease_ttl_ms, _rv, initial_node_spec) = tunnel
             .register_node_with_seed(
                 self.config.node_id.clone(),
                 hostname,
@@ -135,6 +184,7 @@ impl AgentDaemon {
                 self.config.max_concurrent_runners,
             )
             .await?;
+        self.sync_grants_from_node_spec(&initial_node_spec);
 
         let active_runners = Arc::new(AtomicU32::new(0));
         let active_tasks: Arc<Mutex<HashMap<ActivationId, ActiveActivationControl>>> =
@@ -277,7 +327,7 @@ impl AgentDaemon {
                                 .unwrap_or_else(|_| "localhost".to_string());
                             let os = std::env::consts::OS.to_string();
                             let arch = std::env::consts::ARCH.to_string();
-                            if new_tunnel
+                            if let Ok((_, _, reconnected_node_spec)) = new_tunnel
                                 .register_node_with_seed(
                                     daemon.config.node_id.clone(),
                                     hostname,
@@ -293,8 +343,8 @@ impl AgentDaemon {
                                     daemon.config.max_concurrent_runners,
                                 )
                                 .await
-                                .is_ok()
                             {
+                                daemon.sync_grants_from_node_spec(&reconnected_node_spec);
                                 let count = active_runners.load(Ordering::Relaxed);
                                 let _ = new_tunnel
                                     .heartbeat(daemon.config.node_id.clone(), count)
@@ -332,6 +382,8 @@ impl AgentDaemon {
         tokio::spawn(async move {
             let sess_id = SessionId::new(session.metadata.id.clone());
             let act_id = ActivationId::new(activation.metadata.id.clone());
+            daemon.sync_grants_from_node_spec(&node_spec);
+            daemon.sync_session_grants(&sess_id, &session.spec.permissions);
 
             let (effective_config, effective_permission, model_endpoint) = {
                 let disc = daemon
@@ -606,4 +658,56 @@ impl AgentDaemon {
             }
         });
     }
+}
+
+fn policy_layer_to_capability_grants(policy: &PermissionPolicyLayer) -> Vec<CapabilityRequest> {
+    let mut grants = Vec::new();
+    if let Some(ref fr) = policy.file_read {
+        if let Some(ref allows) = fr.allow {
+            for pat in allows {
+                if pat != "." && pat != "*" {
+                    grants.push(CapabilityRequest::FileRead {
+                        path: PathBuf::from(pat),
+                    });
+                }
+            }
+        }
+    }
+    if let Some(ref fw) = policy.file_write {
+        if let Some(ref allows) = fw.allow {
+            for pat in allows {
+                if pat != "." && pat != "*" {
+                    grants.push(CapabilityRequest::FileWrite {
+                        path: PathBuf::from(pat),
+                    });
+                }
+            }
+        }
+    }
+    if let Some(ref cwd) = policy.command_work_dir {
+        if let Some(ref allows) = cwd.allow {
+            for pat in allows {
+                if pat != "." && pat != "*" {
+                    grants.push(CapabilityRequest::CommandWorkDir {
+                        work_dir: PathBuf::from(pat),
+                    });
+                }
+            }
+        }
+    }
+    if let Some(ref hh) = policy.http_hosts {
+        if let Some(ref allows) = hh.allow {
+            for pat in allows {
+                if pat != "*" {
+                    grants.push(CapabilityRequest::Http {
+                        scheme: "https".to_string(),
+                        host: pat.clone(),
+                        port: None,
+                        method: "GET".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    grants
 }

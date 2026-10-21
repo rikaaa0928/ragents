@@ -158,6 +158,7 @@ impl DaemonTunnelHandle {
             max_concurrent_runners,
         )
         .await
+        .map(|(ttl, rv, _)| (ttl, rv))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -175,7 +176,7 @@ impl DaemonTunnelHandle {
         installed_extensions: Vec<String>,
         allowed_workspace_dirs: Vec<String>,
         max_concurrent_runners: u32,
-    ) -> Result<(u64, ResourceVersion), ClientError> {
+    ) -> Result<(u64, ResourceVersion, NodeSpec), ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::RegisterNode {
@@ -199,8 +200,9 @@ impl DaemonTunnelHandle {
             ServerToDaemonMessage::Registered {
                 lease_ttl_ms,
                 resource_version,
+                node_spec,
                 ..
-            } => Ok((lease_ttl_ms, resource_version)),
+            } => Ok((lease_ttl_ms, resource_version, node_spec)),
             ServerToDaemonMessage::Ack {
                 ok: false, error, ..
             } => Err(ClientError::Tunnel(

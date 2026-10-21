@@ -77,11 +77,24 @@ impl SandboxState {
         let mut allowed_read_paths = Vec::new();
 
         let resolve = |raw: &str| -> PathBuf {
-            let p = Path::new(raw);
-            if p.is_absolute() {
-                p.to_path_buf()
+            let expanded = if raw == "~" || raw.starts_with("~/") {
+                if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+                    let tail = raw.strip_prefix("~/").unwrap_or("");
+                    if tail.is_empty() {
+                        PathBuf::from(home)
+                    } else {
+                        Path::new(&home).join(tail)
+                    }
+                } else {
+                    PathBuf::from(raw)
+                }
             } else {
-                workspace_root.join(p)
+                PathBuf::from(raw)
+            };
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                workspace_root.join(expanded)
             }
         };
 
@@ -159,21 +172,42 @@ impl SandboxState {
         let p = path.into();
         let mut guard = self.writable_paths.lock().expect("writable_paths poisoned");
         if p.exists() && p.is_dir() {
-            guard.push(p);
+            if !guard.contains(&p) {
+                guard.push(p);
+            }
         } else {
             if let Some(parent) = p.parent() {
-                guard.push(parent.to_path_buf());
+                let parent_buf = parent.to_path_buf();
+                if !guard.contains(&parent_buf) {
+                    guard.push(parent_buf);
+                }
             }
-            guard.push(p);
+            if !guard.contains(&p) {
+                guard.push(p);
+            }
         }
     }
 
     pub fn allow_readable_path(&self, path: impl Into<PathBuf>) {
         let p = path.into();
-        self.allowed_read_paths
+        let mut guard = self
+            .allowed_read_paths
             .lock()
-            .expect("allowed_read_paths poisoned")
-            .push(p);
+            .expect("allowed_read_paths poisoned");
+        if !guard.contains(&p) {
+            guard.push(p);
+        }
+    }
+
+    pub fn apply_capability_grant(&self, cap: &CapabilityRequest) {
+        match cap {
+            CapabilityRequest::FileWrite { path } => self.allow_writable_path(path.clone()),
+            CapabilityRequest::FileRead { path } => self.allow_readable_path(path.clone()),
+            CapabilityRequest::CommandWorkDir { work_dir } => {
+                self.allow_writable_path(work_dir.clone())
+            }
+            CapabilityRequest::Http { .. } => {}
+        }
     }
 
     pub fn revoke_temporary_path(&self, path: &Path) {

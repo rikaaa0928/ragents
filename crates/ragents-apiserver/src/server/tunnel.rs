@@ -155,6 +155,7 @@ fn handle_daemon_message(
                         node_id,
                         lease_ttl_ms: state.lease_ttl_ms,
                         resource_version: node.metadata.resource_version,
+                        node_spec: node.spec,
                     });
                 }
                 Err(e) => {

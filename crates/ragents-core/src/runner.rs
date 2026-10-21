@@ -268,10 +268,16 @@ impl CoreExecutor for InProcessExecutor {
 
         let mut hook_manager = HookManager::empty();
         let sandbox_state = Arc::new(SandboxState::from_run_spec(&run_spec));
-        let base_preopen_dirs = vec![
+        let mut base_preopen_dirs = vec![
             run_spec.workspace_root.clone(),
             run_spec.session_tmp_dir.clone(),
         ];
+        let (w_dirs, r_dirs) = sandbox_state.wasi_preopen_dirs();
+        for dir in w_dirs.into_iter().chain(r_dirs.into_iter()) {
+            if !base_preopen_dirs.contains(&dir) {
+                base_preopen_dirs.push(dir);
+            }
+        }
 
         for ext in &run_spec.effective_config.extensions {
             if ext.enabled {

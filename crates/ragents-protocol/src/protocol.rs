@@ -281,6 +281,8 @@ pub enum ServerToDaemonMessage {
         node_id: NodeId,
         lease_ttl_ms: u64,
         resource_version: ResourceVersion,
+        #[serde(default)]
+        node_spec: NodeSpec,
     },
     Ack {
         request_id: String,

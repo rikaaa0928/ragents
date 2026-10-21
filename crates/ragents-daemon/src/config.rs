@@ -567,20 +567,32 @@ impl DaemonConfig {
         }
         for ext in &session.spec.extensions {
             let mut merged = ext.clone();
-            if !Path::new(&merged.path).exists() {
-                if let Some(existing) = ext_map.get(&ext.name) {
-                    if Path::new(&existing.path).exists() {
-                        merged.path = existing.path.clone();
+            if let Some(existing) = ext_map.get(&ext.name) {
+                for dir in &existing.allowed_dirs {
+                    if !merged.allowed_dirs.contains(dir) {
+                        merged.allowed_dirs.push(dir.clone());
                     }
                 }
-                if !Path::new(&merged.path).exists() {
-                    if let Some(fname) = Path::new(&merged.path).file_name() {
-                        for dir in &local_wasm_dirs {
-                            let cand = dir.join(fname);
-                            if cand.exists() {
-                                merged.path = cand.to_string_lossy().to_string();
-                                break;
-                            }
+                let is_empty_cfg = merged.config.is_null()
+                    || merged
+                        .config
+                        .as_object()
+                        .map(|o| o.is_empty())
+                        .unwrap_or(false);
+                if is_empty_cfg && !existing.config.is_null() {
+                    merged.config = existing.config.clone();
+                }
+                if !Path::new(&merged.path).exists() && Path::new(&existing.path).exists() {
+                    merged.path = existing.path.clone();
+                }
+            }
+            if !Path::new(&merged.path).exists() {
+                if let Some(fname) = Path::new(&merged.path).file_name() {
+                    for dir in &local_wasm_dirs {
+                        let cand = dir.join(fname);
+                        if cand.exists() {
+                            merged.path = cand.to_string_lossy().to_string();
+                            break;
                         }
                     }
                 }
@@ -592,11 +604,17 @@ impl DaemonConfig {
         let mut base_node_permissions = self.default_permissions.clone();
         base_node_permissions.merge_from(&node_spec.permissions);
         if let SchedulingMode::Pinned { workspace_path, .. } = &session.spec.scheduling {
-            let ws_key = normalize_and_resolve_workspace_path(workspace_path)
+            let raw_key = workspace_path.to_string_lossy().into_owned();
+            let norm_key = normalize_and_resolve_workspace_path(workspace_path)
                 .to_string_lossy()
                 .into_owned();
-            if let Some(ws_pol) = node_spec.workspace_permissions.get(&ws_key) {
+            if let Some(ws_pol) = node_spec.workspace_permissions.get(&raw_key) {
                 base_node_permissions.merge_from(ws_pol);
+            }
+            if norm_key != raw_key {
+                if let Some(ws_pol) = node_spec.workspace_permissions.get(&norm_key) {
+                    base_node_permissions.merge_from(ws_pol);
+                }
             }
         }
         base_node_permissions.merge_from(&session.spec.permissions);

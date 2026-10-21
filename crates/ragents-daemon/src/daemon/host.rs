@@ -152,6 +152,45 @@ impl DaemonCoreHost {
         }
         false
     }
+
+    fn sync_sandbox_with_grants(&self) {
+        for g in self
+            .activation_grants
+            .lock()
+            .expect("activation_grants mutex poisoned")
+            .iter()
+        {
+            self.sandbox_state.apply_capability_grant(g);
+        }
+        if let Some(s_grants) = self
+            .session_grants
+            .lock()
+            .expect("session_grants mutex poisoned")
+            .get(&self.session_id)
+        {
+            for g in s_grants {
+                self.sandbox_state.apply_capability_grant(g);
+            }
+        }
+        if let Some(w_grants) = self
+            .workspace_grants
+            .lock()
+            .expect("workspace_grants mutex poisoned")
+            .get(&self.norm_workspace_key)
+        {
+            for g in w_grants {
+                self.sandbox_state.apply_capability_grant(g);
+            }
+        }
+        for g in self
+            .node_grants
+            .lock()
+            .expect("node_grants mutex poisoned")
+            .iter()
+        {
+            self.sandbox_state.apply_capability_grant(g);
+        }
+    }
 }
 
 #[async_trait]
@@ -396,6 +435,7 @@ impl CoreHost for DaemonCoreHost {
                         Ok(PermissionOutcome::allowed_with(effective_cap, false))
                     }
                     PermissionDecision::AllowActivation => {
+                        self.sandbox_state.apply_capability_grant(&effective_cap);
                         self.activation_grants
                             .lock()
                             .expect("activation_grants mutex poisoned")
@@ -403,6 +443,7 @@ impl CoreHost for DaemonCoreHost {
                         Ok(PermissionOutcome::allowed_with(effective_cap, true))
                     }
                     PermissionDecision::AllowSession => {
+                        self.sandbox_state.apply_capability_grant(&effective_cap);
                         self.session_grants
                             .lock()
                             .expect("session_grants mutex poisoned")
@@ -412,6 +453,7 @@ impl CoreHost for DaemonCoreHost {
                         Ok(PermissionOutcome::allowed_with(effective_cap, true))
                     }
                     PermissionDecision::AllowWorkspace => {
+                        self.sandbox_state.apply_capability_grant(&effective_cap);
                         self.workspace_grants
                             .lock()
                             .expect("workspace_grants mutex poisoned")
@@ -421,6 +463,7 @@ impl CoreHost for DaemonCoreHost {
                         Ok(PermissionOutcome::allowed_with(effective_cap, true))
                     }
                     PermissionDecision::AllowNode => {
+                        self.sandbox_state.apply_capability_grant(&effective_cap);
                         self.node_grants
                             .lock()
                             .expect("node_grants mutex poisoned")
@@ -452,6 +495,7 @@ impl CoreHost for DaemonCoreHost {
         extension_id: Option<&str>,
         request: ProcessActionRequest,
     ) -> Result<Option<ProcessActionResponse>, CoreError> {
+        self.sync_sandbox_with_grants();
         let self_arc: Arc<dyn CoreHost> = Arc::new(self.clone());
         let resp = self
             .process_manager

@@ -150,7 +150,13 @@ impl HostState {
             return Err(wasi_fs_types::ErrorCode::NotPermitted.into());
         };
 
-        if !is_write && in_preopen_dirs && !self.sandbox_state.is_read_denied(full_path) {
+        if !is_write
+            && (in_preopen_dirs || self.sandbox_state.is_path_readable(full_path))
+            && !self.sandbox_state.is_read_denied(full_path)
+        {
+            return Ok(());
+        }
+        if is_write && self.sandbox_state.is_path_writable(full_path) {
             return Ok(());
         }
 
@@ -205,7 +211,7 @@ impl HostState {
         {
             Ok(PermissionOutcome::Allowed {
                 effective_capability,
-                ..
+                persist_in_activation,
             }) => {
                 let granted_cap = effective_capability.unwrap_or(cap);
                 let approved_path = granted_cap
@@ -217,6 +223,9 @@ impl HostState {
                     && !full_path.starts_with(&approved_path)
                 {
                     return Err(wasi_fs_types::ErrorCode::NotPermitted.into());
+                }
+                if persist_in_activation {
+                    self.sandbox_state.apply_capability_grant(&granted_cap);
                 }
                 if is_write {
                     self.invoke_approved_writes.push(norm_approved);
