@@ -59,6 +59,7 @@ fn test_config_revision_content_addressed_sha256_stability() {
             temperature: Some(0.2),
             max_output_tokens: Some(4096),
             reasoning: None,
+            built_in_tools: vec![],
         },
         vec![ext1],
     );
@@ -70,6 +71,7 @@ fn test_config_revision_content_addressed_sha256_stability() {
             temperature: Some(0.2),
             max_output_tokens: Some(4096),
             reasoning: None,
+            built_in_tools: vec![],
         },
         vec![ext2],
     );

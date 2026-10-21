@@ -412,15 +412,34 @@ async fn run_react_loop(
         .cloned()
         .collect::<Vec<_>>();
 
-    let active_tool_names = active_tools
+    let active_built_in_tools = cfg
+        .model
+        .built_in_tools
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|name| {
+            !name.is_empty()
+                && !run_spec
+                    .disabled_tools
+                    .iter()
+                    .any(|disabled| disabled == name)
+        })
+        .collect::<Vec<_>>();
+
+    let mut active_tool_names = active_tools
         .iter()
         .map(|t| t.definition.name.clone())
         .collect::<Vec<_>>();
+    for bt in &active_built_in_tools {
+        if !active_tool_names.contains(bt) {
+            active_tool_names.push(bt.clone());
+        }
+    }
 
     host.report_prepared_config(extension_prompts, active_tool_names)
         .await?;
 
-    let request_tools = active_tools
+    let mut request_tools = active_tools
         .iter()
         .map(|t| {
             Tool::function(t.definition.name.clone())
@@ -428,6 +447,13 @@ async fn run_react_loop(
                 .with_parameters(t.definition.parameters.clone())
         })
         .collect::<Vec<_>>();
+
+    for bt in &active_built_in_tools {
+        request_tools.push(Tool::Extension {
+            tool_type: bt.clone(),
+            extra: serde_json::Map::new(),
+        });
+    }
 
     let mut iteration = 0usize;
     let mut final_text = String::new();

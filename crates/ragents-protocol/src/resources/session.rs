@@ -137,6 +137,8 @@ pub struct ModelRequestSpec {
     pub max_output_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub built_in_tools: Vec<String>,
 }
 
 impl ModelRequestSpec {
@@ -146,6 +148,7 @@ impl ModelRequestSpec {
             temperature: None,
             max_output_tokens: None,
             reasoning: None,
+            built_in_tools: Vec::new(),
         }
     }
 

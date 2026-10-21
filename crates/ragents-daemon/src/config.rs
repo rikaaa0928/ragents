@@ -534,11 +534,27 @@ impl DaemonConfig {
                     .and_then(|m| m.reasoning.clone())
             });
 
+        let built_in_tools = activation
+            .spec
+            .model_override
+            .as_ref()
+            .filter(|m| !m.built_in_tools.is_empty())
+            .map(|m| m.built_in_tools.clone())
+            .or_else(|| {
+                session
+                    .spec
+                    .model
+                    .as_ref()
+                    .map(|m| m.built_in_tools.clone())
+            })
+            .unwrap_or_default();
+
         let effective_model = ModelRequestSpec {
             name: requested_model_name,
             temperature,
             max_output_tokens,
             reasoning,
+            built_in_tools,
         };
 
         let node_prompt = node_spec
