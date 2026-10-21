@@ -62,38 +62,56 @@ impl DaemonTunnelHandle {
         msg: DaemonToServerMessage,
     ) -> Result<ServerToDaemonMessage, ClientError> {
         let req_id = Self::extract_request_id(&msg).to_string();
-        let (tx, rx) = oneshot::channel();
-        let (out_tx, pending) = {
-            let guard = self.inner.lock().expect("tunnel mutex poisoned");
-            (guard.out_tx.clone(), guard.pending.clone())
-        };
+        let max_attempts = 3usize;
 
-        pending
-            .lock()
-            .expect("pending mutex poisoned")
-            .insert(req_id.clone(), tx);
+        for attempt in 1..=max_attempts {
+            let (tx, rx) = oneshot::channel();
+            let (out_tx, pending) = {
+                let guard = self.inner.lock().expect("tunnel mutex poisoned");
+                (guard.out_tx.clone(), guard.pending.clone())
+            };
 
-        if out_tx.send(msg).is_err() {
             pending
                 .lock()
                 .expect("pending mutex poisoned")
-                .remove(&req_id);
-            return Err(ClientError::Tunnel("tunnel write channel closed".into()));
-        }
+                .insert(req_id.clone(), tx);
 
-        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(_)) => Err(ClientError::Tunnel(
-                "tunnel response channel dropped".into(),
-            )),
-            Err(_) => {
+            if out_tx.send(msg.clone()).is_err() {
                 pending
                     .lock()
                     .expect("pending mutex poisoned")
                     .remove(&req_id);
-                Err(ClientError::Tunnel("tunnel call timed out".into()))
+                if attempt < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64))
+                        .await;
+                    continue;
+                }
+                return Err(ClientError::Tunnel("tunnel write channel closed".into()));
+            }
+
+            match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
+                Ok(Ok(resp)) => return Ok(resp),
+                Ok(Err(_)) => {
+                    if attempt < max_attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    return Err(ClientError::Tunnel(
+                        "tunnel response channel dropped".into(),
+                    ));
+                }
+                Err(_) => {
+                    pending
+                        .lock()
+                        .expect("pending mutex poisoned")
+                        .remove(&req_id);
+                    return Err(ClientError::Tunnel("tunnel call timed out".into()));
+                }
             }
         }
+
+        Err(ClientError::Tunnel("tunnel call failed".into()))
     }
 
     #[allow(clippy::too_many_arguments)]
