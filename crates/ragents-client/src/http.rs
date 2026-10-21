@@ -162,6 +162,31 @@ impl RagentsClient {
         Self::parse_response(resp).await
     }
 
+    pub async fn withdraw_realtime_messages(
+        &self,
+        session_id: &SessionId,
+        req: WithdrawRealtimeMessageRequest,
+    ) -> Result<WithdrawRealtimeMessageResponse, ClientError> {
+        let url = format!(
+            "{}/api/v1/sessions/{}/realtime/withdraw",
+            self.base_url, session_id
+        );
+        let resp = self.http.post(url).json(&req).send().await?;
+        Self::parse_response(resp).await
+    }
+
+    pub async fn withdraw_queued_activation(
+        &self,
+        activation_id: &ActivationId,
+    ) -> Result<Activation, ClientError> {
+        let url = format!(
+            "{}/api/v1/activations/{}/withdraw",
+            self.base_url, activation_id
+        );
+        let resp = self.http.post(url).send().await?;
+        Self::parse_response(resp).await
+    }
+
     pub async fn get_activation(
         &self,
         activation_id: &ActivationId,

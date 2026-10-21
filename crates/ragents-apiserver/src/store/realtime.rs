@@ -52,11 +52,13 @@ impl SqliteStore {
             }
 
             let now = Utc::now().to_rfc3339();
+            let mut inserted_ids = Vec::with_capacity(content.len());
             for block in content {
                 tx.execute(
                     "INSERT INTO realtime_messages (session_id, content_json, created_at) VALUES (?1, ?2, ?3)",
                     params![target_sid.as_str(), serde_json::to_string(&block)?, &now],
                 )?;
+                inserted_ids.push(tx.last_insert_rowid());
             }
 
             let count: i64 = tx.query_row(
@@ -98,12 +100,67 @@ impl SqliteStore {
                 queued_count: count as usize,
                 target_session_id: Some(target_sid),
                 spawned_activation_id,
+                inserted_ids,
             }
         };
 
         self.publish_events(events_to_publish);
         self.publish_dispatches(dispatches);
         Ok(response)
+    }
+
+    pub fn withdraw_realtime_messages(
+        &self,
+        session_id: &SessionId,
+        req: WithdrawRealtimeMessageRequest,
+    ) -> Result<WithdrawRealtimeMessageResponse, StoreError> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+
+        let mut target_sid = session_id.clone();
+        let mut session = Self::load_session_in_tx(&tx, &target_sid)?
+            .ok_or_else(|| StoreError::NotFound(format!("session {target_sid}")))?;
+        let mut hops = 0usize;
+        while session.status.phase == SessionPhase::Closed {
+            if let Some(next_sid) = session.status.compaction.continued_in_session_id.clone() {
+                if hops >= 32 {
+                    break;
+                }
+                hops += 1;
+                session = Self::load_session_in_tx(&tx, &next_sid)?
+                    .ok_or_else(|| StoreError::NotFound(format!("session {next_sid}")))?;
+                target_sid = next_sid;
+            } else {
+                break;
+            }
+        }
+
+        let mut removed_count = 0usize;
+        if req.message_ids.is_empty() {
+            removed_count += tx.execute(
+                "DELETE FROM realtime_messages WHERE session_id = ?1",
+                params![target_sid.as_str()],
+            )?;
+        } else {
+            for msg_id in req.message_ids {
+                removed_count += tx.execute(
+                    "DELETE FROM realtime_messages WHERE session_id = ?1 AND id = ?2",
+                    params![target_sid.as_str(), msg_id],
+                )?;
+            }
+        }
+
+        let remaining_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM realtime_messages WHERE session_id = ?1",
+            params![target_sid.as_str()],
+            |row| row.get(0),
+        )?;
+
+        tx.commit()?;
+        Ok(WithdrawRealtimeMessageResponse {
+            removed_count,
+            remaining_count: remaining_count as usize,
+        })
     }
 
     /// Atomically drains ALL queued real-time messages for `session_id` in one batch,

@@ -107,6 +107,20 @@ pub struct PushRealtimeMessageResponse {
     pub target_session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_activation_id: Option<ActivationId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inserted_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WithdrawRealtimeMessageRequest {
+    #[serde(default)]
+    pub message_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WithdrawRealtimeMessageResponse {
+    pub removed_count: usize,
+    pub remaining_count: usize,
 }
 
 // ============================================================================

@@ -293,3 +293,107 @@ fn test_cross_session_source_lineage_context_resolution() {
         .expect("read child effective context");
     assert_eq!(child_ctx.effective_items.len(), 3);
 }
+
+#[test]
+fn test_deferred_queued_activation_batch_and_atomic_withdrawal() {
+    let store = SqliteStore::open_in_memory().expect("open store");
+    register_test_node(&store, "node_a", vec!["gpt-4.1"], 60_000);
+
+    let (created, dispatches) = store
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_withdraw_1")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Floating {
+                    node_selector: BTreeMap::new(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("turn 1 running")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .expect("create session");
+
+    let act1_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let epoch1 = dispatches[0].lease_epoch;
+    assert!( store.withdraw_queued_activation(&act1_id).is_err(), "scheduled activation cannot be withdrawn" );
+
+    // Submit a second activation while act1 is still active -> act2 stays Queued
+    let (act2, dispatches2) = store
+        .create_activation(CreateActivationRequest {
+            activation_id: None,
+            labels: BTreeMap::new(),
+            spec: ActivationSpec {
+                session_id: SessionId::new("sess_withdraw_1"),
+                submission_kind: SubmissionKind::FollowUp,
+                input: vec![Item::user_message("turn 2 queued to withdraw")],
+                model_override: None,
+                disabled_tools: vec![],
+                desired_phase: DesiredActivationPhase::Running,
+                interaction_responses: BTreeMap::new(),
+            },
+        })
+        .expect("create queued activation");
+    assert!(dispatches2.is_empty());
+    assert_eq!(act2.status.phase, ActivationPhase::Queued);
+    let act2_id = ActivationId::new(act2.metadata.id);
+
+    // While act2 is Queued, its input must NOT be in effective_items yet!
+    let ctx_while_queued = store
+        .read_effective_context(&SessionId::new("sess_withdraw_1"))
+        .expect("read context");
+    assert_eq!(ctx_while_queued.effective_items.len(), 1);
+
+    // Withdraw act2 while Queued -> succeeds and leaves zero residue in effective_items
+    let withdrawn = store
+        .withdraw_queued_activation(&act2_id)
+        .expect("withdraw queued activation");
+    assert_eq!(withdrawn.status.phase, ActivationPhase::Cancelled);
+
+    let ctx_after_withdraw = store
+        .read_effective_context(&SessionId::new("sess_withdraw_1"))
+        .expect("read context after withdraw");
+    assert_eq!(ctx_after_withdraw.effective_items.len(), 1);
+
+    // Also test realtime message push + withdraw before drain
+    let rt_pushed = store
+        .push_realtime_message(
+            &SessionId::new("sess_withdraw_1"),
+            vec![openresponses_rust::MessageContent::InputText {
+                text: "urgent realtime".to_string(),
+            }],
+        )
+        .expect("push realtime");
+    assert_eq!(rt_pushed.queued_count, 1);
+    assert_eq!(rt_pushed.inserted_ids.len(), 1);
+
+    let rt_withdrawn = store
+        .withdraw_realtime_messages(
+            &SessionId::new("sess_withdraw_1"),
+            WithdrawRealtimeMessageRequest {
+                message_ids: rt_pushed.inserted_ids,
+            },
+        )
+        .expect("withdraw realtime");
+    assert_eq!(rt_withdrawn.removed_count, 1);
+    assert_eq!(rt_withdrawn.remaining_count, 0);
+
+    let (drained, _) = store
+        .drain_realtime_messages(
+            &SessionId::new("sess_withdraw_1"),
+            &act1_id,
+            epoch1,
+            None,
+        )
+        .expect("drain realtime");
+    assert!(drained.is_empty());
+}

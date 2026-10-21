@@ -33,7 +33,7 @@ impl SqliteStore {
     pub(crate) fn create_activation_in_tx(
         tx: &rusqlite::Transaction<'_>,
         mut req: CreateActivationRequest,
-        events_out: &mut Vec<SessionEventEnvelope>,
+        _events_out: &mut Vec<SessionEventEnvelope>,
     ) -> Result<Activation, StoreError> {
         let mut session_id = req.spec.session_id.clone();
         let mut session = Self::load_session_in_tx(tx, &session_id)?
@@ -84,7 +84,6 @@ impl SqliteStore {
         let mut meta = ObjectMeta::new(activation_id.as_str(), rv);
         meta.labels = req.labels;
 
-        let input_items = req.spec.input.clone();
         let status = ActivationStatus::initial_queued();
         let activation = Activation {
             metadata: meta,
@@ -112,60 +111,7 @@ impl SqliteStore {
             ],
         )?;
 
-        let batch_seq = BatchSeq::new(session.status.batch_count);
-        let item_count = input_items.len() as u64;
-        if !input_items.is_empty() {
-            let first_seq = LocalItemSeq::new(session.status.local_item_count);
-            let batch = ItemBatch {
-                session_id: session_id.clone(),
-                batch_seq,
-                first_local_item_seq: first_seq,
-                kind: ItemBatchKind::Input,
-                activation_id: activation_id.clone(),
-                turn_id: None,
-                response_id: None,
-                created_at: Utc::now(),
-                items: input_items.clone(),
-            };
-
-            tx.execute(
-                "INSERT INTO batches (
-                    session_id, batch_seq, first_local_item_seq, last_local_item_seq,
-                    kind, activation_id, turn_id, response_id, created_at, payload_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    session_id.as_str(),
-                    batch_seq.value() as i64,
-                    first_seq.value() as i64,
-                    batch.last_local_item_seq().value() as i64,
-                    "input",
-                    activation_id.as_str(),
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    batch.created_at.to_rfc3339(),
-                    serde_json::to_string(&batch)?,
-                ],
-            )?;
-            session.status.batch_count += 1;
-            session.status.local_item_count += item_count;
-            session.status.effective_context_item_count += item_count;
-        }
-
-        let ev = Self::append_event_in_tx(
-            tx,
-            &session_id,
-            Some(activation_id),
-            None,
-            (!input_items.is_empty()).then_some(batch_seq),
-            SessionEvent::ActivationSubmitted {
-                input_batch_seq: batch_seq,
-                items: input_items,
-            },
-        )?;
-        events_out.push(ev.clone());
-
         session.status.queued_activation_count += 1;
-        session.status.event_count = ev.event_seq.value() + 1;
         Self::save_session_in_tx(tx, &mut session)?;
 
         Ok(activation)
@@ -892,6 +838,44 @@ impl SqliteStore {
             )?;
             let cont_act_id = ActivationId::new(cont_act.metadata.id.clone());
 
+            // Migrate any unscheduled `queued` activations from `from_session` to `continued_session`
+            let queued_from_acts: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT activation_id FROM activations WHERE session_id = ?1 AND phase = 'queued' ORDER BY created_at ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![req.from_session_id.as_str()], |r| {
+                        r.get::<_, String>(0)
+                    })?;
+                let mut ids = Vec::new();
+                for r in rows {
+                    ids.push(r?);
+                }
+                ids
+            };
+            if !queued_from_acts.is_empty() {
+                let mut cont_sess_reload =
+                    Self::load_session_in_tx(&tx, &continued_session_id)?.unwrap();
+                for q_act_id_str in queued_from_acts {
+                    let q_act_id = ActivationId::new(q_act_id_str);
+                    if let Some(mut q_act) = Self::load_activation_in_tx(&tx, &q_act_id)? {
+                        q_act.spec.session_id = continued_session_id.clone();
+                        tx.execute(
+                            "UPDATE activations SET session_id = ?1, spec_json = ?2 WHERE activation_id = ?3",
+                            params![
+                                continued_session_id.as_str(),
+                                serde_json::to_string(&q_act.spec)?,
+                                q_act_id.as_str(),
+                            ],
+                        )?;
+                        from_session.status.queued_activation_count =
+                            from_session.status.queued_activation_count.saturating_sub(1);
+                        cont_sess_reload.status.queued_activation_count += 1;
+                    }
+                }
+                Self::save_session_in_tx(&tx, &mut cont_sess_reload)?;
+            }
+
             let compacted_ev = Self::append_event_in_tx(
                 &tx,
                 &req.from_session_id,
@@ -1164,6 +1148,57 @@ impl SqliteStore {
             let _ = self.reconcile_tx.send(notice.clone());
         }
         Ok(outcome)
+    }
+
+    pub fn withdraw_queued_activation(
+        &self,
+        activation_id: &ActivationId,
+    ) -> Result<Activation, StoreError> {
+        let mut events_to_publish = Vec::new();
+        let act = {
+            let mut conn = self.conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+
+            let mut act = Self::load_activation_in_tx(&tx, activation_id)?
+                .ok_or_else(|| StoreError::NotFound(format!("activation {activation_id}")))?;
+            if act.status.phase != ActivationPhase::Queued {
+                return Err(StoreError::Conflict(format!(
+                    "activation {activation_id} is no longer queued (phase: {:?}) and cannot be withdrawn",
+                    act.status.phase
+                )));
+            }
+
+            let sess_id = act.spec.session_id.clone();
+            let mut session = Self::load_session_in_tx(&tx, &sess_id)?
+                .ok_or_else(|| StoreError::NotFound(format!("session {sess_id}")))?;
+
+            act.spec.desired_phase = DesiredActivationPhase::Cancelled;
+            act.status.phase = ActivationPhase::Cancelled;
+            act.status.finished_at = Some(Utc::now());
+            act.metadata.generation = act.metadata.generation.next();
+
+            session.status.queued_activation_count =
+                session.status.queued_activation_count.saturating_sub(1);
+
+            let ev = Self::append_event_in_tx(
+                &tx,
+                &sess_id,
+                Some(activation_id.clone()),
+                None,
+                None,
+                SessionEvent::ActivationCancelled,
+            )?;
+            session.status.event_count = ev.event_seq.value() + 1;
+            events_to_publish.push(ev);
+
+            Self::save_activation_in_tx(&tx, &mut act)?;
+            Self::save_session_in_tx(&tx, &mut session)?;
+            tx.commit()?;
+            act
+        };
+
+        self.publish_events(events_to_publish);
+        Ok(act)
     }
 
     pub fn get_activation(

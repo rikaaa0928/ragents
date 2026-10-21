@@ -365,6 +365,73 @@ pub(crate) async fn handle_push_realtime_message(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
+pub(crate) async fn handle_withdraw_realtime_message(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(req): Json<WithdrawRealtimeMessageRequest>,
+) -> Result<Json<WithdrawRealtimeMessageResponse>, ApiError> {
+    let principal = state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "POST",
+            &format!("/api/v1/sessions/{session_id}/realtime/withdraw"),
+            &headers,
+        )
+        .await?;
+    let id = SessionId::new(session_id.clone());
+    let sess = state
+        .store
+        .get_session(&id)?
+        .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
+    state
+        .extensions
+        .authorize(
+            &principal,
+            ResourceVerb::Patch,
+            ResourceKind::Session,
+            Some(&session_id),
+            &sess.metadata.labels,
+        )
+        .await?;
+    let resp = state.store.withdraw_realtime_messages(&id, req)?;
+    Ok(Json(resp))
+}
+
+pub(crate) async fn handle_withdraw_activation(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(activation_id): Path<String>,
+) -> Result<Json<Activation>, ApiError> {
+    let principal = state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "POST",
+            &format!("/api/v1/activations/{activation_id}/withdraw"),
+            &headers,
+        )
+        .await?;
+    let id = ActivationId::new(activation_id.clone());
+    let existing = state
+        .store
+        .get_activation(&id)?
+        .ok_or_else(|| StoreError::NotFound(format!("activation {id}")))?;
+    state
+        .extensions
+        .authorize(
+            &principal,
+            ResourceVerb::Patch,
+            ResourceKind::Activation,
+            Some(&activation_id),
+            &existing.metadata.labels,
+        )
+        .await?;
+    let act = state.store.withdraw_queued_activation(&id)?;
+    Ok(Json(act))
+}
+
 pub(crate) async fn handle_get_activation(
     State(state): State<ApiServerState>,
     headers: HeaderMap,

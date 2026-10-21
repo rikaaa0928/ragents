@@ -101,6 +101,60 @@ impl SqliteStore {
                 None
             };
 
+            let input_items = activation.spec.input.clone();
+            let batch_seq = BatchSeq::new(session.status.batch_count);
+            let item_count = input_items.len() as u64;
+            if !input_items.is_empty() {
+                let first_seq = LocalItemSeq::new(session.status.local_item_count);
+                let batch = ItemBatch {
+                    session_id: sess_id.clone(),
+                    batch_seq,
+                    first_local_item_seq: first_seq,
+                    kind: ItemBatchKind::Input,
+                    activation_id: act_id.clone(),
+                    turn_id: None,
+                    response_id: None,
+                    created_at: chrono::Utc::now(),
+                    items: input_items.clone(),
+                };
+
+                tx.execute(
+                    "INSERT INTO batches (
+                        session_id, batch_seq, first_local_item_seq, last_local_item_seq,
+                        kind, activation_id, turn_id, response_id, created_at, payload_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        sess_id.as_str(),
+                        batch_seq.value() as i64,
+                        first_seq.value() as i64,
+                        batch.last_local_item_seq().value() as i64,
+                        "input",
+                        act_id.as_str(),
+                        Option::<String>::None,
+                        Option::<String>::None,
+                        batch.created_at.to_rfc3339(),
+                        serde_json::to_string(&batch)?,
+                    ],
+                )?;
+                session.status.batch_count += 1;
+                session.status.local_item_count += item_count;
+                session.status.effective_context_item_count += item_count;
+            }
+
+            let submitted_ev = Self::append_event_in_tx(
+                tx,
+                &sess_id,
+                Some(act_id.clone()),
+                None,
+                (!input_items.is_empty()).then_some(batch_seq),
+                SessionEvent::ActivationSubmitted {
+                    input_batch_seq: batch_seq,
+                    items: input_items,
+                },
+            )?;
+            session.status.event_count = submitted_ev.event_seq.value() + 1;
+            events_out.push(submitted_ev);
+
             let next_epoch = activation.status.lease_epoch.next();
             activation.status.lease_epoch = next_epoch;
             activation.status.phase = ActivationPhase::Scheduled;
