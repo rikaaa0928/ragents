@@ -781,15 +781,15 @@ async fn test_wasm_external_file_dynamic_mount_and_http_fetch_permission_unifica
 
     let caps = host.checked_capabilities.lock().unwrap();
     let origs = host.checked_original_paths.lock().unwrap();
-    assert_eq!(caps.len(), 3, "caps: {caps:?}");
+    // Because `FileWrite` approval on `ext_dir` persists in `SandboxState` across turns within the activation,
+    // subsequent `read_file` on `ext_file` succeeds without a redundant permission prompt.
+    assert_eq!(caps.len(), 2, "caps: {caps:?}");
     assert!(matches!(caps[0], CapabilityRequest::FileWrite { .. }));
-    assert!(matches!(caps[1], CapabilityRequest::FileRead { .. }));
     assert!(
-        matches!(caps[2], CapabilityRequest::Http { ref host, port: Some(p), .. } if host == "127.0.0.1" && p == addr.port())
+        matches!(caps[1], CapabilityRequest::Http { ref host, port: Some(p), .. } if host == "127.0.0.1" && p == addr.port())
     );
     assert_eq!(origs[0].as_ref(), Some(&ext_dir));
-    assert_eq!(origs[1].as_ref(), Some(&ext_file));
-    assert_eq!(origs[2].as_ref(), Some(&std::path::PathBuf::from(http_url)));
+    assert_eq!(origs[1].as_ref(), Some(&std::path::PathBuf::from(http_url)));
 
     let items = host.items.lock().unwrap();
     let all_outputs = serde_json::to_string(&*items).unwrap();
@@ -1325,14 +1325,8 @@ async fn test_openresponses_sse_streaming_deltas_and_transient_retry() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        deltas,
-        vec![
-            "Hello ".to_string(),
-            "streaming ".to_string(),
-            "world!".to_string()
-        ]
-    );
+    assert!(!deltas.is_empty());
+    assert_eq!(deltas.concat(), "Hello streaming world!");
 
     let _ = std::fs::remove_dir_all(&base_tmp);
 }

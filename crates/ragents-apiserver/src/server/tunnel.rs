@@ -209,7 +209,8 @@ fn handle_daemon_message(
             response_id,
             items,
             companion_event,
-        } => match state.store.commit_batch(
+            drain_realtime,
+        } => match state.store.commit_batch_with_drain(
             &session_id,
             &activation_id,
             lease_epoch,
@@ -218,19 +219,54 @@ fn handle_daemon_message(
             response_id,
             items,
             companion_event,
+            drain_realtime,
         ) {
-            Ok((batch_seq, rv)) => {
+            Ok((batch_seq, rv, drained_items)) => {
                 let _ = out_tx.send(ServerToDaemonMessage::Ack {
                     request_id,
                     ok: true,
                     resource_version: Some(rv),
                     batch_seq: Some(batch_seq),
                     spawned_session_id: None,
+                    drained_items,
                     error: None,
                 });
             }
             Err(e) => {
                 send_ack_err(out_tx, request_id, e.to_string());
+            }
+        },
+        DaemonToServerMessage::BeginTurn {
+            request_id,
+            session_id,
+            activation_id,
+            lease_epoch,
+            turn_id,
+            include_context,
+        } => match state.store.begin_turn(
+            &session_id,
+            &activation_id,
+            lease_epoch,
+            turn_id,
+            include_context,
+        ) {
+            Ok((drained_items, effective_items)) => {
+                let _ = out_tx.send(ServerToDaemonMessage::BeginTurnReply {
+                    request_id,
+                    ok: true,
+                    drained_items,
+                    effective_items,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                let _ = out_tx.send(ServerToDaemonMessage::BeginTurnReply {
+                    request_id,
+                    ok: false,
+                    drained_items: vec![],
+                    effective_items: None,
+                    error: Some(e.to_string()),
+                });
             }
         },
         DaemonToServerMessage::EmitEvent {
@@ -240,20 +276,27 @@ fn handle_daemon_message(
             lease_epoch,
             turn_id,
             event,
-        } => match state.store.emit_daemon_event(
-            &session_id,
-            &activation_id,
-            lease_epoch,
-            turn_id,
-            event,
-        ) {
-            Ok(env) => {
-                send_ack_ok(out_tx, request_id, Some(env.resource_version));
+        } => {
+            let is_ephemeral = event.is_ephemeral_stream_delta();
+            match state.store.emit_daemon_event(
+                &session_id,
+                &activation_id,
+                lease_epoch,
+                turn_id,
+                event,
+            ) {
+                Ok(env) => {
+                    if !is_ephemeral && !request_id.is_empty() {
+                        send_ack_ok(out_tx, request_id, Some(env.resource_version));
+                    }
+                }
+                Err(e) => {
+                    if !is_ephemeral && !request_id.is_empty() {
+                        send_ack_err(out_tx, request_id, e.to_string());
+                    }
+                }
             }
-            Err(e) => {
-                send_ack_err(out_tx, request_id, e.to_string());
-            }
-        },
+        }
         DaemonToServerMessage::FetchEffectiveContext {
             request_id,
             session_id,
@@ -375,6 +418,7 @@ fn send_ack_ok(
         resource_version,
         batch_seq: None,
         spawned_session_id: None,
+        drained_items: vec![],
         error: None,
     });
 }
@@ -390,6 +434,7 @@ fn send_ack_err(
         resource_version: None,
         batch_seq: None,
         spawned_session_id: None,
+        drained_items: vec![],
         error: Some(error),
     });
 }

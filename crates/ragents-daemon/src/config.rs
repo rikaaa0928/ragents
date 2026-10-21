@@ -98,6 +98,10 @@ pub struct DaemonConfig {
     pub default_model: Option<String>,
     #[serde(default = "default_temp_root")]
     pub temp_root_dir: PathBuf,
+    /// Directory containing node-installed WASM extensions (`ragent_<name>_extension.wasm` or `<name>.wasm`).
+    /// Used to resolve `ExtensionSpec` entries that specify only `name` or a relative filename.
+    #[serde(default = "default_extensions_dir")]
+    pub extensions_dir: PathBuf,
     /// Allowed parent directories for Pinned session `workspace_path` (e.g. `["/a/b/c", "/a/b/d"]`).
     /// `/tmp` (and system temp dir) is always included by default.
     #[serde(default = "default_allowed_workspace_dirs")]
@@ -132,6 +136,26 @@ fn default_system_prompt() -> String {
 
 fn default_temp_root() -> PathBuf {
     std::env::temp_dir().join("ragents")
+}
+
+pub fn default_extensions_dir() -> PathBuf {
+    if let Ok(env_dir) = std::env::var("RAGENTS_EXTENSIONS_DIR") {
+        let trimmed = env_dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    let etc_dir = PathBuf::from("/etc/ragents/wasm");
+    if etc_dir.exists() {
+        return etc_dir;
+    }
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let user_dir = Path::new(&home).join(".config/ragents/wasm");
+        if user_dir.exists() {
+            return user_dir;
+        }
+    }
+    etc_dir
 }
 
 pub fn default_allowed_workspace_dirs() -> Vec<PathBuf> {
@@ -229,6 +253,12 @@ impl DaemonConfig {
                 cfg.allowed_workspace_dirs = parse_workspace_dirs_csv(&raw_dirs);
             }
         }
+        if let Ok(ext_dir) = std::env::var("RAGENTS_EXTENSIONS_DIR") {
+            let trimmed = ext_dir.trim();
+            if !trimmed.is_empty() {
+                cfg.extensions_dir = PathBuf::from(trimmed);
+            }
+        }
         ensure_default_tmp_in_allowed_dirs(&mut cfg.allowed_workspace_dirs);
         Ok(cfg)
     }
@@ -269,6 +299,7 @@ impl DaemonConfig {
             default_system_prompt: default_system_prompt(),
             default_model: Some(model_name),
             temp_root_dir: default_temp_root(),
+            extensions_dir: default_extensions_dir(),
             allowed_workspace_dirs,
             labels: BTreeMap::new(),
             auto_discover_models: default_auto_discover_models(),
@@ -573,15 +604,73 @@ impl DaemonConfig {
         let effective_system_prompt = prompt_parts.assemble();
 
         // Merge daemon extensions with session extensions (session overrides by name,
-        // while resolving non-existent container paths against the daemon's local wasm dir)
-        let local_wasm_dirs: Vec<PathBuf> = self
-            .extensions
-            .iter()
-            .filter_map(|e| Path::new(&e.path).parent().map(|p| p.to_path_buf()))
-            .collect();
+        // while resolving extension names or relative/non-existent paths against `self.extensions_dir`).
+        let mut local_wasm_dirs: Vec<PathBuf> = vec![self.extensions_dir.clone()];
+        for ext in &self.extensions {
+            if !ext.path.trim().is_empty() {
+                if let Some(parent) = Path::new(&ext.path).parent() {
+                    if !parent.as_os_str().is_empty() && !local_wasm_dirs.contains(&parent.to_path_buf()) {
+                        local_wasm_dirs.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+        let etc_dir = PathBuf::from("/etc/ragents/wasm");
+        if !local_wasm_dirs.contains(&etc_dir) {
+            local_wasm_dirs.push(etc_dir);
+        }
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            let user_dir = Path::new(&home).join(".config/ragents/wasm");
+            if !local_wasm_dirs.contains(&user_dir) {
+                local_wasm_dirs.push(user_dir);
+            }
+        }
+
+        let resolve_wasm_path = |ext: &ExtensionSpec| -> String {
+            let trimmed = ext.path.trim();
+            if !trimmed.is_empty() && Path::new(trimmed).is_absolute() && Path::new(trimmed).exists() {
+                return trimmed.to_string();
+            }
+            let mut candidate_names: Vec<String> = Vec::new();
+            if !trimmed.is_empty() {
+                if let Some(fname) = Path::new(trimmed).file_name() {
+                    candidate_names.push(fname.to_string_lossy().to_string());
+                }
+            }
+            let std_name = format!("ragent_{}_extension.wasm", ext.name);
+            if !candidate_names.contains(&std_name) {
+                candidate_names.push(std_name.clone());
+            }
+            let short_name = format!("{}.wasm", ext.name);
+            if !candidate_names.contains(&short_name) {
+                candidate_names.push(short_name);
+            }
+
+            for dir in &local_wasm_dirs {
+                for fname in &candidate_names {
+                    let direct = dir.join(fname);
+                    if direct.exists() {
+                        return direct.to_string_lossy().to_string();
+                    }
+                    let nested = dir.join(&ext.name).join("target/wasm32-wasip2/release").join(fname);
+                    if nested.exists() {
+                        return nested.to_string_lossy().to_string();
+                    }
+                }
+            }
+
+            if !trimmed.is_empty() {
+                trimmed.to_string()
+            } else {
+                self.extensions_dir.join(std_name).to_string_lossy().to_string()
+            }
+        };
+
         let mut ext_map: BTreeMap<String, ExtensionSpec> = BTreeMap::new();
         for ext in &self.extensions {
-            ext_map.insert(ext.name.clone(), ext.clone());
+            let mut resolved = ext.clone();
+            resolved.path = resolve_wasm_path(&resolved);
+            ext_map.insert(resolved.name.clone(), resolved);
         }
         for ext in &session.spec.extensions {
             let mut merged = ext.clone();
@@ -600,21 +689,14 @@ impl DaemonConfig {
                 if is_empty_cfg && !existing.config.is_null() {
                     merged.config = existing.config.clone();
                 }
-                if !Path::new(&merged.path).exists() && Path::new(&existing.path).exists() {
+                if (merged.path.trim().is_empty() || !Path::new(&merged.path).exists())
+                    && !existing.path.trim().is_empty()
+                    && Path::new(&existing.path).exists()
+                {
                     merged.path = existing.path.clone();
                 }
             }
-            if !Path::new(&merged.path).exists() {
-                if let Some(fname) = Path::new(&merged.path).file_name() {
-                    for dir in &local_wasm_dirs {
-                        let cand = dir.join(fname);
-                        if cand.exists() {
-                            merged.path = cand.to_string_lossy().to_string();
-                            break;
-                        }
-                    }
-                }
-            }
+            merged.path = resolve_wasm_path(&merged);
             ext_map.insert(merged.name.clone(), merged);
         }
         let effective_extensions: Vec<ExtensionSpec> = ext_map.into_values().collect();

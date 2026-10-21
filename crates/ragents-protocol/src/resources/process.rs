@@ -87,6 +87,8 @@ pub struct ProcessActionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,

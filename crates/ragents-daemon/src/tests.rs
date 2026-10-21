@@ -71,6 +71,7 @@ fn make_daemon_cfg(
         default_system_prompt: format!("System prompt from {node_id}"),
         default_model: models.first().map(|s| s.to_string()),
         temp_root_dir: temp_root,
+        extensions_dir: default_extensions_dir(),
         allowed_workspace_dirs: {
             let mut dirs = default_allowed_workspace_dirs();
             let env_tmp = ragents_protocol::normalize_and_resolve_workspace_path(&std::env::temp_dir());

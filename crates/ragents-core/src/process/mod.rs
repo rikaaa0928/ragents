@@ -160,14 +160,17 @@ impl ProcessManager {
         };
 
         for _round in 0..MAX_SANDBOX_ESCALATION_ROUNDS {
+            let round_started = std::time::Instant::now();
             let (mut output, violations) = sandbox_state
                 .execute_command_with_violations(workspace_root, command, timeout_ms)
                 .await;
+            let elapsed_ms = round_started.elapsed().as_millis() as u64;
 
             if output.exit_code == 0 || violations.is_empty() {
                 final_resp = ProcessActionResponse {
                     ok: output.error.is_none(),
                     exit_code: Some(output.exit_code),
+                    duration_ms: Some(elapsed_ms),
                     stdout: Some(output.stdout),
                     stderr: Some(output.stderr),
                     error: output.error,
@@ -180,6 +183,7 @@ impl ProcessManager {
                 final_resp = ProcessActionResponse {
                     ok: output.error.is_none(),
                     exit_code: Some(output.exit_code),
+                    duration_ms: Some(elapsed_ms),
                     stdout: Some(output.stdout),
                     stderr: Some(output.stderr),
                     error: output.error,
@@ -203,6 +207,7 @@ impl ProcessManager {
                 final_resp = ProcessActionResponse {
                     ok: output.error.is_none(),
                     exit_code: Some(output.exit_code),
+                    duration_ms: Some(elapsed_ms),
                     stdout: Some(output.stdout),
                     stderr: Some(output.stderr),
                     error: output.error,
@@ -234,6 +239,7 @@ impl ProcessManager {
                 final_resp = ProcessActionResponse {
                     ok: output.error.is_none(),
                     exit_code: Some(output.exit_code),
+                    duration_ms: Some(elapsed_ms),
                     stdout: Some(output.stdout),
                     stderr: Some(output.stderr),
                     error: output.error,

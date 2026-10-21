@@ -211,8 +211,35 @@ impl SqliteStore {
         items: Vec<Item>,
         companion: BatchCompanionEvent,
     ) -> Result<(BatchSeq, ResourceVersion), StoreError> {
+        let (b_seq, rv, _) = self.commit_batch_with_drain(
+            session_id,
+            activation_id,
+            lease_epoch,
+            kind,
+            turn_id,
+            response_id,
+            items,
+            companion,
+            false,
+        )?;
+        Ok((b_seq, rv))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_batch_with_drain(
+        &self,
+        session_id: &SessionId,
+        activation_id: &ActivationId,
+        lease_epoch: LeaseEpoch,
+        kind: ItemBatchKind,
+        turn_id: Option<TurnId>,
+        response_id: Option<String>,
+        items: Vec<Item>,
+        companion: BatchCompanionEvent,
+        drain_realtime: bool,
+    ) -> Result<(BatchSeq, ResourceVersion, Vec<Item>), StoreError> {
         let mut events_to_publish = Vec::new();
-        let (batch_seq, rv) = {
+        let (batch_seq, rv, drained_items) = {
             let mut conn = self.conn.lock().expect("store mutex poisoned");
             let tx = conn.transaction()?;
 
@@ -311,13 +338,87 @@ impl SqliteStore {
             session.status.event_count = ev.event_seq.value() + 1;
             events_to_publish.push(ev);
 
+            let drained = if drain_realtime {
+                let (d_items, _) = Self::drain_realtime_messages_in_tx(
+                    &tx,
+                    session_id,
+                    activation_id,
+                    None,
+                    &mut session,
+                    &mut events_to_publish,
+                )?;
+                d_items
+            } else {
+                Vec::new()
+            };
+
             Self::save_session_in_tx(&tx, &mut session)?;
             tx.commit()?;
-            (appended_batch_seq.unwrap_or(BatchSeq::new(0)), committed_rv)
+            (
+                appended_batch_seq.unwrap_or(BatchSeq::new(0)),
+                committed_rv,
+                drained,
+            )
         };
 
         self.publish_events(events_to_publish);
-        Ok((batch_seq, rv))
+        Ok((batch_seq, rv, drained_items))
+    }
+
+    pub fn begin_turn(
+        &self,
+        session_id: &SessionId,
+        activation_id: &ActivationId,
+        lease_epoch: LeaseEpoch,
+        turn_id: TurnId,
+        include_context: bool,
+    ) -> Result<(Vec<Item>, Option<Vec<Item>>), StoreError> {
+        let mut events_to_publish = Vec::new();
+        let (drained_items, effective_items) = {
+            let mut conn = self.conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+
+            let act = Self::load_activation_in_tx(&tx, activation_id)?
+                .ok_or_else(|| StoreError::NotFound(format!("activation {activation_id}")))?;
+            Self::verify_fencing(&act, lease_epoch)?;
+
+            let mut session = Self::load_session_in_tx(&tx, session_id)?
+                .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
+
+            let (drained, _) = Self::drain_realtime_messages_in_tx(
+                &tx,
+                session_id,
+                activation_id,
+                Some(turn_id.clone()),
+                &mut session,
+                &mut events_to_publish,
+            )?;
+
+            let ev = Self::append_event_in_tx(
+                &tx,
+                session_id,
+                Some(activation_id.clone()),
+                Some(turn_id),
+                None,
+                SessionEvent::TurnStarted,
+            )?;
+            session.status.event_count = ev.event_seq.value() + 1;
+            events_to_publish.push(ev);
+
+            Self::save_session_in_tx(&tx, &mut session)?;
+
+            let effective = if include_context {
+                Some(Self::resolve_effective_items_from_conn(&tx, session_id)?)
+            } else {
+                None
+            };
+
+            tx.commit()?;
+            (drained, effective)
+        };
+
+        self.publish_events(events_to_publish);
+        Ok((drained_items, effective_items))
     }
 
     pub fn emit_daemon_event(
@@ -329,10 +430,6 @@ impl SqliteStore {
         event: SessionEvent,
     ) -> Result<SessionEventEnvelope, StoreError> {
         if event.is_ephemeral_stream_delta() {
-            let act = self
-                .get_activation(activation_id)?
-                .ok_or_else(|| StoreError::NotFound(format!("activation {activation_id}")))?;
-            Self::verify_fencing(&act, lease_epoch)?;
             let envelope = SessionEventEnvelope {
                 resource_version: ResourceVersion::new(0),
                 event_seq: EventSeq::new(0),

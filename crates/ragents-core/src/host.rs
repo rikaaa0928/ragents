@@ -78,9 +78,45 @@ pub struct CoreRunSummary {
     pub compacted_into_session_id: Option<SessionId>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BeginTurnOutput {
+    #[serde(default)]
+    pub drained_items: Vec<Item>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_items: Option<Vec<Item>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommitModelOutputResult {
+    pub batch_seq: BatchSeq,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drained_realtime_items: Vec<Item>,
+}
+
 #[async_trait]
 pub trait CoreHost: Send + Sync {
     async fn load_effective_context(&self) -> Result<Vec<Item>, CoreError>;
+
+    /// Atomically begins a Turn: drains pending real-time messages, emits `TurnStarted`,
+    /// and optionally returns the full effective context (on Turn 1 when `include_context` is true).
+    async fn begin_turn(
+        &self,
+        turn_id: &TurnId,
+        include_context: bool,
+    ) -> Result<BeginTurnOutput, CoreError> {
+        let drained_items = self.drain_realtime_messages(Some(turn_id.clone())).await?;
+        let effective_items = if include_context {
+            Some(self.load_effective_context().await?)
+        } else {
+            None
+        };
+        self.emit_event(Some(turn_id.clone()), SessionEvent::TurnStarted)
+            .await?;
+        Ok(BeginTurnOutput {
+            drained_items,
+            effective_items,
+        })
+    }
 
     /// Reports the prepared extension prompts and effective tool names right after `agent.prepare`.
     async fn report_prepared_config(
@@ -98,6 +134,30 @@ pub trait CoreHost: Send + Sync {
         items: Vec<Item>,
         usage: Option<Usage>,
     ) -> Result<BatchSeq, CoreError>;
+
+    /// Commits model output and optionally drains any real-time messages that arrived during the turn
+    /// in a single atomic round-trip.
+    async fn commit_model_output_with_drain(
+        &self,
+        turn_id: &TurnId,
+        response_id: Option<String>,
+        items: Vec<Item>,
+        usage: Option<Usage>,
+        drain_realtime: bool,
+    ) -> Result<CommitModelOutputResult, CoreError> {
+        let batch_seq = self
+            .commit_model_output(turn_id, response_id, items, usage)
+            .await?;
+        let drained_realtime_items = if drain_realtime {
+            self.drain_realtime_messages(None).await?
+        } else {
+            Vec::new()
+        };
+        Ok(CommitModelOutputResult {
+            batch_seq,
+            drained_realtime_items,
+        })
+    }
 
     async fn commit_tool_output(
         &self,

@@ -179,6 +179,19 @@ pub enum DaemonToServerMessage {
         response_id: Option<String>,
         items: Vec<Item>,
         companion_event: BatchCompanionEvent,
+        #[serde(default)]
+        drain_realtime: bool,
+    },
+    /// Daemon begins a Turn: atomically drains pending real-time messages, emits `TurnStarted`,
+    /// and optionally fetches the full effective context (for Turn 1).
+    BeginTurn {
+        request_id: String,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        turn_id: TurnId,
+        #[serde(default)]
+        include_context: bool,
     },
     /// Daemon emits a standalone lifecycle event (e.g. TurnStarted, ToolCallStarted, PermissionRequested)
     EmitEvent {
@@ -307,6 +320,18 @@ pub enum ServerToDaemonMessage {
         batch_seq: Option<BatchSeq>,
         #[serde(skip_serializing_if = "Option::is_none")]
         spawned_session_id: Option<SessionId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        drained_items: Vec<Item>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    BeginTurnReply {
+        request_id: String,
+        ok: bool,
+        #[serde(default)]
+        drained_items: Vec<Item>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_items: Option<Vec<Item>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

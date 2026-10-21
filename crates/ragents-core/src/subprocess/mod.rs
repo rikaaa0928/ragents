@@ -8,7 +8,7 @@ use crate::error::CoreError;
 use crate::host::{CoreExecutor, CoreHost, CoreRunSpec, CoreRunSummary};
 use crate::model::ModelBackend;
 use async_trait::async_trait;
-use ragents_protocol::{SessionEvent, TurnId};
+use ragents_protocol::TurnId;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -376,19 +376,34 @@ impl CoreExecutor for SubprocessExecutor {
                         )
                         .await?;
                     }
+                    WorkerToParentMessage::BeginTurn {
+                        turn_id,
+                        include_context,
+                    } => {
+                        let res = tokio::select! {
+                            r = host.begin_turn(&turn_id, include_context) => r.map_err(|e| e.to_string()),
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        };
+                        send_jsonl(
+                            &mut writer,
+                            &ParentToWorkerMessage::BeginTurnReply { result: res },
+                        )
+                        .await?;
+                    }
                     WorkerToParentMessage::CommitModelOutput {
                         turn_id,
                         response_id,
                         items,
                         usage,
+                        drain_realtime,
                     } => {
                         let res = tokio::select! {
-                            r = host.commit_model_output(&turn_id, response_id, items, usage) => r.map_err(|e| e.to_string()),
+                            r = host.commit_model_output_with_drain(&turn_id, response_id, items, usage, drain_realtime) => r.map_err(|e| e.to_string()),
                             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
                         };
                         send_jsonl(
                             &mut writer,
-                            &ParentToWorkerMessage::CommitBatchReply { result: res },
+                            &ParentToWorkerMessage::CommitModelOutputReply { result: res },
                         )
                         .await?;
                     }
@@ -411,15 +426,18 @@ impl CoreExecutor for SubprocessExecutor {
                         .await?;
                     }
                     WorkerToParentMessage::EmitEvent { turn_id, event } => {
+                        let is_ephemeral = event.is_ephemeral_stream_delta();
                         let res = tokio::select! {
                             r = host.emit_event(turn_id, *event) => r.map_err(|e| e.to_string()),
                             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
                         };
-                        send_jsonl(
-                            &mut writer,
-                            &ParentToWorkerMessage::EmitEventReply { result: res },
-                        )
-                        .await?;
+                        if !is_ephemeral {
+                            send_jsonl(
+                                &mut writer,
+                                &ParentToWorkerMessage::EmitEventReply { result: res },
+                            )
+                            .await?;
+                        }
                     }
                     WorkerToParentMessage::CheckPermission {
                         extension_id,
@@ -497,42 +515,32 @@ impl CoreExecutor for SubprocessExecutor {
                             .as_ref()
                             .and_then(|m| m.get("ragents.turn_id"))
                             .map(TurnId::new);
-                        let (delta_tx, mut delta_rx) =
+                        let (delta_tx, delta_rx) =
                             tokio::sync::mpsc::unbounded_channel::<crate::model::ModelStreamDelta>();
                         let cb: Option<crate::model::ModelStreamCallback> = if is_compaction_worker {
+                            drop(delta_tx);
                             None
                         } else {
                             Some(Arc::new(move |delta| {
                                 let _ = delta_tx.send(delta);
                             }))
                         };
-                        let model_fut = model_backend.create_response_streaming(
-                            &parent_endpoint,
-                            *request,
-                            cb,
+                        let model_fut = async {
+                            let cb = cb;
+                            model_backend
+                                .create_response_streaming(&parent_endpoint, *request, cb)
+                                .await
+                        };
+                        let forward_fut = crate::runner::forward_coalesced_stream_deltas(
+                            delta_rx,
+                            turn_id,
+                            host.as_ref(),
                         );
-                        tokio::pin!(model_fut);
-                        let res = loop {
-                            tokio::select! {
-                                r = &mut model_fut => {
-                                    while let Ok(delta) = delta_rx.try_recv() {
-                                        let ev = match delta {
-                                            crate::model::ModelStreamDelta::TextDelta { delta } => SessionEvent::ModelTextDelta { delta },
-                                            crate::model::ModelStreamDelta::ReasoningDelta { delta } => SessionEvent::ModelReasoningDelta { delta },
-                                        };
-                                        let _ = host.emit_event(turn_id.clone(), ev).await;
-                                    }
-                                    break r.map(Box::new).map_err(|e| e.to_string());
-                                }
-                                Some(delta) = delta_rx.recv() => {
-                                    let ev = match delta {
-                                        crate::model::ModelStreamDelta::TextDelta { delta } => SessionEvent::ModelTextDelta { delta },
-                                        crate::model::ModelStreamDelta::ReasoningDelta { delta } => SessionEvent::ModelReasoningDelta { delta },
-                                    };
-                                    let _ = host.emit_event(turn_id.clone(), ev).await;
-                                }
-                                _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        let res = tokio::select! {
+                            (r, ()) = async { tokio::join!(model_fut, forward_fut) } => {
+                                r.map(Box::new).map_err(|e| e.to_string())
                             }
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
                         };
                         send_jsonl(
                             &mut writer,

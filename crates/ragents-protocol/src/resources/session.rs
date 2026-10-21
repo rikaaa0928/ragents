@@ -163,6 +163,7 @@ impl ModelRequestSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionSpec {
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
     #[serde(default = "default_true")]
     pub enabled: bool,

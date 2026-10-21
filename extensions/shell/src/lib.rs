@@ -68,6 +68,7 @@ struct HostProcessResponse {
     ok: bool,
     error: Option<String>,
     exit_code: Option<i32>,
+    duration_ms: Option<u64>,
     stdout: Option<String>,
     stderr: Option<String>,
     combined: Option<String>,
@@ -298,15 +299,16 @@ fn handle_shell(args: &serde_json::Value) -> Result<ToolResult, String> {
 
     if wait {
         let exit_code = resp.exit_code.unwrap_or(-1);
+        let duration_ms = resp.duration_ms.unwrap_or(0);
         let raw_stdout = resp.stdout.unwrap_or_default();
         let raw_stderr = resp.stderr.unwrap_or_default();
         let stdout = truncate_tail_stream(&raw_stdout, "stdout");
         let stderr = truncate_tail_stream(&raw_stderr, "stderr");
         let success = resp.ok && exit_code == 0 && resp.error.is_none();
         let output = if let Some(ref error) = resp.error {
-            format!("exit_code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}\nerror: {error}")
+            format!("exit_code: {exit_code}\nduration_ms: {duration_ms}\nstdout:\n{stdout}\nstderr:\n{stderr}\nerror: {error}")
         } else {
-            format!("exit_code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+            format!("exit_code: {exit_code}\nduration_ms: {duration_ms}\nstdout:\n{stdout}\nstderr:\n{stderr}")
         };
         let error = (!success).then(|| {
             resp.error

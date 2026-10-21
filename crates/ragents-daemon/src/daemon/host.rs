@@ -5,7 +5,8 @@ use chrono::Utc;
 use openresponses_rust::{Item, MessageContent, Usage};
 use ragents_client::DaemonTunnelHandle;
 use ragents_core::{
-    CoreError, CoreHost, PermissionOutcome, ProcessManager, ProcessNotificationSink, SandboxState,
+    BeginTurnOutput, CommitModelOutputResult, CoreError, CoreHost, PermissionOutcome,
+    ProcessManager, ProcessNotificationSink, SandboxState,
 };
 use ragents_protocol::*;
 use std::collections::HashMap;
@@ -230,6 +231,28 @@ impl CoreHost for DaemonCoreHost {
             .map_err(|e| CoreError::HostError(e.to_string()))
     }
 
+    async fn begin_turn(
+        &self,
+        turn_id: &TurnId,
+        include_context: bool,
+    ) -> Result<BeginTurnOutput, CoreError> {
+        let (drained_items, effective_items) = self
+            .tunnel
+            .begin_turn(
+                self.session_id.clone(),
+                self.activation_id.clone(),
+                self.lease_epoch,
+                turn_id.clone(),
+                include_context,
+            )
+            .await
+            .map_err(|e| CoreError::HostError(e.to_string()))?;
+        Ok(BeginTurnOutput {
+            drained_items,
+            effective_items,
+        })
+    }
+
     async fn commit_model_output(
         &self,
         turn_id: &TurnId,
@@ -237,8 +260,22 @@ impl CoreHost for DaemonCoreHost {
         items: Vec<Item>,
         usage: Option<Usage>,
     ) -> Result<BatchSeq, CoreError> {
-        self.tunnel
-            .commit_batch(
+        self.commit_model_output_with_drain(turn_id, response_id, items, usage, false)
+            .await
+            .map(|r| r.batch_seq)
+    }
+
+    async fn commit_model_output_with_drain(
+        &self,
+        turn_id: &TurnId,
+        response_id: Option<String>,
+        items: Vec<Item>,
+        usage: Option<Usage>,
+        drain_realtime: bool,
+    ) -> Result<CommitModelOutputResult, CoreError> {
+        let (batch_seq, drained_realtime_items) = self
+            .tunnel
+            .commit_batch_with_drain(
                 self.session_id.clone(),
                 self.activation_id.clone(),
                 self.lease_epoch,
@@ -247,9 +284,14 @@ impl CoreHost for DaemonCoreHost {
                 response_id.clone(),
                 items,
                 BatchCompanionEvent::TurnCompleted { response_id, usage },
+                drain_realtime,
             )
             .await
-            .map_err(|e| CoreError::HostError(e.to_string()))
+            .map_err(|e| CoreError::HostError(e.to_string()))?;
+        Ok(CommitModelOutputResult {
+            batch_seq,
+            drained_realtime_items,
+        })
     }
 
     async fn commit_tool_output(

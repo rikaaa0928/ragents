@@ -1,5 +1,7 @@
 use crate::error::CoreError;
-use crate::host::{CoreRunSpec, CoreRunSummary, PermissionOutcome};
+use crate::host::{
+    BeginTurnOutput, CommitModelOutputResult, CoreRunSpec, CoreRunSummary, PermissionOutcome,
+};
 use openresponses_rust::{CreateResponseBody, Item, ResponseResource, Usage};
 use ragents_protocol::*;
 use serde::{Deserialize, Serialize};
@@ -22,11 +24,18 @@ pub enum WorkerToParentMessage {
         effective_tools: Vec<String>,
     },
     LoadEffectiveContext,
+    BeginTurn {
+        turn_id: TurnId,
+        #[serde(default)]
+        include_context: bool,
+    },
     CommitModelOutput {
         turn_id: TurnId,
         response_id: Option<String>,
         items: Vec<Item>,
         usage: Option<Usage>,
+        #[serde(default)]
+        drain_realtime: bool,
     },
     CommitToolOutput {
         turn_id: TurnId,
@@ -81,8 +90,14 @@ pub enum ParentToWorkerMessage {
     EffectiveContextReply {
         result: Result<Vec<Item>, String>,
     },
+    BeginTurnReply {
+        result: Result<BeginTurnOutput, String>,
+    },
     CommitBatchReply {
         result: Result<BatchSeq, String>,
+    },
+    CommitModelOutputReply {
+        result: Result<CommitModelOutputResult, String>,
     },
     EmitEventReply {
         result: Result<(), String>,

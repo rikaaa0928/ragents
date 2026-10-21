@@ -3,7 +3,10 @@ use super::protocol::{
     WorkerToParentMessage,
 };
 use crate::error::CoreError;
-use crate::host::{CoreExecutor, CoreHost, ModelEndpointConfig, PermissionOutcome};
+use crate::host::{
+    BeginTurnOutput, CommitModelOutputResult, CoreExecutor, CoreHost, ModelEndpointConfig,
+    PermissionOutcome,
+};
 use crate::model::ModelBackend;
 use crate::runner::InProcessExecutor;
 use async_trait::async_trait;
@@ -131,6 +134,28 @@ impl CoreHost for IpcCoreHostProxy {
         }
     }
 
+    async fn begin_turn(
+        &self,
+        turn_id: &TurnId,
+        include_context: bool,
+    ) -> Result<BeginTurnOutput, CoreError> {
+        let mut ch = self.channel.lock().await;
+        match ch
+            .call(&WorkerToParentMessage::BeginTurn {
+                turn_id: turn_id.clone(),
+                include_context,
+            })
+            .await?
+        {
+            ParentToWorkerMessage::BeginTurnReply { result } => {
+                result.map_err(CoreError::HostError)
+            }
+            other => Err(CoreError::HostError(format!(
+                "unexpected reply to BeginTurn: {other:?}"
+            ))),
+        }
+    }
+
     async fn commit_model_output(
         &self,
         turn_id: &TurnId,
@@ -138,6 +163,19 @@ impl CoreHost for IpcCoreHostProxy {
         items: Vec<Item>,
         usage: Option<Usage>,
     ) -> Result<BatchSeq, CoreError> {
+        self.commit_model_output_with_drain(turn_id, response_id, items, usage, false)
+            .await
+            .map(|r| r.batch_seq)
+    }
+
+    async fn commit_model_output_with_drain(
+        &self,
+        turn_id: &TurnId,
+        response_id: Option<String>,
+        items: Vec<Item>,
+        usage: Option<Usage>,
+        drain_realtime: bool,
+    ) -> Result<CommitModelOutputResult, CoreError> {
         let mut ch = self.channel.lock().await;
         match ch
             .call(&WorkerToParentMessage::CommitModelOutput {
@@ -145,12 +183,19 @@ impl CoreHost for IpcCoreHostProxy {
                 response_id,
                 items,
                 usage,
+                drain_realtime,
             })
             .await?
         {
-            ParentToWorkerMessage::CommitBatchReply { result } => {
+            ParentToWorkerMessage::CommitModelOutputReply { result } => {
                 result.map_err(CoreError::HostError)
             }
+            ParentToWorkerMessage::CommitBatchReply { result } => result
+                .map(|batch_seq| CommitModelOutputResult {
+                    batch_seq,
+                    drained_realtime_items: Vec::new(),
+                })
+                .map_err(CoreError::HostError),
             other => Err(CoreError::HostError(format!(
                 "unexpected reply to CommitModelOutput: {other:?}"
             ))),
@@ -193,6 +238,17 @@ impl CoreHost for IpcCoreHostProxy {
         event: SessionEvent,
     ) -> Result<(), CoreError> {
         let mut ch = self.channel.lock().await;
+        if event.is_ephemeral_stream_delta() {
+            send_jsonl(
+                &mut ch.writer,
+                &WorkerToParentMessage::EmitEvent {
+                    turn_id,
+                    event: Box::new(event),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
         match ch
             .call(&WorkerToParentMessage::EmitEvent {
                 turn_id,

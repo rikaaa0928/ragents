@@ -40,7 +40,12 @@ pub struct DaemonTunnelHandle {
     inner: Arc<Mutex<TunnelInner>>,
 }
 
-type AckPayload = (Option<ResourceVersion>, Option<BatchSeq>, Option<SessionId>);
+type AckPayload = (
+    Option<ResourceVersion>,
+    Option<BatchSeq>,
+    Option<SessionId>,
+    Vec<Item>,
+);
 
 impl DaemonTunnelHandle {
     /// Atomically swaps the underlying WebSocket connection and pending map to a newly reconnected tunnel
@@ -245,7 +250,7 @@ impl DaemonTunnelHandle {
                 active_runners,
             })
             .await?;
-        Self::expect_ack(resp).map(|(rv, _, _)| rv.unwrap_or_default())
+        Self::expect_ack(resp).map(|(rv, _, _, _)| rv.unwrap_or_default())
     }
 
     pub async fn accept_activation(
@@ -267,7 +272,7 @@ impl DaemonTunnelHandle {
                 effective_permission: Box::new(effective_permission),
             })
             .await?;
-        Self::expect_ack(resp).map(|(rv, _, _)| rv.unwrap_or_default())
+        Self::expect_ack(resp).map(|(rv, _, _, _)| rv.unwrap_or_default())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -282,6 +287,34 @@ impl DaemonTunnelHandle {
         items: Vec<Item>,
         companion_event: BatchCompanionEvent,
     ) -> Result<BatchSeq, ClientError> {
+        self.commit_batch_with_drain(
+            session_id,
+            activation_id,
+            lease_epoch,
+            kind,
+            turn_id,
+            response_id,
+            items,
+            companion_event,
+            false,
+        )
+        .await
+        .map(|(seq, _)| seq)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_batch_with_drain(
+        &self,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        kind: ItemBatchKind,
+        turn_id: Option<TurnId>,
+        response_id: Option<String>,
+        items: Vec<Item>,
+        companion_event: BatchCompanionEvent,
+        drain_realtime: bool,
+    ) -> Result<(BatchSeq, Vec<Item>), ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::CommitBatch {
@@ -294,9 +327,48 @@ impl DaemonTunnelHandle {
                 response_id,
                 items,
                 companion_event,
+                drain_realtime,
             })
             .await?;
-        Self::expect_ack(resp).map(|(_, batch_seq, _)| batch_seq.unwrap_or_default())
+        Self::expect_ack(resp)
+            .map(|(_, batch_seq, _, drained)| (batch_seq.unwrap_or_default(), drained))
+    }
+
+    pub async fn begin_turn(
+        &self,
+        session_id: SessionId,
+        activation_id: ActivationId,
+        lease_epoch: LeaseEpoch,
+        turn_id: TurnId,
+        include_context: bool,
+    ) -> Result<(Vec<Item>, Option<Vec<Item>>), ClientError> {
+        let request_id = format!("req_{}", Uuid::now_v7());
+        let resp = self
+            .call(DaemonToServerMessage::BeginTurn {
+                request_id,
+                session_id,
+                activation_id,
+                lease_epoch,
+                turn_id,
+                include_context,
+            })
+            .await?;
+        match resp {
+            ServerToDaemonMessage::BeginTurnReply {
+                ok: true,
+                drained_items,
+                effective_items,
+                ..
+            } => Ok((drained_items, effective_items)),
+            ServerToDaemonMessage::BeginTurnReply {
+                ok: false, error, ..
+            } => Err(ClientError::Tunnel(
+                error.unwrap_or_else(|| "begin turn failed".into()),
+            )),
+            other => Err(ClientError::Tunnel(format!(
+                "unexpected begin turn reply: {other:?}"
+            ))),
+        }
     }
 
     pub async fn emit_event(
@@ -307,6 +379,22 @@ impl DaemonTunnelHandle {
         turn_id: Option<TurnId>,
         event: SessionEvent,
     ) -> Result<ResourceVersion, ClientError> {
+        if event.is_ephemeral_stream_delta() {
+            let out_tx = {
+                let guard = self.inner.lock().expect("tunnel mutex poisoned");
+                guard.out_tx.clone()
+            };
+            let _ = out_tx.send(DaemonToServerMessage::EmitEvent {
+                request_id: String::new(),
+                session_id,
+                activation_id,
+                lease_epoch,
+                turn_id,
+                event,
+            });
+            return Ok(ResourceVersion::new(0));
+        }
+
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::EmitEvent {
@@ -318,7 +406,7 @@ impl DaemonTunnelHandle {
                 event,
             })
             .await?;
-        Self::expect_ack(resp).map(|(rv, _, _)| rv.unwrap_or_default())
+        Self::expect_ack(resp).map(|(rv, _, _, _)| rv.unwrap_or_default())
     }
 
     pub async fn fetch_effective_context(
@@ -416,7 +504,7 @@ impl DaemonTunnelHandle {
                 outcome,
             })
             .await?;
-        Self::expect_ack(resp).map(|(rv, _, _)| rv.unwrap_or_default())
+        Self::expect_ack(resp).map(|(rv, _, _, _)| rv.unwrap_or_default())
     }
 
     pub async fn rollover_compacted_session(
@@ -456,8 +544,14 @@ impl DaemonTunnelHandle {
                 resource_version,
                 batch_seq,
                 spawned_session_id,
+                drained_items,
                 ..
-            } => Ok((resource_version, batch_seq, spawned_session_id)),
+            } => Ok((
+                resource_version,
+                batch_seq,
+                spawned_session_id,
+                drained_items,
+            )),
             ServerToDaemonMessage::Ack {
                 ok: false, error, ..
             } => {
@@ -477,6 +571,7 @@ impl DaemonTunnelHandle {
             | DaemonToServerMessage::Heartbeat { request_id, .. }
             | DaemonToServerMessage::AcceptActivation { request_id, .. }
             | DaemonToServerMessage::CommitBatch { request_id, .. }
+            | DaemonToServerMessage::BeginTurn { request_id, .. }
             | DaemonToServerMessage::EmitEvent { request_id, .. }
             | DaemonToServerMessage::FetchEffectiveContext { request_id, .. }
             | DaemonToServerMessage::PushRealtimeMessage { request_id, .. }
@@ -548,6 +643,7 @@ pub async fn connect_daemon_tunnel_with_token(
             match incoming {
                 ServerToDaemonMessage::Registered { ref request_id, .. }
                 | ServerToDaemonMessage::Ack { ref request_id, .. }
+                | ServerToDaemonMessage::BeginTurnReply { ref request_id, .. }
                 | ServerToDaemonMessage::EffectiveContextReply { ref request_id, .. }
                 | ServerToDaemonMessage::RealtimeMessagesReply { ref request_id, .. }
                 | ServerToDaemonMessage::RolloverCompactedSessionReply { ref request_id, .. } => {

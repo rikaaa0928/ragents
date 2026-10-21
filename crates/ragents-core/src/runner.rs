@@ -162,36 +162,19 @@ impl AgentCore {
         host: &dyn CoreHost,
         turn_id: &TurnId,
     ) -> Result<AgentCoreStepResult, CoreError> {
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<ModelStreamDelta>();
+        let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel::<ModelStreamDelta>();
         let cb: ModelStreamCallback = Arc::new(move |delta| {
             let _ = delta_tx.send(delta);
         });
 
-        let model_fut = model_backend.create_response_streaming(endpoint, request, Some(cb));
-        tokio::pin!(model_fut);
-
-        let response: ResponseResource = loop {
-            tokio::select! {
-                res = &mut model_fut => {
-                    let r = res?;
-                    while let Ok(delta) = delta_rx.try_recv() {
-                        let ev = match delta {
-                            ModelStreamDelta::TextDelta { delta } => SessionEvent::ModelTextDelta { delta },
-                            ModelStreamDelta::ReasoningDelta { delta } => SessionEvent::ModelReasoningDelta { delta },
-                        };
-                        let _ = host.emit_event(Some(turn_id.clone()), ev).await;
-                    }
-                    break r;
-                }
-                Some(delta) = delta_rx.recv() => {
-                    let ev = match delta {
-                        ModelStreamDelta::TextDelta { delta } => SessionEvent::ModelTextDelta { delta },
-                        ModelStreamDelta::ReasoningDelta { delta } => SessionEvent::ModelReasoningDelta { delta },
-                    };
-                    let _ = host.emit_event(Some(turn_id.clone()), ev).await;
-                }
-            }
+        let model_fut = async {
+            model_backend
+                .create_response_streaming(endpoint, request, Some(cb))
+                .await
         };
+        let forward_fut = forward_coalesced_stream_deltas(delta_rx, Some(turn_id.clone()), host);
+        let (res, ()) = tokio::join!(model_fut, forward_fut);
+        let response: ResponseResource = res?;
 
         if let Some(err) = response.error {
             return Err(CoreError::ResponseFailed(err.message));
@@ -459,6 +442,7 @@ async fn run_react_loop(
     let mut final_text = String::new();
     let mut accumulated_usage: Option<Usage> = None;
     let mut last_turn_id: Option<TurnId> = None;
+    let mut cached_effective_items: Option<Vec<Item>> = None;
 
     loop {
         if cancellation.is_cancelled() {
@@ -474,11 +458,19 @@ async fn run_react_loop(
         let turn_id = TurnId::generate();
         last_turn_id = Some(turn_id.clone());
 
-        // Drain all pending real-time messages (background process exit notifications, steer messages)
-        // in one atomic batch before loading the effective context for this Turn.
-        let _ = host.drain_realtime_messages(Some(turn_id.clone())).await?;
+        let include_context = cached_effective_items.is_none();
+        let begin_out = host.begin_turn(&turn_id, include_context).await?;
+        let raw_items = if let Some(initial_items) = begin_out.effective_items {
+            cached_effective_items = Some(initial_items.clone());
+            initial_items
+        } else {
+            let cached = cached_effective_items.get_or_insert_with(Vec::new);
+            if !begin_out.drained_items.is_empty() {
+                cached.extend(begin_out.drained_items);
+            }
+            cached.clone()
+        };
 
-        let raw_items = host.load_effective_context().await?;
         let projected_items =
             match apply_context_projection_hook(hook_manager, iteration, raw_items).await? {
                 ContextProjectionOutcome::Projected(items) => items,
@@ -518,9 +510,6 @@ async fn run_react_loop(
                     });
                 }
             };
-
-        host.emit_event(Some(turn_id.clone()), SessionEvent::TurnStarted)
-            .await?;
 
         let projection = ContextProjection::new(projected_items);
 
@@ -591,13 +580,20 @@ async fn run_react_loop(
             final_text = step.text.clone();
         }
 
-        host.commit_model_output(
-            &turn_id,
-            step.response_id.clone(),
-            step.output_items.clone(),
-            step.usage.clone(),
-        )
-        .await?;
+        let drain_realtime_on_commit = step.function_calls.is_empty();
+        let commit_res = host
+            .commit_model_output_with_drain(
+                &turn_id,
+                step.response_id.clone(),
+                step.output_items.clone(),
+                step.usage.clone(),
+                drain_realtime_on_commit,
+            )
+            .await?;
+
+        if let Some(ref mut cached) = cached_effective_items {
+            cached.extend(step.output_items.clone());
+        }
 
         if !step.function_calls.is_empty() {
             for call in &step.function_calls {
@@ -633,9 +629,13 @@ async fn run_react_loop(
                     &call.name,
                     success,
                     duration_ms,
-                    vec![tool_output_item],
+                    vec![tool_output_item.clone()],
                 )
                 .await?;
+
+                if let Some(ref mut cached) = cached_effective_items {
+                    cached.push(tool_output_item);
+                }
             }
 
             hook_manager
@@ -672,11 +672,13 @@ async fn run_react_loop(
                 )
                 .await?;
 
-            // Before finishing the activation, check if any real-time messages arrived during the final turn.
-            // If so, continue into another Turn so the agent can process the notification.
-            let late_realtime = host.drain_realtime_messages(None).await?;
-            if late_realtime.is_empty() {
+            // If any real-time messages arrived during the final turn, they were atomically drained
+            // inside `commit_model_output_with_drain`; append them to local cache and continue into another Turn.
+            if commit_res.drained_realtime_items.is_empty() {
                 break;
+            }
+            if let Some(ref mut cached) = cached_effective_items {
+                cached.extend(commit_res.drained_realtime_items);
             }
         }
     }
@@ -694,6 +696,63 @@ async fn run_react_loop(
 enum ContextProjectionOutcome {
     Projected(Vec<Item>),
     CompactionRequested(CompactionPlan),
+}
+
+pub(crate) async fn forward_coalesced_stream_deltas(
+    mut delta_rx: tokio::sync::mpsc::UnboundedReceiver<ModelStreamDelta>,
+    turn_id: Option<TurnId>,
+    host: &dyn CoreHost,
+) {
+    while let Some(first) = delta_rx.recv().await {
+        tokio::task::yield_now().await;
+
+        let mut cur_is_text = matches!(first, ModelStreamDelta::TextDelta { .. });
+        let mut buf = match first {
+            ModelStreamDelta::TextDelta { delta } | ModelStreamDelta::ReasoningDelta { delta } => {
+                delta
+            }
+        };
+
+        while let Ok(next) = delta_rx.try_recv() {
+            match next {
+                ModelStreamDelta::TextDelta { delta } if cur_is_text => {
+                    buf.push_str(&delta);
+                }
+                ModelStreamDelta::ReasoningDelta { delta } if !cur_is_text => {
+                    buf.push_str(&delta);
+                }
+                ModelStreamDelta::TextDelta { delta } => {
+                    if !buf.is_empty() {
+                        let ev = SessionEvent::ModelReasoningDelta {
+                            delta: std::mem::take(&mut buf),
+                        };
+                        let _ = host.emit_event(turn_id.clone(), ev).await;
+                    }
+                    cur_is_text = true;
+                    buf = delta;
+                }
+                ModelStreamDelta::ReasoningDelta { delta } => {
+                    if !buf.is_empty() {
+                        let ev = SessionEvent::ModelTextDelta {
+                            delta: std::mem::take(&mut buf),
+                        };
+                        let _ = host.emit_event(turn_id.clone(), ev).await;
+                    }
+                    cur_is_text = false;
+                    buf = delta;
+                }
+            }
+        }
+
+        if !buf.is_empty() {
+            let ev = if cur_is_text {
+                SessionEvent::ModelTextDelta { delta: buf }
+            } else {
+                SessionEvent::ModelReasoningDelta { delta: buf }
+            };
+            let _ = host.emit_event(turn_id.clone(), ev).await;
+        }
+    }
 }
 
 async fn apply_context_projection_hook(

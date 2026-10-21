@@ -185,92 +185,112 @@ impl SqliteStore {
             let mut session = Self::load_session_in_tx(&tx, session_id)?
                 .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
 
-            let mut blocks: Vec<openresponses_rust::MessageContent> = Vec::new();
-            {
-                let mut stmt = tx.prepare(
-                    "SELECT content_json FROM realtime_messages WHERE session_id = ?1 ORDER BY id ASC",
-                )?;
-                let rows = stmt.query_map(params![session_id.as_str()], |row| {
-                    let s: String = row.get(0)?;
-                    Ok(s)
-                })?;
-                for row in rows {
-                    let json_str = row?;
-                    let block: openresponses_rust::MessageContent =
-                        serde_json::from_str(&json_str)?;
-                    blocks.push(block);
-                }
-            }
-
-            if blocks.is_empty() {
-                return Ok((Vec::new(), None));
-            }
-
-            tx.execute(
-                "DELETE FROM realtime_messages WHERE session_id = ?1",
-                params![session_id.as_str()],
-            )?;
-
-            let block_count = blocks.len();
-            let item = Item::user_message_with_content(blocks);
-            let items = vec![item];
-
-            let b_seq = BatchSeq::new(session.status.batch_count);
-            let first_seq = LocalItemSeq::new(session.status.local_item_count);
-            let batch = ItemBatch {
-                session_id: session_id.clone(),
-                batch_seq: b_seq,
-                first_local_item_seq: first_seq,
-                kind: ItemBatchKind::Input,
-                activation_id: activation_id.clone(),
-                turn_id: turn_id.clone(),
-                response_id: None,
-                created_at: Utc::now(),
-                items: items.clone(),
-            };
-
-            tx.execute(
-                "INSERT INTO batches (
-                    session_id, batch_seq, first_local_item_seq, last_local_item_seq,
-                    kind, activation_id, turn_id, response_id, created_at, payload_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    session_id.as_str(),
-                    b_seq.value() as i64,
-                    first_seq.value() as i64,
-                    batch.last_local_item_seq().value() as i64,
-                    "input",
-                    activation_id.as_str(),
-                    turn_id.as_ref().map(|t| t.as_str()),
-                    Option::<String>::None,
-                    batch.created_at.to_rfc3339(),
-                    serde_json::to_string(&batch)?,
-                ],
-            )?;
-            session.status.batch_count += 1;
-            session.status.local_item_count += 1;
-            session.status.effective_context_item_count += 1;
-
-            let ev = Self::append_event_in_tx(
+            let (items, maybe_b_seq) = Self::drain_realtime_messages_in_tx(
                 &tx,
                 session_id,
-                Some(activation_id.clone()),
+                activation_id,
                 turn_id,
-                Some(b_seq),
-                SessionEvent::RealtimeMessagesDrained {
-                    count: block_count,
-                    batch_seq: b_seq,
-                },
+                &mut session,
+                &mut events_to_publish,
             )?;
-            session.status.event_count = ev.event_seq.value() + 1;
-            events_to_publish.push(ev);
-
-            Self::save_session_in_tx(&tx, &mut session)?;
-            tx.commit()?;
-            (items, Some(b_seq))
+            if maybe_b_seq.is_some() {
+                Self::save_session_in_tx(&tx, &mut session)?;
+                tx.commit()?;
+            }
+            (items, maybe_b_seq)
         };
 
         self.publish_events(events_to_publish);
         Ok((items, batch_seq))
+    }
+
+    pub(crate) fn drain_realtime_messages_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &SessionId,
+        activation_id: &ActivationId,
+        turn_id: Option<TurnId>,
+        session: &mut Session,
+        events_to_publish: &mut Vec<SessionEventEnvelope>,
+    ) -> Result<(Vec<Item>, Option<BatchSeq>), StoreError> {
+        let mut blocks: Vec<openresponses_rust::MessageContent> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT content_json FROM realtime_messages WHERE session_id = ?1 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id.as_str()], |row| {
+                let s: String = row.get(0)?;
+                Ok(s)
+            })?;
+            for row in rows {
+                let json_str = row?;
+                let block: openresponses_rust::MessageContent = serde_json::from_str(&json_str)?;
+                blocks.push(block);
+            }
+        }
+
+        if blocks.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+
+        tx.execute(
+            "DELETE FROM realtime_messages WHERE session_id = ?1",
+            params![session_id.as_str()],
+        )?;
+
+        let block_count = blocks.len();
+        let item = Item::user_message_with_content(blocks);
+        let items = vec![item];
+
+        let b_seq = BatchSeq::new(session.status.batch_count);
+        let first_seq = LocalItemSeq::new(session.status.local_item_count);
+        let batch = ItemBatch {
+            session_id: session_id.clone(),
+            batch_seq: b_seq,
+            first_local_item_seq: first_seq,
+            kind: ItemBatchKind::Input,
+            activation_id: activation_id.clone(),
+            turn_id: turn_id.clone(),
+            response_id: None,
+            created_at: Utc::now(),
+            items: items.clone(),
+        };
+
+        tx.execute(
+            "INSERT INTO batches (
+                session_id, batch_seq, first_local_item_seq, last_local_item_seq,
+                kind, activation_id, turn_id, response_id, created_at, payload_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session_id.as_str(),
+                b_seq.value() as i64,
+                first_seq.value() as i64,
+                batch.last_local_item_seq().value() as i64,
+                "input",
+                activation_id.as_str(),
+                turn_id.as_ref().map(|t| t.as_str()),
+                Option::<String>::None,
+                batch.created_at.to_rfc3339(),
+                serde_json::to_string(&batch)?,
+            ],
+        )?;
+        session.status.batch_count += 1;
+        session.status.local_item_count += 1;
+        session.status.effective_context_item_count += 1;
+
+        let ev = Self::append_event_in_tx(
+            tx,
+            session_id,
+            Some(activation_id.clone()),
+            turn_id,
+            Some(b_seq),
+            SessionEvent::RealtimeMessagesDrained {
+                count: block_count,
+                batch_seq: b_seq,
+            },
+        )?;
+        session.status.event_count = ev.event_seq.value() + 1;
+        events_to_publish.push(ev);
+
+        Ok((items, Some(b_seq)))
     }
 }
