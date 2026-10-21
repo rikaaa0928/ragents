@@ -67,11 +67,14 @@ fn evaluate_path_rules(
     let norm_target = normalize_path(target_path, workspace_root);
     let norm_ws = normalize_path(workspace_root, workspace_root);
     let norm_tmp = normalize_path(session_tmp_dir, workspace_root);
+    let require_exact = ragents_core::sandbox::is_setuid_or_setgid_binary(&norm_target)
+        || ragents_core::sandbox::is_setuid_or_setgid_binary(target_path);
 
-    let is_default_safe = norm_target.starts_with(&norm_ws)
-        || norm_target.starts_with(&norm_tmp)
-        || norm_target.starts_with(Path::new("/tmp"))
-        || norm_target.starts_with(Path::new("/private/tmp"));
+    let is_default_safe = !require_exact
+        && (norm_target.starts_with(&norm_ws)
+            || norm_target.starts_with(&norm_tmp)
+            || norm_target.starts_with(Path::new("/tmp"))
+            || norm_target.starts_with(Path::new("/private/tmp")));
 
     if let Some(rule_set) = rules {
         if let Some(ref denies) = rule_set.deny {
@@ -88,7 +91,12 @@ fn evaluate_path_rules(
         if let Some(ref allows) = rule_set.allow {
             for pattern in allows {
                 let norm_pat = normalize_path(Path::new(pattern), workspace_root);
-                if norm_target.starts_with(&norm_pat) || pattern == "*" {
+                let matched = if require_exact {
+                    norm_target == norm_pat || pattern == "*"
+                } else {
+                    norm_target.starts_with(&norm_pat) || pattern == "*"
+                };
+                if matched {
                     return PolicyEvalResult::Allow;
                 }
             }
@@ -128,7 +136,13 @@ pub fn capability_covered_by(
         ) => {
             let norm_g = normalize_path(g, workspace_root);
             let norm_r = normalize_path(r, workspace_root);
-            norm_r.starts_with(&norm_g)
+            if ragents_core::sandbox::is_setuid_or_setgid_binary(&norm_r)
+                || ragents_core::sandbox::is_setuid_or_setgid_binary(r)
+            {
+                norm_r == norm_g
+            } else {
+                norm_r.starts_with(&norm_g)
+            }
         }
         (CapabilityRequest::Http { host: g, .. }, CapabilityRequest::Http { host: r, .. }) => {
             host_matches(g, r)

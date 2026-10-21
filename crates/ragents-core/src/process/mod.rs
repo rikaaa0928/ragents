@@ -5,7 +5,7 @@ pub(crate) use entry::kill_process_group;
 use crate::error::CoreError;
 use crate::host::{CoreHost, PermissionOutcome};
 use crate::sandbox::{
-    extract_eperm_paths_from_text, normalize_violation_to_request_dir,
+    extract_eperm_paths_from_text, is_setuid_or_setgid_binary, normalize_violation_to_request_dir,
     query_macos_sandbox_violations, SandboxMode, SandboxState, SandboxViolation,
 };
 use async_trait::async_trait;
@@ -190,7 +190,13 @@ impl ProcessManager {
 
             let new_violations: Vec<_> = violations
                 .into_iter()
-                .filter(|v| !unlocked_paths.iter().any(|u| v.raw_path.starts_with(u)))
+                .filter(|v| {
+                    if is_setuid_or_setgid_binary(&v.raw_path) {
+                        !unlocked_paths.iter().any(|u| u == &v.raw_path)
+                    } else {
+                        !unlocked_paths.iter().any(|u| v.raw_path.starts_with(u))
+                    }
+                })
                 .collect();
 
             if new_violations.is_empty() {
@@ -370,13 +376,22 @@ impl ProcessManager {
                         .iter()
                         .any(|p| !sandbox_state.is_path_readable(p) && p.exists());
                     for raw_path in extracted {
+                        let is_setuid = is_setuid_or_setgid_binary(&raw_path);
                         let is_read_violation =
                             !sandbox_state.is_path_readable(&raw_path) && raw_path.exists();
+                        if is_setuid && !is_read_violation {
+                            continue;
+                        }
                         if has_unreadable && !is_read_violation && raw_path.exists() {
                             continue;
                         }
                         let req_dir = normalize_violation_to_request_dir(&raw_path);
-                        let (cap, op) = if is_read_violation {
+                        let (cap, op) = if is_setuid && is_read_violation {
+                            (
+                                CapabilityRequest::FileRead { path: req_dir },
+                                "file-read-data + setuid/setgid exec".to_string(),
+                            )
+                        } else if is_read_violation {
                             (
                                 CapabilityRequest::FileRead { path: req_dir },
                                 "file-read-data".to_string(),
@@ -419,7 +434,13 @@ impl ProcessManager {
 
                     let new_violations: Vec<_> = violations
                         .into_iter()
-                        .filter(|v| !unlocked_paths.iter().any(|u| v.raw_path.starts_with(u)))
+                        .filter(|v| {
+                            if is_setuid_or_setgid_binary(&v.raw_path) {
+                                !unlocked_paths.iter().any(|u| u == &v.raw_path)
+                            } else {
+                                !unlocked_paths.iter().any(|u| v.raw_path.starts_with(u))
+                            }
+                        })
                         .collect();
 
                     if !new_violations.is_empty() {

@@ -17,10 +17,64 @@ pub fn canonicalize_or_normalize(path: &Path) -> PathBuf {
     canonicalize_with_nonexistent_tail(path).unwrap_or_else(|| path.to_path_buf())
 }
 
+/// Returns `true` if `path` exists as a regular file on a Unix platform and has its
+/// `setuid` (`0o4000`) or `setgid` (`0o2000`) permission bit set.
+pub fn is_setuid_or_setgid_binary(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            return meta.is_file() && (meta.mode() & 0o6000) != 0;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    false
+}
+
+/// Returns `true` if `dir` is a system executable directory (`/bin`, `/sbin`, `/usr/bin`,
+/// `/usr/sbin`, `/usr/local/bin`, `/usr/local/sbin`) where executables must be authorized
+/// individually per command rather than collapsed to the entire directory.
+pub fn is_system_executable_dir(dir: &Path) -> bool {
+    for candidate in [Some(dir.to_path_buf()), canonicalize_with_nonexistent_tail(dir)]
+        .into_iter()
+        .flatten()
+    {
+        let s = candidate.to_string_lossy();
+        let trimmed = s.trim_end_matches('/');
+        if matches!(
+            trimmed,
+            "/bin"
+                | "/sbin"
+                | "/usr/bin"
+                | "/usr/sbin"
+                | "/usr/local/bin"
+                | "/usr/local/sbin"
+                | "/System/Cryptexes/App/usr/bin"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Normalizes a specific violated file path (such as `/Users/alice/.cache/uv/sdists-v6/.git`)
 /// to its logical parent directory scope (such as `/Users/alice/.cache/uv`) so that a single
 /// user approval unlocks the tool's working directory rather than prompting for every internal lockfile.
+///
+/// System executables under `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin` and any binary with
+/// `setuid`/`setgid` bits are never collapsed to their parent directory and are authorized
+/// individually per binary.
 pub fn normalize_violation_to_request_dir(raw_path: &Path) -> PathBuf {
+    if is_setuid_or_setgid_binary(raw_path)
+        || raw_path.parent().is_some_and(is_system_executable_dir)
+    {
+        return canonicalize_with_nonexistent_tail(raw_path)
+            .unwrap_or_else(|| raw_path.to_path_buf());
+    }
+
     let comps: Vec<Component<'_>> = raw_path.components().collect();
 
     for i in 0..comps.len() {

@@ -1,6 +1,9 @@
 mod violation;
 
-pub use violation::{canonicalize_or_normalize, normalize_violation_to_request_dir};
+pub use violation::{
+    canonicalize_or_normalize, is_setuid_or_setgid_binary, is_system_executable_dir,
+    normalize_violation_to_request_dir,
+};
 pub(crate) use violation::{
     closest_existing_dir, escape_sbpl, expand_canonical_paths, extract_eperm_paths_from_text,
     query_macos_sandbox_violations,
@@ -367,13 +370,22 @@ impl SandboxState {
                         .iter()
                         .any(|p| !self.is_path_readable(p) && p.exists());
                     for raw_path in extracted {
+                        let is_setuid = is_setuid_or_setgid_binary(&raw_path);
                         let is_read_violation =
                             !self.is_path_readable(&raw_path) && raw_path.exists();
+                        if is_setuid && !is_read_violation {
+                            continue;
+                        }
                         if has_unreadable && !is_read_violation && raw_path.exists() {
                             continue;
                         }
                         let req_dir = normalize_violation_to_request_dir(&raw_path);
-                        let (cap, op) = if is_read_violation {
+                        let (cap, op) = if is_setuid && is_read_violation {
+                            (
+                                CapabilityRequest::FileRead { path: req_dir },
+                                "file-read-data + setuid/setgid exec".to_string(),
+                            )
+                        } else if is_read_violation {
                             (
                                 CapabilityRequest::FileRead { path: req_dir },
                                 "file-read-data".to_string(),
@@ -545,6 +557,8 @@ impl SandboxState {
 
     pub fn is_path_readable(&self, target: &Path) -> bool {
         let norm_target = canonicalize_or_normalize(target);
+        let require_exact =
+            is_setuid_or_setgid_binary(&norm_target) || is_setuid_or_setgid_binary(target);
         let allowed_read = self
             .allowed_read_paths
             .lock()
@@ -552,7 +566,11 @@ impl SandboxState {
             .clone();
         for a in &allowed_read {
             let norm_a = canonicalize_or_normalize(a);
-            if norm_target.starts_with(&norm_a) {
+            if require_exact {
+                if norm_target == norm_a || target == a.as_path() {
+                    return true;
+                }
+            } else if norm_target.starts_with(&norm_a) {
                 return true;
             }
         }
@@ -574,7 +592,11 @@ impl SandboxState {
             .clone();
         for w in &writable {
             let norm_w = canonicalize_or_normalize(w);
-            if norm_target.starts_with(&norm_w) {
+            if require_exact {
+                if norm_target == norm_w || target == w.as_path() {
+                    return true;
+                }
+            } else if norm_target.starts_with(&norm_w) {
                 return true;
             }
         }
@@ -702,10 +724,26 @@ pub fn build_macos_seatbelt_profile(
     let expanded_allowed_read = expand_canonical_paths(allowed_read_paths);
     if !expanded_allowed_read.is_empty() {
         profile.push_str("(allow file-read-data\n");
-        for p in expanded_allowed_read {
-            profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(&p)));
+        for p in &expanded_allowed_read {
+            profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(p)));
         }
         profile.push_str(")\n");
+    }
+
+    let mut setuid_literals = std::collections::BTreeSet::new();
+    for p in expand_canonical_paths(writable_paths)
+        .into_iter()
+        .chain(expanded_allowed_read)
+    {
+        if is_setuid_or_setgid_binary(Path::new(&p)) {
+            setuid_literals.insert(p);
+        }
+    }
+    for bin in setuid_literals {
+        profile.push_str(&format!(
+            "(allow process-exec (with no-sandbox) (literal \"{}\"))\n",
+            escape_sbpl(&bin)
+        ));
     }
 
     profile

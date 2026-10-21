@@ -1502,3 +1502,99 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
 
     let _ = std::fs::remove_dir_all(&base_tmp);
 }
+
+#[test]
+fn test_setuid_and_system_bin_per_command_sandbox_authorization() {
+    use crate::sandbox::{
+        build_macos_seatbelt_profile, canonicalize_or_normalize, is_setuid_or_setgid_binary,
+        normalize_violation_to_request_dir, SandboxMode, SandboxState,
+    };
+    use std::path::{Path, PathBuf};
+
+    let norm_bin_sh = normalize_violation_to_request_dir(Path::new("/bin/sh"));
+    assert_ne!(
+        norm_bin_sh,
+        PathBuf::from("/bin"),
+        "/bin/sh must not be collapsed to /bin"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base_tmp =
+            std::env::temp_dir().join(format!("ragents-setuid-test-{}", uuid::Uuid::now_v7()));
+        let ws_root = base_tmp.join("ws");
+        let sess_tmp = base_tmp.join("tmp");
+        let custom_bin_dir = base_tmp.join("custom_bin");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        std::fs::create_dir_all(&sess_tmp).unwrap();
+        std::fs::create_dir_all(&custom_bin_dir).unwrap();
+
+        let fake_setuid_bin = custom_bin_dir.join("my_ps");
+        std::fs::write(&fake_setuid_bin, b"#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&fake_setuid_bin, std::fs::Permissions::from_mode(0o4755))
+            .unwrap();
+
+        assert!(is_setuid_or_setgid_binary(&fake_setuid_bin));
+
+        let req_path = normalize_violation_to_request_dir(&fake_setuid_bin);
+        assert_eq!(
+            req_path,
+            canonicalize_or_normalize(&fake_setuid_bin),
+            "setuid binary must be authorized as an individual file, never collapsed to parent dir"
+        );
+
+        let sandbox = SandboxState::from_policy(
+            SandboxMode::Auto,
+            &ws_root,
+            &sess_tmp,
+            &PermissionPolicyLayer::default(),
+        );
+
+        // Allowing the parent directory must NOT satisfy a setuid binary check
+        sandbox.allow_readable_path(&custom_bin_dir);
+        assert!(
+            !sandbox.is_path_readable(&fake_setuid_bin),
+            "parent directory grant must not unlock setuid binary without explicit per-binary approval"
+        );
+
+        let profile_before = build_macos_seatbelt_profile(
+            &[ws_root.clone()],
+            &[],
+            &[],
+            &[custom_bin_dir.clone()],
+            true,
+            "TAG_SETUID",
+        );
+        assert!(
+            !profile_before.contains("with no-sandbox"),
+            "directory grant must never emit (with no-sandbox): {profile_before}"
+        );
+
+        // Explicitly approving the setuid binary unlocks both read and process-exec (with no-sandbox)
+        sandbox.allow_readable_path(&fake_setuid_bin);
+        assert!(sandbox.is_path_readable(&fake_setuid_bin));
+
+        let profile_after = build_macos_seatbelt_profile(
+            &[ws_root.clone()],
+            &[],
+            &[],
+            &[custom_bin_dir.clone(), fake_setuid_bin.clone()],
+            true,
+            "TAG_SETUID",
+        );
+        let canon_bin = canonicalize_or_normalize(&fake_setuid_bin);
+        let expected_rule = format!(
+            "(allow process-exec (with no-sandbox) (literal \"{}\"))",
+            canon_bin.display()
+        );
+        assert!(
+            profile_after.contains(&expected_rule),
+            "expected seatbelt profile to contain `{expected_rule}`, got:\n{profile_after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
+    }
+}
+

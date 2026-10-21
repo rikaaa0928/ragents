@@ -67,16 +67,33 @@ pub(crate) async fn request_sandbox_violation_approval(
     unlocked_paths: &mut Vec<PathBuf>,
     temporary_once_paths: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    let reason = format!(
-        "Command `{}` requires {} access to '{}' (suggested directory: '{}')",
-        command,
-        v.operation,
-        v.raw_path.display(),
-        v.capability
-            .path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
-    );
+    let suggested = v
+        .capability
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let reason = if crate::sandbox::is_setuid_or_setgid_binary(&v.raw_path) {
+        format!(
+            "Command `{}` requires read and setuid/setgid execution permission (`process-exec with no-sandbox`) for privileged binary '{}'",
+            command,
+            v.raw_path.display()
+        )
+    } else if v.raw_path.parent().is_some_and(crate::sandbox::is_system_executable_dir) {
+        format!(
+            "Command `{}` requires {} access to executable '{}'",
+            command,
+            v.operation,
+            v.raw_path.display()
+        )
+    } else {
+        format!(
+            "Command `{}` requires {} access to '{}' (suggested directory: '{}')",
+            command,
+            v.operation,
+            v.raw_path.display(),
+            suggested
+        )
+    };
     match host
         .check_permission_with_original_path(
             Some(plugin_name),
