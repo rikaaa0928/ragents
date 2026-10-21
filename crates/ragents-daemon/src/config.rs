@@ -557,10 +557,12 @@ impl DaemonConfig {
             built_in_tools,
         };
 
-        let node_prompt = node_spec
-            .node_prompt
-            .clone()
-            .unwrap_or_else(|| self.default_system_prompt.clone());
+        let effective_np = node_spec.effective_node_prompt();
+        let node_prompt = if !effective_np.is_empty() || node_spec.node_prompt.is_some() || node_spec.node_prompt_override.is_some() {
+            effective_np
+        } else {
+            self.default_system_prompt.clone()
+        };
         let client_prompt = session.spec.system_prompt.clone().unwrap_or_default();
         let prompt_parts = PromptParts {
             system_prompt: cluster_system_prompt.to_string(),
@@ -618,7 +620,7 @@ impl DaemonConfig {
         let effective_extensions: Vec<ExtensionSpec> = ext_map.into_values().collect();
 
         let mut base_node_permissions = self.default_permissions.clone();
-        base_node_permissions.merge_from(&node_spec.permissions);
+        base_node_permissions.merge_from(&node_spec.effective_permissions());
         if let SchedulingMode::Pinned { workspace_path, .. } = &session.spec.scheduling {
             let raw_key = workspace_path.to_string_lossy().into_owned();
             let norm_key = normalize_and_resolve_workspace_path(workspace_path)

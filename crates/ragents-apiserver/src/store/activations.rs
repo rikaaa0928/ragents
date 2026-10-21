@@ -1010,7 +1010,9 @@ impl SqliteStore {
                         PermissionDecision::AllowNode => {
                             if let Some(nid) = target_node_id.as_ref() {
                                 if let Some(mut node) = Self::load_node_in_tx(&tx, nid)? {
-                                    node.spec.permissions.grant_capability(&effective_cap);
+                                    node.spec
+                                        .granted_permissions
+                                        .grant_capability(&effective_cap);
                                     Self::save_node_spec_in_tx(&tx, &mut node)?;
                                 }
                             }
@@ -1023,7 +1025,7 @@ impl SqliteStore {
                     let mut combined_policy = PermissionPolicyLayer::default();
                     if let Some(nid) = target_node_id.as_ref() {
                         if let Some(node) = Self::load_node_in_tx(&tx, nid)? {
-                            combined_policy.merge_from(&node.spec.permissions);
+                            combined_policy.merge_from(&node.status.effective_permissions);
                             if let SchedulingMode::Pinned { workspace_path, .. } =
                                 &session.spec.scheduling
                             {

@@ -1993,8 +1993,50 @@ async fn test_four_segment_system_prompt_ssot_permissions_and_disabled_tools() {
         "write_file was in disabled_tools and must be stripped"
     );
     assert_eq!(sess.status.effective_tools, seen_t[0]);
+    drop(seen_t);
+    drop(seen_inst);
 
+    // Restart daemon with an updated `default_system_prompt` in `daemon.toml` and verify that
+    // `NodeStatus.effective_node_prompt` and bound `SessionStatus.latest_prompt_parts.node_prompt` refresh immediately.
     daemon_cancel.cancel();
+    let mut cfg2 = make_daemon_cfg(
+        "node_ssot",
+        &server_url,
+        vec!["gpt-4.1"],
+        tmp.path().join("node_ssot"),
+    );
+    cfg2.executor_mode = ExecutorMode::InProcess;
+    cfg2.default_system_prompt = "Node Environment Prompt v2 (Updated on Restart)".to_string();
+    cfg2.allowed_workspace_dirs.push(tmp.path().to_path_buf());
+    let daemon2_cancel = CancellationToken::new();
+    let daemon2 = AgentDaemon::new(cfg2).with_model_backend(backend.clone());
+    daemon2.start(daemon2_cancel.clone()).await.unwrap();
+
+    let nodes = client.list_nodes().await.unwrap();
+    let node_ssot = nodes
+        .iter()
+        .find(|n| n.metadata.id == "node_ssot")
+        .expect("node_ssot present");
+    assert_eq!(
+        node_ssot.status.effective_node_prompt,
+        "Node Environment Prompt v2 (Updated on Restart)"
+    );
+
+    let sess_after = client
+        .get_session(&SessionId::new("sess_ssot"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sess_after
+            .status
+            .latest_prompt_parts
+            .unwrap()
+            .node_prompt,
+        "Node Environment Prompt v2 (Updated on Restart)"
+    );
+
+    daemon2_cancel.cancel();
     server_cancel.cancel();
 }
 

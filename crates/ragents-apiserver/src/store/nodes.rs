@@ -117,20 +117,30 @@ impl SqliteStore {
                 )
                 .optional()?;
 
-            // Seed-Only principle: only populate NodeSpec from daemon defaults on first registration.
-            // If the node already exists in `api-server`, preserve `api-server`'s stored NodeSpec (SSOT).
+            // Refresh daemon-owned base configuration (`node_prompt` and `base_permissions`) on every registration
+            // while preserving control-plane overrides (`node_prompt_override`) and interactive grants (`granted_permissions`, `workspace_permissions`).
             let spec = match existing {
-                Some((spec_json, _)) => serde_json::from_str::<NodeSpec>(&spec_json)?,
+                Some((spec_json, _)) => {
+                    let mut prev = serde_json::from_str::<NodeSpec>(&spec_json)?;
+                    prev.node_prompt = default_system_prompt;
+                    prev.base_permissions = default_permissions;
+                    prev
+                }
                 None => NodeSpec {
                     unschedulable: false,
                     node_prompt: default_system_prompt,
-                    permissions: default_permissions,
+                    node_prompt_override: None,
+                    base_permissions: default_permissions,
+                    granted_permissions: PermissionPolicyLayer::default(),
                     workspace_permissions: BTreeMap::new(),
                 },
             };
 
             let mut meta = ObjectMeta::new(node_id.as_str(), rv);
             meta.labels = labels;
+
+            let effective_node_prompt = spec.effective_node_prompt();
+            let effective_permissions = spec.effective_permissions();
 
             let status = NodeStatus {
                 phase: NodePhase::Ready,
@@ -141,6 +151,8 @@ impl SqliteStore {
                 default_model,
                 installed_extensions,
                 allowed_workspace_dirs,
+                effective_node_prompt: effective_node_prompt.clone(),
+                effective_permissions,
                 max_concurrent_runners: max_concurrent_runners.max(1),
                 active_runners: active_count,
                 last_heartbeat_at: now,
@@ -169,6 +181,30 @@ impl SqliteStore {
                     expires_at.to_rfc3339(),
                 ],
             )?;
+
+            // Synchronize `latest_prompt_parts.node_prompt` for sessions currently bound to this node
+            // so the Inspector immediately displays the refreshed `effective_node_prompt` after daemon restart.
+            let bound_session_ids: Vec<String> = {
+                let mut stmt =
+                    tx.prepare("SELECT session_id FROM sessions WHERE bound_node_id = ?1")?;
+                let rows = stmt.query_map(params![node_id.as_str()], |r| r.get(0))?;
+                let mut ids = Vec::new();
+                for r in rows {
+                    ids.push(r?);
+                }
+                ids
+            };
+            for sid_str in bound_session_ids {
+                let sid = SessionId::new(sid_str);
+                if let Some(mut sess) = Self::load_session_in_tx(&tx, &sid)? {
+                    if let Some(ref mut parts) = sess.status.latest_prompt_parts {
+                        if parts.node_prompt != effective_node_prompt {
+                            parts.node_prompt = effective_node_prompt.clone();
+                            Self::save_session_in_tx(&tx, &mut sess)?;
+                        }
+                    }
+                }
+            }
 
             dispatches = Self::schedule_pending_in_tx(&tx, &mut events_to_publish)?;
 

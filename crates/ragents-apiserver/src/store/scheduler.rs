@@ -172,7 +172,7 @@ impl SqliteStore {
                 .unwrap_or_default();
             session.status.latest_prompt_parts = Some(PromptParts {
                 system_prompt: cluster_system_prompt.clone(),
-                node_prompt: target_node_spec.node_prompt.clone().unwrap_or_default(),
+                node_prompt: target_node_spec.effective_node_prompt(),
                 client_prompt: session.spec.system_prompt.clone().unwrap_or_default(),
                 extension_prompts: existing_ext_prompts,
             });

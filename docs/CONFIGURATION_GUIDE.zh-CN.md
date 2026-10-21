@@ -50,7 +50,7 @@ max_concurrent_runners = 4
 # 单次 Activation 最大 ReAct 循环轮数限制（不填则默认无上限，直至任务完成或被取消）
 # max_turns = 50
 
-# 节点级默认系统提示词（仅在节点首次向 api-server 注册时作为种子写入 NodeSpec.node_prompt；后续以 api-server 中的 NodeSpec 为唯一事实源）
+# 节点级默认系统提示词（每次 daemon 启动注册时自动刷新 NodeSpec.node_prompt，并与可选控制面覆盖合并为 NodeStatus.effective_node_prompt）
 default_system_prompt = "You are a helpful AI engineering assistant managed by ragents."
 
 # 节点默认模型名（必须存在于下方 [models] 表中）
@@ -134,7 +134,7 @@ enabled = true
 config = { enabled = true, trigger_tokens = 400000, keep_recent_tokens = 64000 }
 
 # ============================================================================
-# 4. 节点默认权限与沙箱边界策略（Seed-Only：首次注册写入 NodeSpec.permissions，后续以 api-server 为准）
+# 4. 节点默认权限与沙箱边界策略（每次 daemon 启动时刷新 NodeSpec.base_permissions，并与运行时 AllowNode 增量权限 NodeSpec.granted_permissions 合并为 NodeStatus.effective_permissions）
 # ============================================================================
 [default_permissions.file_read]
 # 显式禁止读取的敏感目录（在 macOS Seatbelt / Linux bwrap 内核层同样强制阻断）
@@ -216,7 +216,7 @@ config = { inject_thinking_budget = 4096 }
 2. **四段式结构化系统提示词（`PromptParts`）**：
    - 系统提示词不再是简单的二选一覆盖，而是拆分为结构化的四段 `PromptParts` 并按固定顺序拼接（`PromptParts::assemble()`）：
      1. **`system_prompt`（集群级）**：来自 `api-server` 的 `store_meta.cluster_system_prompt`；
-     2. **`node_prompt`（节点级）**：来自 `api-server` 的 `NodeSpec.node_prompt`（节点首次注册时由 `daemon.toml` 的 `default_system_prompt` 种子化写入）；
+     2. **`node_prompt`（节点级）**：来自 `api-server` 的 `NodeStatus.effective_node_prompt`（每次 Daemon 启动注册时自动从 `daemon.toml` 的 `default_system_prompt` 刷新 `NodeSpec.node_prompt`，并与可选控制面覆盖 `node_prompt_override` 合并）；
      3. **`client_prompt`（会话/角色级）**：来自 `SessionSpec.system_prompt`（支持通过 `PATCH /api/v1/sessions/{id}` 在任意时刻动态修改，下一轮 Activation 立即生效）；
      4. **`extension_prompts`（WASM 扩展级）**：在 `agent-core` 启动并执行 `agent.prepare` 时，各 WASM 扩展返回的只读追加 `append_system_prompt`（其中 `agents_md` 扩展读取的 `<workspace_instructions>` 固定排在扩展段首位，随后是 `skills`、`chatroom` 等扩展）。
    - `agent.prepare` 执行完毕后，`agent-core` 立即通过 `ReportPreparedConfig` 将完整的 `PromptParts`、拼接后的 `effective_system_prompt` 以及过滤 `ActivationSpec.disabled_tools` 后的 `effective_tools` 回写至 `api-server`（持久化于 `ConfigRevision` 与 `SessionStatus.latest_prompt_parts` / `SessionStatus.effective_tools`）。
@@ -226,12 +226,12 @@ config = { inject_thinking_budget = 4096 }
      - **不同名扩展**：取并集（例如 `daemon.toml` 默认配置了 `shell`、`file_editor`、`agents_md`，CLI 传入 `--extension skills=...:~/.agents/skills`，最终全部生效）。
      - **同名扩展**：`SessionSpec` 中的同名 `ExtensionSpec` 完整覆盖 `daemon.toml` 中的对应项（可用于在特定会话中覆盖某扩展的 `config`、`allowed_dirs` 或将 `enabled` 设为 `false`）。
 4. **权限策略层（`permissions`）—— `api-server` 唯一事实源多层合并**：
-   - **多层策略合并顺序**：从 `api-server` 下发的 `NodeSpec.permissions`（节点级，首次注册由 `daemon.toml` 种子化） $\rightarrow$ `NodeSpec.workspace_permissions[workspace_root]`（工作区级） $\rightarrow$ `SessionSpec.permissions`（会话级）逐层执行 `merge_from`，并自动确保当前工作目录 `.` 与 `/tmp`（`/private/tmp`）处于内置默认允许列表。
+   - **多层策略合并顺序**：从 `api-server` 下发的 `NodeStatus.effective_permissions`（即每次 Daemon 启动刷新的 `NodeSpec.base_permissions` 与运行时追加的 `NodeSpec.granted_permissions` 合并结果） $\rightarrow$ `NodeSpec.workspace_permissions[workspace_root]`（工作区级） $\rightarrow$ `SessionSpec.permissions`（会话级）逐层执行 `merge_from`，并自动确保当前工作目录 `.` 与 `/tmp`（`/private/tmp`）处于内置默认允许列表。
    - **叠加启用扩展的 `allowed_dirs`**：将最终生效（`enabled = true`）的所有扩展声明的 `allowed_dirs` 自动合并追加到 `effective_permissions.file_read.allow` 中，同时在 WASI 0.2 `preopen_dirs` 与 OS 内核沙箱 `allowed_read_paths` 中注册。
    - **单规则集内部判定铁律（Deny 永远最高）**：
      在同一个规则集内，无论 `allow` 来自节点配置、工作区配置、会话配置还是扩展 `allowed_dirs`，执行判定顺序永远是：
      **① 命中 `deny` 立即拒绝 $\succ$ ② 命中 `allow`（含 `allowed_dirs` 与运行时动态授权）放行 $\succ$ ③ 命中 `default` 或工作区默认边界策略**。
-   - **交互式审批持久化回写 `api-server`**：当用户在运行中执行 `ragents approve` 时，`allow-session` 直接写入 `SessionSpec.permissions`，`allow-workspace` 写入 `NodeSpec.workspace_permissions[workspace_path]`，`allow-node` 写入 `NodeSpec.permissions`。
+   - **交互式审批持久化回写 `api-server`**：当用户在运行中执行 `ragents approve` 时，`allow-session` 直接写入 `SessionSpec.permissions`，`allow-workspace` 写入 `NodeSpec.workspace_permissions[workspace_path]`，`allow-node` 写入 `NodeSpec.granted_permissions`（并同步刷新 `NodeStatus.effective_permissions`）。
 5. **内容寻址审计快照（`ConfigRevision` & `PermissionSnapshot`）**：
    - 每次 `Activation` 开始执行时，`agent-daemon` 与 `agent-core` 剔除所有敏感凭证（`api_key`、`base_url`），将包含四段式 `prompt_parts` 与 `effective_tools` 的合并配置计算规范化 JSON SHA-256 摘要（生成 `cfg_sha256:...` 与 `permsnap_sha256:...`），通过 `AcceptActivation` 与 `ReportPreparedConfig` 回写至 `api-server` 持久化归档，确保每次历史运行均可精确复盘。
 

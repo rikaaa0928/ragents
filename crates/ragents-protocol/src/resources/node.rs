@@ -14,15 +14,38 @@ pub struct Node {
 pub struct NodeSpec {
     #[serde(default)]
     pub unschedulable: bool,
-    /// Node-level environment System Prompt (segment 2: `node_prompt`)
+    /// Daemon-reported base Node-level environment System Prompt (refreshed from `daemon.toml` on every `RegisterNode`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_prompt: Option<String>,
-    /// Node-wide permission policy (seeded from `daemon.toml` on first registration, updated via `AllowNode`)
+    /// Optional Control-Plane override for Node-level environment System Prompt (persisted across daemon restarts)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_prompt_override: Option<String>,
+    /// Daemon-reported base permission policy (refreshed from `daemon.toml` on every `RegisterNode`)
     #[serde(default)]
-    pub permissions: PermissionPolicyLayer,
-    /// Workspace-scoped permission policies keyed by normalized `workspace_path` (updated via `AllowWorkspace`)
+    pub base_permissions: PermissionPolicyLayer,
+    /// Control-Plane incremental node-wide permission grants (updated via `AllowNode`, preserved across daemon restarts)
+    #[serde(default)]
+    pub granted_permissions: PermissionPolicyLayer,
+    /// Workspace-scoped permission policies keyed by normalized `workspace_path` (updated via `AllowWorkspace`, preserved across daemon restarts)
     #[serde(default)]
     pub workspace_permissions: BTreeMap<String, PermissionPolicyLayer>,
+}
+
+impl NodeSpec {
+    /// Computes the effective node-level system prompt (`node_prompt_override` takes priority over `node_prompt`).
+    pub fn effective_node_prompt(&self) -> String {
+        self.node_prompt_override
+            .clone()
+            .or_else(|| self.node_prompt.clone())
+            .unwrap_or_default()
+    }
+
+    /// Computes the merged node-level permission policy (`base_permissions` merged with `granted_permissions`).
+    pub fn effective_permissions(&self) -> PermissionPolicyLayer {
+        let mut merged = self.base_permissions.clone();
+        merged.merge_from(&self.granted_permissions);
+        merged
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +72,12 @@ pub struct NodeStatus {
     /// Allowed parent directories for Pinned session `workspace_path` on this node (always includes `/tmp` by default)
     #[serde(default)]
     pub allowed_workspace_dirs: Vec<String>,
+    /// Effective node-level environment System Prompt (merged from `NodeSpec`)
+    #[serde(default)]
+    pub effective_node_prompt: String,
+    /// Effective node-wide permission policy (`base_permissions` merged with `granted_permissions`)
+    #[serde(default)]
+    pub effective_permissions: PermissionPolicyLayer,
     pub max_concurrent_runners: u32,
     pub active_runners: u32,
     pub last_heartbeat_at: DateTime<Utc>,

@@ -106,7 +106,7 @@ impl SqliteStore {
             let cluster_prompt = Self::load_cluster_system_prompt_in_tx(&tx)?;
             let node_prompt = match &bound_node_id {
                 Some(nid) => Self::load_node_in_tx(&tx, nid)?
-                    .and_then(|n| n.spec.node_prompt)
+                    .map(|n| n.status.effective_node_prompt)
                     .unwrap_or_default(),
                 None => String::new(),
             };
@@ -328,7 +328,7 @@ impl SqliteStore {
                     let cluster_prompt = Self::load_cluster_system_prompt_in_tx(&tx)?;
                     let node_prompt = match &session.status.bound_node_id {
                         Some(nid) => Self::load_node_in_tx(&tx, nid)?
-                            .and_then(|n| n.spec.node_prompt)
+                            .map(|n| n.status.effective_node_prompt)
                             .unwrap_or_default(),
                         None => String::new(),
                     };

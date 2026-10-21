@@ -100,7 +100,8 @@ impl AgentDaemon {
     pub fn sync_grants_from_node_spec(&self, node_spec: &NodeSpec) {
         {
             let mut n_guard = self.node_grants.lock().expect("node_grants mutex poisoned");
-            for cap in policy_layer_to_capability_grants(&node_spec.permissions) {
+            n_guard.clear();
+            for cap in policy_layer_to_capability_grants(&node_spec.effective_permissions()) {
                 if !n_guard.contains(&cap) {
                     n_guard.push(cap);
                 }

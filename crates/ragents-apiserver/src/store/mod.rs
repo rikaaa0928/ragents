@@ -339,11 +339,14 @@ impl SqliteStore {
     ) -> Result<(), StoreError> {
         let rv = Self::next_resource_version(tx)?;
         node.metadata.resource_version = rv;
+        node.status.effective_node_prompt = node.spec.effective_node_prompt();
+        node.status.effective_permissions = node.spec.effective_permissions();
         tx.execute(
-            "UPDATE nodes SET resource_version = ?1, spec_json = ?2 WHERE node_id = ?3",
+            "UPDATE nodes SET resource_version = ?1, spec_json = ?2, status_json = ?3 WHERE node_id = ?4",
             params![
                 rv.value() as i64,
                 serde_json::to_string(&node.spec)?,
+                serde_json::to_string(&node.status)?,
                 node.metadata.id,
             ],
         )?;

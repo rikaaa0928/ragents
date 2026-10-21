@@ -195,12 +195,18 @@ pub struct Node {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeSpec {
     pub unschedulable: bool,
-    /// 节点级环境提示词（首次注册时由 daemon.toml 的 default_system_prompt 种子化）
+    /// Daemon 上报的节点级基础环境提示词（每次 RegisterNode 从 daemon.toml 刷新）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_prompt: Option<String>,
-    /// 节点级全局权限策略（AllowNode 审批在此持久化）
+    /// 控制面可选的节点级提示词覆盖（跨 Daemon 重启保留）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_prompt_override: Option<String>,
+    /// Daemon 上报的节点基础权限策略（每次 RegisterNode 从 daemon.toml 刷新）
     #[serde(default)]
-    pub permissions: PermissionPolicyLayer,
+    pub base_permissions: PermissionPolicyLayer,
+    /// 控制面运行时追加的节点级增量权限（AllowNode 审批在此持久化，跨 Daemon 重启保留）
+    #[serde(default)]
+    pub granted_permissions: PermissionPolicyLayer,
     /// 按工作目录路径持久化的权限策略（AllowWorkspace 审批在此持久化）
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_permissions: BTreeMap<String, PermissionPolicyLayer>,
@@ -214,6 +220,8 @@ pub struct NodeStatus {
     pub arch: String,                     // aarch64 | x86_64
     pub supported_models: Vec<String>,    // 本节点本地配置支持的模型名列表（不含 api_key/base_url）
     pub installed_extensions: Vec<String>,// 本节点预装的 WASM 插件名称列表
+    pub effective_node_prompt: String,    // 合并后的最终生效节点提示词
+    pub effective_permissions: PermissionPolicyLayer, // base_permissions 与 granted_permissions 合并后的最终节点权限
     pub max_concurrent_runners: u32,
     pub active_runners: u32,
     pub last_heartbeat_at: DateTime<Utc>,
@@ -494,7 +502,7 @@ provider_model_id = "gpt-4.1"
 
 1. **四段式 System Prompt (`PromptParts`) 组装**：
    - 第 1 段 `system_prompt`：来自 `api-server` 下发的集群级 `cluster_system_prompt`；
-   - 第 2 段 `node_prompt`：来自 `api-server` 下发的 `node_spec.node_prompt`（首次注册时由 `daemon.toml` 的 `default_system_prompt` 种子化）；
+   - 第 2 段 `node_prompt`：来自 `node.status.effective_node_prompt`（由 `NodeSpec.node_prompt_override` 覆盖 `NodeSpec.node_prompt` 计算所得，每次 Daemon 启动/重连时自动刷新 `NodeSpec.node_prompt`）；
    - 第 3 段 `client_prompt`：来自 `Session.spec.system_prompt`（支持随时声明式修改）；
    - 第 4 段 `extension_prompts`：在 `agent-core` 执行 `agent.prepare` 时收集各 WASM 扩展返回的 `append_system_prompt`（固定 `agents_md` 排首位，随后为其余扩展），最终通过 `PromptParts::assemble()` 生成确定性的 `effective_system_prompt`。
 2. **模型与参数合并**：
@@ -502,7 +510,7 @@ provider_model_id = "gpt-4.1"
    - 从 Daemon 本地模型表查找对应 `base_url`、`api_key`、默认 `temperature` 和 `max_output_tokens`，再用 `Session.spec` 和 `Activation.spec` 中的显式非空参数覆盖。
 3. **扩展与权限合并（以 `api-server` 为唯一事实源）**：
    - 合并节点默认扩展与 `Session.spec.extensions`。
-   - 合并权限策略：`node_spec.permissions (节点级)` $\rightarrow$ `node_spec.workspace_permissions[workspace_root] (工作区级)` $\rightarrow$ `Session.spec.permissions (会话级)`，并叠加启用扩展的 `allowed_dirs` 与内置默认放行目录（`.`、`/tmp`）。
+   - 合并权限策略：`node.status.effective_permissions (base_permissions + granted_permissions)` $\rightarrow$ `node_spec.workspace_permissions[workspace_root] (工作区级)` $\rightarrow$ `Session.spec.permissions (会话级)`，并叠加启用扩展的 `allowed_dirs` 与内置默认放行目录（`.`、`/tmp`）。
 4. **回写不可变快照（`AcceptActivation` & `ReportPreparedConfig`）**：
    - 在 `agent-core` 完成 `agent.prepare` 并剔除 `Activation.spec.disabled_tools` 后，立即通过 `CoreHost::report_prepared_config` 将包含完整四段式 `prompt_parts` 与 `effective_tools` 的 `ConfigRevision`（`cfg_sha256:<hex>`）回写至 `api-server`，同时更新 `SessionStatus.latest_prompt_parts` 与 `SessionStatus.effective_tools`。
 
