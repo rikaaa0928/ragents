@@ -184,16 +184,6 @@ impl HookManager {
         })
     }
 
-    pub async fn transform_agent_draft(
-        &self,
-        hook: &str,
-        iteration: Option<usize>,
-        draft: AgentDraft,
-    ) -> Result<(AgentDraft, FlowControl), CoreError> {
-        let (draft, _ext_prompts, control) = self.prepare_extensions(hook, iteration, draft).await?;
-        Ok((draft, control))
-    }
-
     pub async fn prepare_extensions(
         &self,
         hook: &str,

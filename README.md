@@ -29,11 +29,13 @@
    - **宿主进程管理（`manage-process`）**：当 `uv run`、`pip install` 等命令访问工作区外部目录（如 `~/.cache/uv`）被内核沙箱拦截时，系统在**单次工具调用内部**自动捕获受阻路径（支持 `stderr` 快速提取 + macOS 内核沙箱日志兜底），支持单次命令内**多目录循环递进审批**，获批后原地自动解锁沙箱并重跑命令。
    - **WASI 0.2 文件系统（`wasi:filesystem/types::HostDescriptor`）**：直接接管 WASI 0.2 底层 `open-at`、`create-directory-at`、`unlink-file-at`、`rename-at` 等异步系统调用。无论 WASM 插件（如 `file_editor.wasm` 或任意第三方黑盒 `.wasm`）如何构造路径并调用 `std::fs`，只要触碰未授权目录，均在 WASI `open-at` 系统调用处直接挂起并发起 `FileRead` / `FileWrite` 审批，批准后当场返回文件描述符完成读写。
    - **WASI 0.2 网络（`wasi:http/outgoing-handler` & `wasi:sockets`）**：通过 Wasmtime WASI 0.2 内置的 `WasiHttpView::send_request` 与 `WasiCtxBuilder::socket_addr_check` 拦截所有出站 HTTP 与 TCP/UDP 连接，自动触发 `CapabilityRequest::Http` 权限校验与交互式域名审批（支持 `--path "*.example.com"` 通配符覆盖）。
-   - 审批时统一展示 `original_path`（原始受阻文件路径或完整 URL）与 `suggested_path`（自动收敛建议目录或目标域名），支持用户通过 `--path` 手动收窄或放宽范围，并提供 **`allow-once` / `allow-activation` / `allow-session` / `allow-workspace` / `allow-node`** 5 级生效周期。
-7. **`agent-daemon` 与 `api-server` 双驱动扩展体系**
-   - 同时支持 **Native Rust Trait**、**WASM 组件（`.wasm`/`.cwasm`）** 与 **HTTP/UDS Webhook（`http://` / `https://` / `unix://`）**。
-   - `agent-daemon` 支持拦截并改写模型请求参数（标准字段与供应商私有扩展字段）、注入自定义 Header、动态轮换 `api_key`、后处理模型响应及自定义权限策略。
-   - `api-server` 支持自定义 `Authn`（客户端与节点隧道认证）、`Authz`（含基于 `enforced_label_selector` 的多租户透明隔离）以及 `Mutating / Validating Admission` 准入控制。
+   - 审批时统一展示 `original_path`（原始受阻文件路径或完整 URL）与 `suggested_path`（自动收敛建议目录或目标域名），支持用户通过 `--path` 手动收窄或放宽范围，并提供 **`allow-once` / `allow-activation` / `allow-session` / `allow-workspace` / `allow-node`** 5 级生效周期。其中 `allow-session`、`allow-workspace`、`allow-node` 直接持久化落盘至 `api-server` 的 `SessionSpec.permissions`、`NodeSpec.workspace_permissions` 与 `NodeSpec.permissions`（`api-server` 唯一事实源，节点重启不丢失）。
+7. **四段式结构化 System Prompt (`PromptParts`) 与三层扩展边界**
+   - **四段式 System Prompt**：按确定性顺序自动拼装 `1. system_prompt`（集群级） $\rightarrow$ `2. node_prompt`（`NodeSpec` 节点级） $\rightarrow$ `3. client_prompt`（`SessionSpec` 会话/角色级，支持随时动态修改） $\rightarrow$ `4. extension_prompts`（`agents_md` 及其他 WASM 扩展只读追加），并在 `agent.prepare` 完成后通过 `ReportPreparedConfig` 将完整 `PromptParts` 与过滤 `disabled_tools` 后的 `effective_tools` 实时回写 `api-server`。
+   - **三层扩展体系**：
+     - `api-server`：支持自定义 `Authn`（客户端与节点隧道认证）、`Authz`（含 `enforced_label_selector` 多租户透明隔离）及 `Mutating / Validating Admission`（含 `CreateSession`、`SubmitPromptTurn`、`PushRealtimeMessage`）。
+     - `agent-daemon`：支持 `before_model_request`、`after_model_response`、`evaluate_permission` 拦截器（Native Trait / WASM / Webhook）。
+     - `agent-core`：WASM 扩展 `agent.prepare` 收窄为只读追加 `append_system_prompt` 与注册 `tools`，严禁中途篡改上层提示词、模型名或历史消息。
 
 ---
 
@@ -44,11 +46,13 @@ ragents/
 ├── Cargo.toml                        # Workspace 根配置
 ├── scripts/build-extensions.sh       # 构建内置 wasm32-wasip2 工具扩展脚本
 ├── wit/ragent-extension.wit          # WASM 扩展 WIT 接口契约
-├── extensions/                       # 内置 WASM 工具扩展源码 (wasm32-wasip2)
+├── extensions/                       # 内置 WASM 工具与控制面扩展源码 (wasm32-wasip2)
+│   ├── authn/                        # 控制面客户端与节点隧道 Bearer Token 鉴权扩展
 │   ├── shell/                        # 宿主前后台命令执行与进程管理扩展（含 2000行/50KB 尾部截断与落盘）
 │   ├── file_editor/                  # 文件分页读取 (offset/limit)、写入与非重叠精确替换扩展
 │   ├── image_viewer/                 # 多模态图像查看扩展
-│   ├── skills/                       # Agent Skills (.agents/skills) 与 AGENTS.md 自动发现与加载扩展
+│   ├── agents_md/                    # 工作区 AGENTS.md / CLAUDE.md 自动发现与指令注入扩展
+│   ├── skills/                       # Agent Skills (.agents/skills) 自动发现与按需加载扩展
 │   └── compaction/                   # 三会话自动上下文压缩与多代接力摘要扩展 (sess_1 -> sess_compact -> sess_2)
 ├── crates/
 │   ├── ragents-protocol/             # 核心声明式资源、事件、REST/SSE/WS 协议与扩展契约
@@ -73,7 +77,7 @@ ragents/
 ### 3.1 编译主程序与内置 WASM 扩展
 
 ```bash
-# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, skills, compaction)
+# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, agents_md, skills, compaction, authn)
 ./scripts/build-extensions.sh
 
 # 2. 编译 ragents 工作区所有二进制
@@ -161,8 +165,9 @@ export RAGENTS_MODEL="gemini-3.8-flash"
   --model gemini-3.8-flash \
   --extension shell=./extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm \
   --extension file_editor=./extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm \
+  --extension agents_md=./extensions/agents_md/target/wasm32-wasip2/release/ragent_agents_md_extension.wasm \
   --extension "skills=./extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm:~/.agents/skills" \
-  --extension 'compaction=./extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm#{"trigger_tokens":64000,"keep_recent_tokens":20000}' \
+  --extension 'compaction=./extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm#{"trigger_tokens":400000,"keep_recent_tokens":64000}' \
   "请检查 src/main.rs 并运行 cargo check"
 ```
 
@@ -319,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("Hello from ragents SDK!")],
                 model_override: None,
+                disabled_tools: vec![],
             }),
         })
         .await?;

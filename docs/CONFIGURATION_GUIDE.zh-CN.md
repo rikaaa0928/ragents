@@ -15,6 +15,7 @@
 | `RAGENTS_MODEL` | `daemon` / `up` | `gpt-4.1` | 未指定 `daemon.toml` 时默认注册的模型名称 |
 | `RAGENTS_SERVER_URL` | `cli` / `daemon` | `http://127.0.0.1:8080` | CLI 与 Daemon 默认连接的 `api-server` 地址（可被命令行 `--server` 覆盖） |
 | `RAGENTS_AUTH_TOKEN` | `cli` / `daemon` | 无 | 访问开启了 `Authn` 认证的 `api-server` 时自动携带的 `Bearer` Token（可被命令行 `--auth-token` 覆盖） |
+| `RAGENTS_SYSTEM_PROMPT` | `apiserver` / `up` | 无 | 集群全局级 `system_prompt`（首次初始化时写入 `store_meta.cluster_system_prompt`，会作为四段式 `PromptParts` 的第 1 段自动注入所有会话） |
 | `RAGENTS_WORKER_BIN` | `daemon` | 当前可执行文件自身 | 自定义 `SubprocessExecutor` 使用的 worker 二进制路径（默认使用 `ragents internal-core-worker` 单二进制自孵化） |
 
 ---
@@ -49,7 +50,7 @@ max_concurrent_runners = 4
 # 单次 Activation 最大 ReAct 循环轮数限制（不填则默认无上限，直至任务完成或被取消）
 # max_turns = 50
 
-# 节点级默认系统提示词（当 Session 未指定 system_prompt 时生效）
+# 节点级默认系统提示词（仅在节点首次向 api-server 注册时作为种子写入 NodeSpec.node_prompt；后续以 api-server 中的 NodeSpec 为唯一事实源）
 default_system_prompt = "You are a helpful AI engineering assistant managed by ragents."
 
 # 节点默认模型名（必须存在于下方 [models] 表中）
@@ -109,49 +110,53 @@ enabled = true
 config = {}
 
 [[extensions]]
+name = "agents_md"
+path = "./extensions/agents_md/target/wasm32-wasip2/release/ragent_agents_md_extension.wasm"
+enabled = true
+config = {}
+
+[[extensions]]
 name = "skills"
 path = "./extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm"
 enabled = true
 # 声明式授予该扩展额外允许读取的宿主机目录（支持 ~/ 展开；会自动挂载至 WASI 并合并进 PermissionSnapshot）
 allowed_dirs = ["~/.agents/skills"]
-config = { include_workspace = true, include_global = true, include_agents_md = true }
+config = { include_workspace = true, include_global = true }
 
 [[extensions]]
 name = "compaction"
 path = "./extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm"
 enabled = true
 # 自动上下文压缩阈值配置：
-# - trigger_tokens：当上下文估算或模型返回的 Token 数达到该阈值时，自动触发三会话接力压缩（默认 64000，可在超长上下文模型质量衰减前主动提前压缩）
-# - keep_recent_tokens：压缩时原样保留在 ContinuedFrom 尾部切片中的最近对话 Token 数（默认 20000，自动在 Assistant Step / User 边界切分，绝不切断平行 FunctionCall 与 FunctionCallOutput）
+# - trigger_tokens：当上下文估算或模型返回的 Token 数达到该阈值时，自动触发三会话接力压缩（默认推荐 400000）
+# - keep_recent_tokens：压缩时原样保留在 ContinuedFrom 尾部切片中的最近对话 Token 数（默认推荐 64000，自动在 Assistant Step / User 边界切分，绝不切断平行 FunctionCall 与 FunctionCallOutput）
 # - custom_instructions：可选的自定义摘要侧重点指令
-config = { enabled = true, trigger_tokens = 64000, keep_recent_tokens = 20000 }
+config = { enabled = true, trigger_tokens = 400000, keep_recent_tokens = 64000 }
 
 # ============================================================================
-# 4. 节点默认权限与沙箱边界策略
+# 4. 节点默认权限与沙箱边界策略（Seed-Only：首次注册写入 NodeSpec.permissions，后续以 api-server 为准）
 # ============================================================================
 [default_permissions.file_read]
 # 显式禁止读取的敏感目录（在 macOS Seatbelt / Linux bwrap 内核层同样强制阻断）
 deny = ["/Users/yourname/.ssh", "/Users/yourname/.aws"]
-# 允许直接读取的额外目录（workspace_root 与 session_tmp_dir 默认自动允许）
-allow = []
+# 允许直接读取的默认目录（当前工作目录 "." 与 "/tmp" 内置默认放行）
+allow = [".", "/tmp"]
 # 工作区外未匹配规则时的默认动作："allow" | "deny" | "ask"
 default = "ask"
 
 [default_permissions.file_write]
 deny = ["/etc", "/usr"]
-# 例如可预先放行本地包管理器缓存目录，避免每次询问
-# allow = ["/Users/yourname/.cache/uv"]
+allow = [".", "/tmp"]
 default = "ask"
 
 [default_permissions.command_work_dir]
-# 是否在每次执行 shell 命令前要求对工作目录进行审批
-# 若不配置，在 workspace_root 内默认 allow，越出工作区自动触发 ask
-# default = "ask"
+allow = [".", "/tmp"]
+default = "ask"
 
 [default_permissions.http_hosts]
 # 允许直接访问的域名列表（支持 "*"、"api.example.com" 或 "*.example.com" 通配符）
-# 若不配置 allow，默认策略为 "ask"，当 WASM 扩展调用 http-fetch 访问外部域名时会自动弹出交互式权限申请
-allow = ["*"]
+# 默认 allow = [] 且 default = "ask"，当 WASM 扩展访问外部域名时会自动弹出交互式权限申请
+allow = []
 default = "ask"
 
 # ============================================================================
@@ -208,22 +213,27 @@ config = { inject_thinking_budget = 4096 }
      *(注：确定模型名称后，其连接的 `base_url`、`api_key`、`extra_headers` **100% 强制取自执行节点本地 `daemon.toml` 的 `[models.<name>]`**，客户端或 `SessionSpec` 绝不能覆盖节点本地凭证。)*
    - **采样与推理参数 (`temperature` / `max_output_tokens` / `reasoning`)**：
      `ActivationSpec.model_override` $\succ$ `SessionSpec.model` $\succ$ `daemon.toml` 中该模型的默认值。
-2. **系统提示词（System Prompt）**：
-   - 若 `SessionSpec.system_prompt`（或 CLI `--system-prompt`）非空则优先使用；否则回退使用 `daemon.toml` 的 `default_system_prompt`。
-   - 随后在 `agent-core` 启动时，挂载的 WASM 扩展（如 `skills` 扩展）可通过 `agent.prepare` Hook 进一步向有效 `system_prompt` 动态追加 `<workspace_instructions>`（`AGENTS.md`）与 `<available_skills>`。
+2. **四段式结构化系统提示词（`PromptParts`）**：
+   - 系统提示词不再是简单的二选一覆盖，而是拆分为结构化的四段 `PromptParts` 并按固定顺序拼接（`PromptParts::assemble()`）：
+     1. **`system_prompt`（集群级）**：来自 `api-server` 的 `store_meta.cluster_system_prompt`；
+     2. **`node_prompt`（节点级）**：来自 `api-server` 的 `NodeSpec.node_prompt`（节点首次注册时由 `daemon.toml` 的 `default_system_prompt` 种子化写入）；
+     3. **`client_prompt`（会话/角色级）**：来自 `SessionSpec.system_prompt`（支持通过 `PATCH /api/v1/sessions/{id}` 在任意时刻动态修改，下一轮 Activation 立即生效）；
+     4. **`extension_prompts`（WASM 扩展级）**：在 `agent-core` 启动并执行 `agent.prepare` 时，各 WASM 扩展返回的只读追加 `append_system_prompt`（其中 `agents_md` 扩展读取的 `<workspace_instructions>` 固定排在扩展段首位，随后是 `skills`、`chatroom` 等扩展）。
+   - `agent.prepare` 执行完毕后，`agent-core` 立即通过 `ReportPreparedConfig` 将完整的 `PromptParts`、拼接后的 `effective_system_prompt` 以及过滤 `ActivationSpec.disabled_tools` 后的 `effective_tools` 回写至 `api-server`（持久化于 `ConfigRevision` 与 `SessionStatus.latest_prompt_parts` / `SessionStatus.effective_tools`）。
 3. **WASM 扩展列表（`extensions`）—— 按扩展名 `name` 字典合并覆盖**：
    - 先加载 `daemon.toml` 中的所有 `[[extensions]]` 作为基线字典（以 `ext.name` 为 Key）。
    - 再遍历 `SessionSpec.extensions`（即 CLI `--extension` 传入的扩展）：
-     - **不同名扩展**：取并集（例如 `daemon.toml` 默认配置了 `shell` 与 `file_editor`，CLI 传入 `--extension skills=...:~/.agents/skills`，最终三者同时生效）。
+     - **不同名扩展**：取并集（例如 `daemon.toml` 默认配置了 `shell`、`file_editor`、`agents_md`，CLI 传入 `--extension skills=...:~/.agents/skills`，最终全部生效）。
      - **同名扩展**：`SessionSpec` 中的同名 `ExtensionSpec` 完整覆盖 `daemon.toml` 中的对应项（可用于在特定会话中覆盖某扩展的 `config`、`allowed_dirs` 或将 `enabled` 设为 `false`）。
-4. **权限策略层（`permissions`）与扩展 `allowed_dirs`**：
-   - **基础策略合并**：`SessionSpec.permissions` 覆盖 `daemon.toml` 的 `default_permissions`（按 `file_read`、`file_write`、`http_hosts`、`command_work_dir` 四个维度的 `deny` / `allow` / `default` 逐项覆盖，未指定的维度继承 `daemon.toml`）。
+4. **权限策略层（`permissions`）—— `api-server` 唯一事实源多层合并**：
+   - **多层策略合并顺序**：从 `api-server` 下发的 `NodeSpec.permissions`（节点级，首次注册由 `daemon.toml` 种子化） $\rightarrow$ `NodeSpec.workspace_permissions[workspace_root]`（工作区级） $\rightarrow$ `SessionSpec.permissions`（会话级）逐层执行 `merge_from`，并自动确保当前工作目录 `.` 与 `/tmp`（`/private/tmp`）处于内置默认允许列表。
    - **叠加启用扩展的 `allowed_dirs`**：将最终生效（`enabled = true`）的所有扩展声明的 `allowed_dirs` 自动合并追加到 `effective_permissions.file_read.allow` 中，同时在 WASI 0.2 `preopen_dirs` 与 OS 内核沙箱 `allowed_read_paths` 中注册。
    - **单规则集内部判定铁律（Deny 永远最高）**：
-     在同一个规则集内，无论 `allow` 来自节点默认配置、会话配置还是扩展 `allowed_dirs`，执行判定顺序永远是：
+     在同一个规则集内，无论 `allow` 来自节点配置、工作区配置、会话配置还是扩展 `allowed_dirs`，执行判定顺序永远是：
      **① 命中 `deny` 立即拒绝 $\succ$ ② 命中 `allow`（含 `allowed_dirs` 与运行时动态授权）放行 $\succ$ ③ 命中 `default` 或工作区默认边界策略**。
+   - **交互式审批持久化回写 `api-server`**：当用户在运行中执行 `ragents approve` 时，`allow-session` 直接写入 `SessionSpec.permissions`，`allow-workspace` 写入 `NodeSpec.workspace_permissions[workspace_path]`，`allow-node` 写入 `NodeSpec.permissions`。
 5. **内容寻址审计快照（`ConfigRevision` & `PermissionSnapshot`）**：
-   - 每次 `Activation` 开始执行前，`agent-daemon` 剔除所有敏感凭证（`api_key`、`base_url`），对合并后的规范化 JSON 计算 SHA-256 摘要（生成 `cfg_sha256:...` 与 `permsnap_sha256:...`），通过 `AcceptActivation` 回写至 `api-server` 持久化归档，确保每次历史运行均可精确复盘。
+   - 每次 `Activation` 开始执行时，`agent-daemon` 与 `agent-core` 剔除所有敏感凭证（`api_key`、`base_url`），将包含四段式 `prompt_parts` 与 `effective_tools` 的合并配置计算规范化 JSON SHA-256 摘要（生成 `cfg_sha256:...` 与 `permsnap_sha256:...`），通过 `AcceptActivation` 与 `ReportPreparedConfig` 回写至 `api-server` 持久化归档，确保每次历史运行均可精确复盘。
 
 ---
 

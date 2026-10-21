@@ -1,6 +1,6 @@
-# ragents 扩展架构设计文档（`agent-daemon` 与 `api-server` プラグイン体系）
+# ragents 三层扩展架构设计文档（`api-server`、`agent-daemon` 与 `agent-core`）
 
-- **文档状态**：Draft v1.0
+- **文档状态**：Implemented（已实现）
 - **关联文档**：
   - [产品需求文档 (PRD)](./PRODUCT_REQUIREMENTS.zh-CN.md)
   - [技术方案设计文档 (Technical Design)](./TECHNICAL_DESIGN.zh-CN.md)
@@ -8,18 +8,20 @@
 
 ---
 
-## 1. 背景与问题定义
+## 1. 背景与三层扩展边界（Three-Tier Extension Boundary）
 
-在 `ragents` 现有的四模块架构中，**`agent-core`** 已经具备基于 `wasm32-wasip2`（Wasmtime Component Model）的扩展机制，用于承载自定义工具（Tools）和 ReAct 循环内的生命周期钩子（`on_session_start` / `on_turn_start` / `on_tool_call` / `on_tool_result` / `on_turn_end`）。
+`ragents` 将扩展能力严格划分为三个互不越界的平面：**集群控制面（`api-server`）**、**节点守护面（`agent-daemon`）** 与 **沙箱执行内核（`agent-core`）**：
 
-然而，随着系统进入生产落地阶段，**宿主守护平面（`agent-daemon`）** 与 **集群控制平面（`api-server`）** 同样面临强烈的定制与扩展需求，而这两层的职责边界与 `agent-core` 截然不同：
-
-1. **为什么模型参数拦截与凭证注入应该在 `agent-daemon` 而不是 `agent-core`？**
-   - 在 Stage 6 的安全隔离模型中，`agent-core` 运行在受限的沙箱子进程（`SubprocessExecutor`）中，**不持有模型 API Key**，所有大模型调用均通过单节点共享 UDS 转发给父进程 `agent-daemon` 代发。
-   - 因此，`agent-daemon` 是天然的 **节点级模型网关（Node-Local Model Gateway）与工作区宿主**。对模型请求参数的统一改写（如强制注入推理强度 `reasoning`、注入特定供应商扩展参数、根据模型名动态改写 `temperature`/`max_output_tokens`、动态向 Vault/STS 换取短期 Token、添加自定义网关 Header、敏感信息脱敏 DLP、Token 用量与成本审计）必须在 `agent-daemon` 层完成。
-2. **为什么鉴权、多租户配额与准入控制必须在 `api-server`？**
-   - `api-server` 是整个集群唯一的声明式状态入口（REST + SSE + Daemon WebSocket Tunnel）。
-   - 企业接入时需要：自定义身份认证（JWT / OIDC / 企业内部 AK/SK / 网关透传 Header）、节点接入认证（Daemon 注册 Token 校验）、细粒度权限控制（RBAC / 多租户 Session 隔离）、K8s 风格的变更/校验准入控制（Mutating & Validating Admission，例如自动打租户标签、限制单用户并发 Session 数、默认注入企业安全规则）以及自定义调度器打分（Scheduler Extender）。
+1. **`agent-core` WASM 工具扩展（`wit/ragent-extension.wit`）—— 仅限工具注册、提示词追加与上下文压缩**
+   - `agent-core` 运行在受限的沙箱子进程（`SubprocessExecutor`）中，负责加载 `shell`、`file_editor`、`image_viewer`、`agents_md`、`skills`、`compaction`、`chatroom` 等 `wasm32-wasip2` 组件。
+   - **严格收窄的 `agent.prepare` 契约**：插件在 `agent.prepare` 阶段仅可返回 `ExtensionPrepareOutput { append_system_prompt: Option<String>, tools: Vec<ToolDefinition> }`（只读追加第四段 `extension_prompts` 并注册工具），**严禁读取或篡改上层 `system_prompt`、`model` 或历史上下文**。
+   - **移除中途隐式篡改钩子**：系统移除了早期设计中的 `input.prepare`、`turn.prepare`、`model.request.prepare`、`model.response.prepare`、`context.append.prepare`，并限制 `context.project.prepare` 仅用于触发三会话上下文压缩（`CompactionPlan`）。`agent.prepare` 完成后，`agent-core` 立即通过 `ReportPreparedConfig` 将组装好的四段式 `PromptParts` 与过滤 `ActivationSpec.disabled_tools` 后的 `effective_tools` 回写 `api-server`，确保 `api-server` 数据库、Web 透视面板与发往大模型的 `instructions` / `tools` 100% 一致。
+2. **为什么模型参数拦截与凭证注入必须在 `agent-daemon` 而不是 `agent-core`？**
+   - 在 `SubprocessExecutor` 安全隔离模型中，`agent-core` 子进程**不持有模型 API Key**，所有大模型调用均通过单节点共享 UDS 转发给父进程 `agent-daemon` 代发。
+   - 因此，`agent-daemon` 是天然的 **节点级模型网关（Node-Local Model Gateway）与工作区宿主**。对模型请求参数的网关级改写（如注入特定供应商扩展参数、动态向 Vault/STS 换取短期 Token、添加自定义网关 Header、敏感信息脱敏 DLP、Token 用量与成本审计）以及节点级自定义权限评估（`evaluate_permission`）統一在 `agent-daemon` 层完成。
+3. **为什么鉴权、多租户配额、输入变更与工具禁用必须在 `api-server`？**
+   - `api-server` 是整个集群唯一的声明式状态入口（Single Source of Truth）。
+   - 身份认证（`Authn`）、细粒度权限与多租户透明隔离（`Authz`）、声明式请求变更与校验准入（`Mutating / Validating Admission`，覆盖 `CreateSession`、`SubmitPromptTurn`、`PushRealtimeMessage` 等操作）以及激活级工具禁用（`ActivationSpec.disabled_tools`）全部在 `api-server` 入库前完成，保证落盘数据与实际执行语义完全一致。
 
 ---
 
@@ -58,26 +60,23 @@
 
 ```text
 [api-server]
-    │ DispatchActivation(Activation, Session, ConfigRevision)
+    │ DispatchActivation(Activation, Session, cluster_system_prompt, node_spec)
     ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
 │                              agent-daemon                                  │
 │                                                                            │
-│  1. [Hook: pre_activation]  ──► 修改/注入 CoreRunSpec (环境变量、指令片段) │
-│            │                                                               │
-│            ▼                                                               │
 │     (Shared UDS IPC) ◄──────► [agent-core 子进程]                          │
+│            │                   ├── agent.prepare -> ReportPreparedConfig   │
+│            │                   └── ReAct Loop (Tools / Compaction)         │
 │            │                                                               │
-│  2. [Hook: evaluate_permission] ──► 拦截 CheckPermission，执行自定义安全策略│
+│  1. [Hook: evaluate_permission] ──► 拦截 CheckPermission，执行自定义安全策略│
 │            │                                                               │
-│  3. [Hook: before_model_request] ──► ★ 拦截/修改模型请求参数、Header、路由 │
+│  2. [Hook: before_model_request] ──► ★ 拦截/修改模型请求参数、Header、路由 │
 │            │                                                               │
 │            ▼                                                               │
 │     [OpenResponses HTTP Client] ──► 调用真实 LLM 供应商 API                 │
 │            │                                                               │
-│  4. [Hook: after_model_response] ──► ★ 拦截/修改模型响应、用量统计、风控审计│
-│            │                                                               │
-│  5. [Hook: post_activation] ──► 清理临时资源、归档产物                     │
+│  3. [Hook: after_model_response] ──► ★ 拦截/修改模型响应、用量统计、风控审计│
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -147,13 +146,12 @@ pub enum ModelRequestInterceptOutcome {
 - **场景 B（企业网关动态签名）**：每次请求前，拦截器根据 `session_metadata["tenant_id"]` 生成带时间戳的 HMAC 签名放入 `upsert_headers["X-Gateway-Signature"]`。
 - **场景 C（敏感信息脱敏 DLP）**：扫描 `request_body.input` 中的私钥或内部口令，替换为 `[REDACTED]` 后再发往公有云模型。
 
-### 3.3 核心扩展点二：Activation 与权限策略拦截器（`DaemonLifecycleInterceptor`）
+### 3.3 核心扩展点二：权限策略拦截器（`evaluate_permission`）
 
-除模型拦截外，`agent-daemon` 还提供两个关键扩展钩子：
-1. **`pre_activation(ActivationContext) -> Result<CoreRunSpecMutation, RejectReason>`**：
-   - 在拉起 `agent-core` 子进程前触发。可动态向 `CoreRunSpec` 注入节点特定的 `InstructionFragment`（例如把宿主机的操作系统、GPU 型号、内部工具路径写入系统提示词），或注入特定 WASM 工具扩展。
-2. **`evaluate_permission(PermissionCheckContext) -> Option<PermissionOutcome>`**：
-   - 当 `agent-core` 请求执行 `shell_exec` / `network_http` 时，可在静态规则（`Allow`/`Deny`/`Ask`）之前或之后运行自定义策略（例如解析 `shell` 命令参数，自动放行 `git status`/`cargo test` 等只读安全命令，自动拦截高危命令，减少人工 `Ask` 打扰）。
+除模型请求与响应拦截外，`agent-daemon` 还提供节点级权限评估钩子：
+- **`evaluate_permission(PermissionInterceptInput) -> PermissionInterceptOutcome`**：
+  - 当 `agent-core` 请求执行 `shell` / `file_read` / `file_write` / `http` 时，可在静态规则（`Allow`/`Deny`/`Ask`）之前运行自定义策略（例如解析命令或路径参数，自动放行只读安全操作或直接拦截高危请求，减少人工 `Ask` 打扰）。
+  - *(注：节点级环境提示词统一由 `api-server` 的 `NodeSpec.node_prompt` 管理并在四段式 `PromptParts` 中自动组装，不再通过 `pre_activation` 隐式篡改。)*
 
 ### 3.4 `daemon.toml` 声明式扩展配置设计
 
@@ -301,7 +299,7 @@ pub enum AuthzResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdmissionRequest {
     pub principal: Principal,
-    pub operation: AdmissionOperation, // CreateSession | SubmitPromptTurn | RegisterNode | ApprovePermission
+    pub operation: AdmissionOperation, // CreateSession | SubmitPromptTurn | PushRealtimeMessage | RegisterNode | ApprovePermission
     pub payload: serde_json::Value,
 }
 

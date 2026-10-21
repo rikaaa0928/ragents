@@ -195,6 +195,15 @@ pub struct Node {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeSpec {
     pub unschedulable: bool,
+    /// 节点级环境提示词（首次注册时由 daemon.toml 的 default_system_prompt 种子化）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_prompt: Option<String>,
+    /// 节点级全局权限策略（AllowNode 审批在此持久化）
+    #[serde(default)]
+    pub permissions: PermissionPolicyLayer,
+    /// 按工作目录路径持久化的权限策略（AllowWorkspace 审批在此持久化）
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_permissions: BTreeMap<String, PermissionPolicyLayer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +295,12 @@ pub struct SessionStatus {
     pub batch_count: u64,
     pub event_count: u64,
     pub last_error: Option<String>,
+    /// 最近一次 Activation 组装的四段式 System Prompt 快照
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_prompt_parts: Option<PromptParts>,
+    /// 最近一次 Activation 实际生效的工具名称列表（已剔除 disabled_tools）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_tools: Vec<String>,
 }
 ```
 
@@ -311,6 +326,10 @@ pub struct ActivationSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<ModelRequestSpec>,
 
+    /// 单次激活禁用的工具名列表（如禁言窥屏轮次禁用 `["chatroom_speak"]`）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
+
     // --- 可声明式修改的控制字段 ---
     pub desired_phase: DesiredActivationPhase, // Running | Cancelled
     #[serde(default)]
@@ -326,7 +345,9 @@ pub enum DesiredActivationPhase {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionResolutionSpec {
-    pub decision: PermissionDecision, // Deny | AllowOnce | AllowSession | AllowProject | AllowAlways
+    pub decision: PermissionDecision, // Deny | AllowOnce | AllowActivation | AllowSession | AllowWorkspace | AllowNode
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_path: Option<String>,
     pub responded_at: DateTime<Utc>,
 }
 
@@ -469,18 +490,21 @@ provider_model_id = "gpt-4.1"
 - `base_url` 和 `api_key` 永不离开 `agent-daemon` 进程。
 
 ### 7.2 配置合并流水线与 `ConfigRevision` 固化
-当 `agent-daemon` 收到分配给自己的 `Activation` 时，按如下步骤合成运行配置：
+当 `agent-daemon` 收到分配给自己的 `DispatchActivation { session, activation, cluster_system_prompt, node_spec, .. }` 时，按如下步骤合成运行配置：
 
-1. **System Prompt 合并**：
-   - 若 `Session.spec.system_prompt` 存在，结合 `daemon.default_system_prompt`（支持前置拼接或覆盖，默认若用户未指定则使用 Daemon 默认值）。
+1. **四段式 System Prompt (`PromptParts`) 组装**：
+   - 第 1 段 `system_prompt`：来自 `api-server` 下发的集群级 `cluster_system_prompt`；
+   - 第 2 段 `node_prompt`：来自 `api-server` 下发的 `node_spec.node_prompt`（首次注册时由 `daemon.toml` 的 `default_system_prompt` 种子化）；
+   - 第 3 段 `client_prompt`：来自 `Session.spec.system_prompt`（支持随时声明式修改）；
+   - 第 4 段 `extension_prompts`：在 `agent-core` 执行 `agent.prepare` 时收集各 WASM 扩展返回的 `append_system_prompt`（固定 `agents_md` 排首位，随后为其余扩展），最终通过 `PromptParts::assemble()` 生成确定性的 `effective_system_prompt`。
 2. **模型与参数合并**：
    - 模型名优先级：`Activation.spec.model_override.name` > `Session.spec.model.name` > `daemon.default_model`。
    - 从 Daemon 本地模型表查找对应 `base_url`、`api_key`、默认 `temperature` 和 `max_output_tokens`，再用 `Session.spec` 和 `Activation.spec` 中的显式非空参数覆盖。
-3. **扩展与权限合并**：
+3. **扩展与权限合并（以 `api-server` 为唯一事实源）**：
    - 合并节点默认扩展与 `Session.spec.extensions`。
-   - 合并权限策略：`Node 全局基础策略 -> Workspace 项目级策略 (仅 Pinned 且已信任目录) -> Session.spec.permissions -> Session 已批准的持久权限事件`，最后叠加 `Node 强制拒绝上限 (Hard Deny)`。
-4. **回写不可变快照**：
-   - 将脱敏后的最终有效配置序列化为规范化 JSON，计算 `cfg_sha256:<hex>`，与 `permsnap_sha256:<hex>` 一起在 `ActivationStarted` 时提交给 `api-server`。
+   - 合并权限策略：`node_spec.permissions (节点级)` $\rightarrow$ `node_spec.workspace_permissions[workspace_root] (工作区级)` $\rightarrow$ `Session.spec.permissions (会话级)`，并叠加启用扩展的 `allowed_dirs` 与内置默认放行目录（`.`、`/tmp`）。
+4. **回写不可变快照（`AcceptActivation` & `ReportPreparedConfig`）**：
+   - 在 `agent-core` 完成 `agent.prepare` 并剔除 `Activation.spec.disabled_tools` 后，立即通过 `CoreHost::report_prepared_config` 将包含完整四段式 `prompt_parts` 与 `effective_tools` 的 `ConfigRevision`（`cfg_sha256:<hex>`）回写至 `api-server`，同时更新 `SessionStatus.latest_prompt_parts` 与 `SessionStatus.effective_tools`。
 
 ---
 
@@ -543,6 +567,13 @@ pub trait CoreHost: Send + Sync {
         extension_id: Option<&str>,
         request: ProcessActionRequest,
     ) -> Result<Option<ProcessActionResponse>, CoreError>;
+
+    /// 在 agent.prepare 完成后，将包含四段式 PromptParts 与 effective_tools 的最终配置回写 api-server
+    async fn report_prepared_config(
+        &self,
+        prompt_parts: PromptParts,
+        effective_tools: Vec<String>,
+    ) -> Result<(), CoreError>;
 }
 
 /// 由执行器实现，屏蔽进程内协程 (InProcess) 与独立子进程 (Subprocess) 的差异
@@ -568,19 +599,19 @@ pub trait CoreExecutor: Send + Sync {
 
 ### 8.3 `agent-core` 内部 ReAct 循环与扩展机制
 `agent-core` 的单次 `Activation` 执行流程：
-1. 初始化 `HookManager`，加载声明的 WASM Component 扩展（`wit/ragents-extension.wit`）。
-2. 执行 `input.prepare` 与 `context.append.prepare` Hook，由 `agent-daemon` 提交初始 `Input` Batch。
-3. 执行 `agent.prepare` Hook，收集扩展注册的 `Tool` 定义列表。
+1. 初始化 `HookManager`，加载声明的 WASM Component 扩展（`wit/ragent-extension.wit`）。
+2. 执行 `agent.prepare` Hook，收集各扩展只读追加的 `append_system_prompt`（写入 `PromptParts.extension_prompts`）与注册的 `ToolDefinition` 列表。
+3. 根据 `ActivationSpec.disabled_tools` 过滤工具列表，组装四段式 `PromptParts`，并调用 `host.report_prepared_config(prompt_parts, effective_tools)` 实时回写 `api-server`。
 4. 进入 ReAct Turn 循环：
-   - 检查 `cancellation.is_cancelled()`，执行 `turn.prepare` Hook。
+   - 检查 `cancellation.is_cancelled()`。
    - 通过 `host.emit_event(TurnStarted)` 发出回合开始事件，并调用 `host.drain_realtime_messages()` 原子消费 `api-server` 实时队列。
-   - 通过 `host.load_effective_context()` 获取当前最新上下文，执行 `context.project.prepare` 构建临时 `ContextProjection`（不改写历史）。
-   - 执行 `model.request.prepare` Hook，随后使用 `ModelBackend` 发送 OpenResponses 流式请求（`stream = true`，内置瞬态错误指数退避重试），实时通过 `host.emit_event(ModelTextDelta / ModelReasoningDelta)` 推送增量文本。
-   - 收到完整 `ResponseResource` 后，依次执行 `model.response.observe`、`model.response.prepare` 与 `context.append.prepare` Hook，调用 `host.commit_model_output(...)` 持久化 `ModelOutput` Batch 并下发包含权威 `items` 的 `TurnCompleted` 事件。
+   - 通过 `host.load_effective_context()` 获取当前最新上下文，执行 `context.project.prepare` 检查是否触发自动上下文压缩（`CompactionPlan`）。
+   - 使用 `ModelBackend` 发送 OpenResponses 流式请求（`stream = true`，内置瞬态错误指数退避重试），实时通过 `host.emit_event(ModelTextDelta / ModelReasoningDelta)` 推送增量文本。
+   - 收到完整 `ResponseResource` 后，执行 `model.response.observe` Observer Hook，调用 `host.commit_model_output(...)` 持久化 `ModelOutput` Batch 并下发包含权威 `items` 的 `TurnCompleted` 事件。
    - 若响应包含 `Item::FunctionCall`：
      - 串行遍历每个工具调用，发出 `ToolCallStarted`。
      - 依次执行 `tool.call.prepare` 与 `permission.requirements` Hook。
-     - 执行工具 Action（`tools.call`）与 `tool.result.prepare`、`context.append.prepare` Hook，将输出封装为 `Item::FunctionCallOutput`（即使工具执行报错也封装为错误文本输出供模型感知，不直接中断循环）。
+     - 执行工具 Action（`tools.call`）与 `tool.result.prepare` Hook，将输出封装为 `Item::FunctionCallOutput`（即使工具执行报错也封装为错误文本输出供模型感知，不直接中断循环）。
      - 调用 `host.commit_tool_output(...)` 持久化 `ToolOutput` Batch，触发 `turn.complete` Hook，继续下一轮 Turn。
    - 若响应不含 `FunctionCall`，触发 `turn.complete` Hook，再次检查 `drain_realtime_messages()` 确认无新到达实时通知后退出循环，由 `agent-daemon` 提交 `ActivationCompleted`。
 5. 无论成功、失败或取消，最终执行 `agent.error`（若出错）、`agent.shutdown` 与 `hook_manager.shutdown()` 释放资源。
@@ -612,15 +643,16 @@ pub trait CoreExecutor: Send + Sync {
 为保证处于 NAT/内网后的 `agent-daemon` 无需暴露公网端口，`agent-daemon` 主动向 `api-server` 建立 WebSocket 连接，消息采用类型化 JSON Envelope：
 
 - **Daemon $\rightarrow$ Server 消息 (`DaemonToServerMessage`)**：
-  1. `RegisterNode { node_id, hostname, os, arch, labels, supported_models, installed_extensions, max_concurrent_runners }`
+  1. `RegisterNode { node_id, hostname, os, arch, labels, supported_models, default_model, installed_extensions, allowed_workspace_dirs, max_concurrent_runners, default_system_prompt, default_permissions }`
   2. `Heartbeat { node_id, active_runners }`（续期节点与活跃 Activation 的 Lease）
   3. `AcceptActivation { activation_id, lease_epoch, effective_config: ConfigRevision, effective_permission: PermissionSnapshot }`
-  4. `CommitBatch { request_id, activation_id, lease_epoch, batch_input }`
-  5. `EmitEvent { request_id, activation_id, lease_epoch, event }`
-  6. `CompleteActivation { request_id, activation_id, lease_epoch, terminal_state }`
+  4. `ReportPreparedConfig { request_id, activation_id, lease_epoch, effective_config: ConfigRevision }`
+  5. `CommitBatch { request_id, activation_id, lease_epoch, batch_input }`
+  6. `EmitEvent { request_id, activation_id, lease_epoch, event }`
+  7. `CompleteActivation { request_id, activation_id, lease_epoch, terminal_state }`
 - **Server $\rightarrow$ Daemon 消息 (`ServerToDaemonMessage`)**：
   1. `Registered { node_id, lease_ttl_ms, current_rv }`
-  2. `DispatchActivation { session: Session, activation: Activation, lease_epoch: LeaseEpoch }`
+  2. `DispatchActivation { session: Session, activation: Activation, lease_epoch: LeaseEpoch, cluster_system_prompt: Option<String>, node_spec: NodeSpec }`
   3. `ReconcileActivation { activation_id, lease_epoch, desired_phase, interaction_responses }`（当客户端取消任务或批复权限时实时推送给对应 Daemon）
   4. `Ack { request_id, ok, resource_version, error }`
 

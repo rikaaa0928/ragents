@@ -30,7 +30,8 @@
 | **S7D：原生 WASI 0.2 权限统一与控制面 WASM 隔离** | ✅ 已完成 | `268cc28`, `c6056c1`, `e6b9efb` | 保持 WIT 最小化，直接接管 WASI 0.2 `wasi:filesystem/types::HostDescriptor`、`wasi:http/outgoing-handler` (`WasiHttpView`) 与 `wasi:sockets` (`socket_addr_check`)；控制面 WASM 插件默认开放网络、隔离宿主机 `/` 并仅挂载私有目录与 `allowed_dirs` |
 | **S7E：双消息队列与后台命令进程管理系统** | ✅ 已完成 | `5877f9d`, `8dc7169` | `api-server` 双消息队列（`FollowUp` 等待队列 + `Realtime` 实时队列，支持单次全部取出并保持多个独立 `MessageContent` 块）；`agent-daemon` 托管 `ProcessManager` 支持 `wait: bool`、`lifecycle: "activation" \| "session"`、默认无超时限制（`0`）、阻塞超时按进程组强杀并保留超时前输出、`stdout`/`stderr`/`combined` 三通道日志查询、后台进程自然退出实时通知及 `ragents steer` CLI |
 | **S7F：子模块拆分、工具输出保护、SSE 流式对账与 Skills 扩展** | ✅ 已完成 | `c65aea9`, `80da66e`, `acb709f`, `3800c72`, `2d1cfb7`, `3cb7262`, `891734d` | 全仓大文件按职责拆分为清晰子模块；`read_file` 支持 `offset`/`limit` 与 2000行/50KB 头部截断、`replace_in_file` 支持针对原文件的多块无重叠原子替换、`shell` 扩展支持 2000行/50KB 尾部截断与落盘；OpenResponses SSE 实时流式推送（`ModelTextDelta`/`ModelReasoningDelta`）+ `TurnCompleted { items }` 权威完整版对账兜底 + 瞬态错误指数退避重试；新增 `extensions/skills` WASM 扩展与 `ExtensionSpec.allowed_dirs` 声明式目录授权 |
-| **S7G：三会话自动上下文压缩扩展 (`extensions/compaction`) 与多代接力血缘** | ✅ 已完成 | 最新提交 | 新增 `extensions/compaction` WASM 扩展（完整复刻 `pi` 的切分点选择 `find_cut_point`、平行工具调用防截断、`<conversation>` 序列化、`<read-files>` / `<modified-files>` 累积追踪与 `<previous-summary>` 增量合并更新）；在 SQLite 新增 `session_compactions` 关系表并在 `SessionStatus.compaction` 维护双向三元组血缘（`sess_1 -> sess_compact -> sess_2 -> sess_compact_2 -> sess_3`），自动迁移会话级权限与 `lifecycle = "session"` 后台进程，CLI `watch_activation_to_completion` 无缝跨会话接力跟随 |
+| **S7G：三会话自动上下文压缩扩展 (`extensions/compaction`) 与多代接力血缘** | ✅ 已完成 | `a2bf9c7` | 新增 `extensions/compaction` WASM 扩展（完整复刻 `pi` 的切分点选择 `find_cut_point`、平行工具调用防截断、`<conversation>` 序列化、`<read-files>` / `<modified-files>` 累积追踪与 `<previous-summary>` 增量合并更新）；在 SQLite 新增 `session_compactions` 关系表并在 `SessionStatus.compaction` 维护双向三元组血缘（`sess_1 -> sess_compact -> sess_2 -> sess_compact_2 -> sess_3`），自动迁移会话级权限与 `lifecycle = "session"` 后台进程，CLI `watch_activation_to_completion` 无缝跨会话接力跟随 |
+| **S7H：四段式 System Prompt (`PromptParts`)、独立 `agents_md` 扩展、`agent-core` 钩子收窄与 `api-server` 权限唯一事实源（SSOT）** | ✅ 已完成 | `5e307e7`, `e7501db` | 新增四段式结构化 `PromptParts`（`system_prompt` 集群级 + `node_prompt` 节点级 + `client_prompt` 会话级 + `extension_prompts` 扩展级）及 `ReportPreparedConfig` 实时回写；将 `AGENTS.md` / `CLAUDE.md` 读取拆分为独立 `extensions/agents_md` WASM 扩展；收窄 `agent.prepare` 为只读追加 `ExtensionPrepareOutput` 并移除中途篡改钩子；在 `ActivationSpec` / `PushRealtimeMessageRequest` 原生支持 `disabled_tools`；实现节点首次注册 Seed-Only 写入 `NodeSpec` 以及 `AllowSession` / `AllowWorkspace` / `AllowNode` 审批直接持久化落盘至 `api-server` |
 
 ---
 
@@ -67,7 +68,7 @@
 ## 3. 常用构建、验证与运行命令
 
 ```bash
-# 1. 编译全部 WASM 扩展 (shell, file_editor, image_viewer, skills, compaction)
+# 1. 编译全部 WASM 扩展 (shell, file_editor, image_viewer, agents_md, skills, compaction, authn)
 ./scripts/build-extensions.sh
 
 # 2. 运行全仓格式化检查、测试与严格 Clippy

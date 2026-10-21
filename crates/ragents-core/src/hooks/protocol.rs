@@ -2,17 +2,12 @@ use openresponses_rust::{FunctionOutput, MessageContent};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const HOOK_AGENT_PREPARE: &str = "agent.prepare";
-pub const HOOK_INPUT_PREPARE: &str = "input.prepare";
-pub const HOOK_TURN_PREPARE: &str = "turn.prepare";
 pub const HOOK_CONTEXT_PROJECT_PREPARE: &str = "context.project.prepare";
-pub const HOOK_MODEL_REQUEST_PREPARE: &str = "model.request.prepare";
 pub const HOOK_MODEL_RESPONSE_OBSERVE: &str = "model.response.observe";
-pub const HOOK_MODEL_RESPONSE_PREPARE: &str = "model.response.prepare";
 pub const HOOK_TOOL_CALL_PREPARE: &str = "tool.call.prepare";
 pub const HOOK_PERMISSION_REQUIREMENTS: &str = "permission.requirements";
 pub const HOOK_TOOLS_CALL: &str = "tools.call";
 pub const HOOK_TOOL_RESULT_PREPARE: &str = "tool.result.prepare";
-pub const HOOK_CONTEXT_APPEND_PREPARE: &str = "context.append.prepare";
 pub const HOOK_TURN_COMPLETE: &str = "turn.complete";
 pub const HOOK_AGENT_ERROR: &str = "agent.error";
 pub const HOOK_AGENT_SHUTDOWN: &str = "agent.shutdown";
