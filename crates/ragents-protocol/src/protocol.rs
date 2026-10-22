@@ -151,11 +151,15 @@ pub enum DaemonToServerMessage {
         #[serde(default)]
         allowed_workspace_dirs: Vec<String>,
         max_concurrent_runners: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_activation_ids: Option<Vec<ActivationId>>,
     },
     Heartbeat {
         request_id: String,
         node_id: NodeId,
         active_runners: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_activation_ids: Option<Vec<ActivationId>>,
     },
     /// Daemon claims a scheduled activation, reporting merged effective ConfigRevision & PermissionSnapshot
     AcceptActivation {

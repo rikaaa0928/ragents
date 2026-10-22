@@ -115,6 +115,7 @@ fn handle_daemon_message(
             installed_extensions,
             allowed_workspace_dirs,
             max_concurrent_runners,
+            running_activation_ids,
         } => {
             state
                 .daemon_peers
@@ -134,7 +135,7 @@ fn handle_daemon_message(
                 allowed_workspace_dirs
             };
 
-            match state.store.register_node_with_seed(
+            match state.store.register_node_with_running_activations(
                 node_id.clone(),
                 hostname,
                 os,
@@ -148,6 +149,7 @@ fn handle_daemon_message(
                 effective_dirs,
                 max_concurrent_runners,
                 state.lease_ttl_ms,
+                running_activation_ids,
             ) {
                 Ok((node, _dispatches)) => {
                     let _ = out_tx.send(ServerToDaemonMessage::Registered {
@@ -167,10 +169,13 @@ fn handle_daemon_message(
             request_id,
             node_id,
             active_runners,
-        } => match state
-            .store
-            .heartbeat_node(&node_id, active_runners, state.lease_ttl_ms)
-        {
+            running_activation_ids,
+        } => match state.store.heartbeat_node_with_activations(
+            &node_id,
+            active_runners,
+            running_activation_ids,
+            state.lease_ttl_ms,
+        ) {
             Ok((node, _)) => {
                 send_ack_ok(out_tx, request_id, Some(node.metadata.resource_version));
             }

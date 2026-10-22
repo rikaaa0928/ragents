@@ -170,7 +170,7 @@ impl AgentDaemon {
         let arch = std::env::consts::ARCH.to_string();
 
         let (lease_ttl_ms, _rv, initial_node_spec) = tunnel
-            .register_node_with_seed(
+            .register_node_with_running_activations(
                 self.config.node_id.clone(),
                 hostname,
                 os,
@@ -183,6 +183,7 @@ impl AgentDaemon {
                 self.config.installed_extension_names(),
                 self.config.effective_allowed_workspace_dir_strings(),
                 self.config.max_concurrent_runners,
+                Some(Vec::new()),
             )
             .await?;
         self.sync_grants_from_node_spec(&initial_node_spec);
@@ -200,6 +201,7 @@ impl AgentDaemon {
         let hb_tunnel = tunnel.clone();
         let hb_node_id = self.config.node_id.clone();
         let hb_runners = active_runners.clone();
+        let hb_tasks = active_tasks.clone();
         let hb_shutdown = shutdown.clone();
         let hb_interval = Duration::from_millis((lease_ttl_ms / 3).max(500));
         tokio::spawn(async move {
@@ -208,7 +210,19 @@ impl AgentDaemon {
                 tokio::select! {
                     _ = ticker.tick() => {
                         let count = hb_runners.load(Ordering::Relaxed);
-                        let _ = hb_tunnel.heartbeat(hb_node_id.clone(), count).await;
+                        let running_ids: Vec<ActivationId> = hb_tasks
+                            .lock()
+                            .expect("active_tasks mutex poisoned")
+                            .keys()
+                            .cloned()
+                            .collect();
+                        if hb_tunnel
+                            .heartbeat_with_activations(hb_node_id.clone(), count, Some(running_ids))
+                            .await
+                            .is_err()
+                        {
+                            hb_tunnel.force_disconnect();
+                        }
                     }
                     _ = hb_shutdown.cancelled() => break,
                 }
@@ -270,6 +284,11 @@ impl AgentDaemon {
                                         }
                                     }
                                 }
+                                if desired_phase == DesiredActivationPhase::Cancelled {
+                                    process_manager
+                                        .cleanup_activation_processes(&activation_id)
+                                        .await;
+                                }
                                 false
                             }
                             Some(DaemonPushEvent::CleanupSession { session_id }) => {
@@ -328,8 +347,14 @@ impl AgentDaemon {
                                 .unwrap_or_else(|_| "localhost".to_string());
                             let os = std::env::consts::OS.to_string();
                             let arch = std::env::consts::ARCH.to_string();
+                            let running_ids: Vec<ActivationId> = active_tasks
+                                .lock()
+                                .expect("active_tasks mutex poisoned")
+                                .keys()
+                                .cloned()
+                                .collect();
                             if let Ok((_, _, reconnected_node_spec)) = new_tunnel
-                                .register_node_with_seed(
+                                .register_node_with_running_activations(
                                     daemon.config.node_id.clone(),
                                     hostname,
                                     os,
@@ -342,13 +367,18 @@ impl AgentDaemon {
                                     daemon.config.installed_extension_names(),
                                     daemon.config.effective_allowed_workspace_dir_strings(),
                                     daemon.config.max_concurrent_runners,
+                                    Some(running_ids.clone()),
                                 )
                                 .await
                             {
                                 daemon.sync_grants_from_node_spec(&reconnected_node_spec);
                                 let count = active_runners.load(Ordering::Relaxed);
                                 let _ = new_tunnel
-                                    .heartbeat(daemon.config.node_id.clone(), count)
+                                    .heartbeat_with_activations(
+                                        daemon.config.node_id.clone(),
+                                        count,
+                                        Some(running_ids),
+                                    )
                                     .await;
                                 tunnel.replace_connection(&new_tunnel);
                                 push_rx = new_rx;
@@ -606,23 +636,13 @@ impl AgentDaemon {
 
             process_manager.cleanup_activation_processes(&act_id).await;
 
-            active_runners.fetch_sub(1, Ordering::Relaxed);
-            active_tasks
-                .lock()
-                .expect("active_tasks mutex poisoned")
-                .remove(&act_id);
-            lease_epochs
-                .lock()
-                .expect("lease_epochs poisoned")
-                .remove(&act_id);
-
             match exec_res {
                 Ok(summary) => {
                     if summary.compacted_into_session_id.is_none() {
                         let _ = tunnel
                             .complete_activation(
                                 sess_id,
-                                act_id,
+                                act_id.clone(),
                                 lease_epoch,
                                 summary.last_turn_id,
                                 ActivationTerminalOutcome::Succeeded {
@@ -636,7 +656,7 @@ impl AgentDaemon {
                     let _ = tunnel
                         .complete_activation(
                             sess_id,
-                            act_id,
+                            act_id.clone(),
                             lease_epoch,
                             None,
                             ActivationTerminalOutcome::Cancelled,
@@ -647,7 +667,7 @@ impl AgentDaemon {
                     let _ = tunnel
                         .complete_activation(
                             sess_id,
-                            act_id,
+                            act_id.clone(),
                             lease_epoch,
                             None,
                             ActivationTerminalOutcome::Failed {
@@ -657,6 +677,16 @@ impl AgentDaemon {
                         .await;
                 }
             }
+
+            active_runners.fetch_sub(1, Ordering::Relaxed);
+            active_tasks
+                .lock()
+                .expect("active_tasks mutex poisoned")
+                .remove(&act_id);
+            lease_epochs
+                .lock()
+                .expect("lease_epochs poisoned")
+                .remove(&act_id);
         });
     }
 }

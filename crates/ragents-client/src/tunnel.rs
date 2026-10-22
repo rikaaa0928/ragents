@@ -33,6 +33,7 @@ pub enum DaemonPushEvent {
 struct TunnelInner {
     out_tx: mpsc::UnboundedSender<DaemonToServerMessage>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<ServerToDaemonMessage>>>>,
+    push_tx: mpsc::UnboundedSender<DaemonPushEvent>,
 }
 
 #[derive(Clone)]
@@ -57,17 +58,39 @@ impl DaemonTunnelHandle {
             TunnelInner {
                 out_tx: guard.out_tx.clone(),
                 pending: guard.pending.clone(),
+                push_tx: guard.push_tx.clone(),
             }
         };
         *self.inner.lock().expect("self tunnel mutex poisoned") = new_inner;
+    }
+
+    /// Proactively clears pending RPC waiters and notifies the daemon reconnect loop that
+    /// the current WebSocket connection is unhealthy (e.g. heartbeat timeout over a half-open TCP socket).
+    pub fn force_disconnect(&self) {
+        let (pending, push_tx) = {
+            let guard = self.inner.lock().expect("tunnel mutex poisoned");
+            (guard.pending.clone(), guard.push_tx.clone())
+        };
+        pending.lock().expect("pending mutex poisoned").clear();
+        let _ = push_tx.send(DaemonPushEvent::Disconnected);
     }
 
     pub async fn call(
         &self,
         msg: DaemonToServerMessage,
     ) -> Result<ServerToDaemonMessage, ClientError> {
+        self.call_with_timeout(msg, std::time::Duration::from_secs(90), 3)
+            .await
+    }
+
+    pub async fn call_with_timeout(
+        &self,
+        msg: DaemonToServerMessage,
+        timeout: std::time::Duration,
+        max_attempts: usize,
+    ) -> Result<ServerToDaemonMessage, ClientError> {
         let req_id = Self::extract_request_id(&msg).to_string();
-        let max_attempts = 3usize;
+        let max_attempts = max_attempts.max(1);
 
         for attempt in 1..=max_attempts {
             let (tx, rx) = oneshot::channel();
@@ -94,7 +117,7 @@ impl DaemonTunnelHandle {
                 return Err(ClientError::Tunnel("tunnel write channel closed".into()));
             }
 
-            match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
+            match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(resp)) => return Ok(resp),
                 Ok(Err(_)) => {
                     if attempt < max_attempts {
@@ -200,6 +223,41 @@ impl DaemonTunnelHandle {
         allowed_workspace_dirs: Vec<String>,
         max_concurrent_runners: u32,
     ) -> Result<(u64, ResourceVersion, NodeSpec), ClientError> {
+        self.register_node_with_running_activations(
+            node_id,
+            hostname,
+            os,
+            arch,
+            labels,
+            supported_models,
+            default_model,
+            default_system_prompt,
+            default_permissions,
+            installed_extensions,
+            allowed_workspace_dirs,
+            max_concurrent_runners,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_node_with_running_activations(
+        &self,
+        node_id: NodeId,
+        hostname: String,
+        os: String,
+        arch: String,
+        labels: BTreeMap<String, String>,
+        supported_models: Vec<String>,
+        default_model: Option<String>,
+        default_system_prompt: Option<String>,
+        default_permissions: PermissionPolicyLayer,
+        installed_extensions: Vec<String>,
+        allowed_workspace_dirs: Vec<String>,
+        max_concurrent_runners: u32,
+        running_activation_ids: Option<Vec<ActivationId>>,
+    ) -> Result<(u64, ResourceVersion, NodeSpec), ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::RegisterNode {
@@ -216,6 +274,7 @@ impl DaemonTunnelHandle {
                 installed_extensions,
                 allowed_workspace_dirs,
                 max_concurrent_runners,
+                running_activation_ids,
             })
             .await?;
 
@@ -242,13 +301,28 @@ impl DaemonTunnelHandle {
         node_id: NodeId,
         active_runners: u32,
     ) -> Result<ResourceVersion, ClientError> {
+        self.heartbeat_with_activations(node_id, active_runners, None)
+            .await
+    }
+
+    pub async fn heartbeat_with_activations(
+        &self,
+        node_id: NodeId,
+        active_runners: u32,
+        running_activation_ids: Option<Vec<ActivationId>>,
+    ) -> Result<ResourceVersion, ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
-            .call(DaemonToServerMessage::Heartbeat {
-                request_id,
-                node_id,
-                active_runners,
-            })
+            .call_with_timeout(
+                DaemonToServerMessage::Heartbeat {
+                    request_id,
+                    node_id,
+                    active_runners,
+                    running_activation_ids,
+                },
+                std::time::Duration::from_secs(10),
+                1,
+            )
             .await?;
         Self::expect_ack(resp).map(|(rv, _, _, _)| rv.unwrap_or_default())
     }
@@ -622,6 +696,7 @@ pub async fn connect_daemon_tunnel_with_token(
         }
     });
 
+    let push_tx_for_handle = push_tx.clone();
     let pending_reader = pending.clone();
     tokio::spawn(async move {
         while let Some(Ok(frame)) = ws_source.next().await {
@@ -701,7 +776,11 @@ pub async fn connect_daemon_tunnel_with_token(
 
     Ok((
         DaemonTunnelHandle {
-            inner: Arc::new(Mutex::new(TunnelInner { out_tx, pending })),
+            inner: Arc::new(Mutex::new(TunnelInner {
+                out_tx,
+                pending,
+                push_tx: push_tx_for_handle,
+            })),
         },
         push_rx,
     ))

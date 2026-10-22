@@ -397,3 +397,121 @@ fn test_deferred_queued_activation_batch_and_atomic_withdrawal() {
         .expect("drain realtime");
     assert!(drained.is_empty());
 }
+
+#[test]
+fn test_running_activation_grace_period_and_reconnect_reconciliation() {
+    let store = SqliteStore::open_in_memory().expect("open store");
+    register_test_node(&store, "node_wan", vec!["gpt-4.1"], 10_000);
+
+    let (created, dispatches) = store
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_wan_1")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_wan"),
+                    workspace_path: PathBuf::from("/tmp/workspace/wan"),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("long running task")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .expect("create session");
+
+    let act_id = ActivationId::new(
+        created
+            .initial_activation
+            .as_ref()
+            .unwrap()
+            .metadata
+            .id
+            .clone(),
+    );
+    let epoch1 = dispatches[0].lease_epoch;
+
+    let cfg = ConfigRevision::new_merged(
+        "prompt".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![],
+    );
+    let perm = PermissionSnapshot::from_effective_policy(PermissionPolicyLayer::default());
+    store
+        .accept_activation(&SessionId::new("sess_wan_1"), &act_id, epoch1, cfg, perm)
+        .expect("accept activation");
+
+    // 1. After 20s (lease expired, within 5-minute running grace period):
+    // Node becomes NotReady, but Running activation stays Running!
+    let t_blip = Utc::now() + Duration::seconds(20);
+    store
+        .patrol_expired_leases(t_blip)
+        .expect("patrol at 20s blip");
+    let node = store
+        .get_node(&NodeId::new("node_wan"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.status.phase, NodePhase::NotReady);
+    let act = store.get_activation(&act_id).unwrap().unwrap();
+    assert_eq!(act.status.phase, ActivationPhase::Running);
+    assert_eq!(act.status.lease_epoch, epoch1);
+
+    // 2. Node reconnects and still reports `act_id` in `running_activation_ids`:
+    // Node returns to Ready and activation remains Running with original lease_epoch.
+    store
+        .register_node_with_running_activations(
+            NodeId::new("node_wan"),
+            "node_wan.local".to_string(),
+            "macos".to_string(),
+            "aarch64".to_string(),
+            BTreeMap::new(),
+            vec!["gpt-4.1".to_string()],
+            Some("gpt-4.1".to_string()),
+            None,
+            PermissionPolicyLayer::default(),
+            vec![],
+            vec!["/tmp".to_string()],
+            4,
+            10_000,
+            Some(vec![act_id.clone()]),
+        )
+        .expect("reconnect with running act_id");
+    let act_after_reconnect = store.get_activation(&act_id).unwrap().unwrap();
+    assert_eq!(act_after_reconnect.status.phase, ActivationPhase::Running);
+    assert_eq!(act_after_reconnect.status.lease_epoch, epoch1);
+
+    // 3. Node restarts and registers with empty `running_activation_ids`:
+    // Activation is immediately marked Interrupted without waiting for grace timeout.
+    store
+        .register_node_with_running_activations(
+            NodeId::new("node_wan"),
+            "node_wan.local".to_string(),
+            "macos".to_string(),
+            "aarch64".to_string(),
+            BTreeMap::new(),
+            vec!["gpt-4.1".to_string()],
+            Some("gpt-4.1".to_string()),
+            None,
+            PermissionPolicyLayer::default(),
+            vec![],
+            vec!["/tmp".to_string()],
+            4,
+            10_000,
+            Some(vec![]),
+        )
+        .expect("reconnect after daemon restart");
+    let act_after_restart = store.get_activation(&act_id).unwrap().unwrap();
+    assert_eq!(
+        act_after_restart.status.phase,
+        ActivationPhase::Interrupted
+    );
+}
+

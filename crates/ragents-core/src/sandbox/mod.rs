@@ -299,6 +299,24 @@ impl SandboxState {
         };
 
         let os_pid = child.id();
+        struct ProcessGroupKillGuard(Option<u32>);
+        impl Drop for ProcessGroupKillGuard {
+            fn drop(&mut self) {
+                #[cfg(unix)]
+                if let Some(pid) = self.0 {
+                    if pid > 1 {
+                        let pgid = -(pid as i32);
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &pgid.to_string()])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                }
+            }
+        }
+        let _pg_guard = ProcessGroupKillGuard(os_pid);
+
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
 

@@ -1,4 +1,5 @@
-use openresponses_rust::{Input, Item, MessageContent};
+use openresponses_rust::{FunctionOutput, Input, Item, MessageContent};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContextProjection {
@@ -19,12 +20,53 @@ impl ContextProjection {
     }
 
     pub fn to_openresponses_input(&self) -> Input {
-        let cleaned = self
+        let answered_call_ids: HashSet<&str> = self
             .items
             .iter()
-            .cloned()
-            .map(strip_reasoning_summary)
+            .filter_map(|item| match item {
+                Item::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
             .collect();
+
+        let mut cleaned = Vec::with_capacity(self.items.len());
+        let mut pending_unanswered_calls: Vec<String> = Vec::new();
+
+        for raw_item in &self.items {
+            if matches!(raw_item, Item::Message { .. }) && !pending_unanswered_calls.is_empty() {
+                for call_id in pending_unanswered_calls.drain(..) {
+                    cleaned.push(Item::FunctionCallOutput {
+                        id: None,
+                        status: None,
+                        call_id,
+                        output: FunctionOutput::Text(
+                            "[Tool execution was interrupted or cancelled before completion.]"
+                                .to_string(),
+                        ),
+                    });
+                }
+            }
+
+            if let Item::FunctionCall { call_id, .. } = raw_item {
+                if !answered_call_ids.contains(call_id.as_str()) {
+                    pending_unanswered_calls.push(call_id.clone());
+                }
+            }
+
+            cleaned.push(strip_reasoning_summary(raw_item.clone()));
+        }
+
+        for call_id in pending_unanswered_calls {
+            cleaned.push(Item::FunctionCallOutput {
+                id: None,
+                status: None,
+                call_id,
+                output: FunctionOutput::Text(
+                    "[Tool execution was interrupted or cancelled before completion.]".to_string(),
+                ),
+            });
+        }
+
         Input::Items(cleaned)
     }
 }
