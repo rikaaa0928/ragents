@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
@@ -31,6 +31,8 @@ pub struct ApiServerState {
     pub extensions: ApiServerExtensions,
     pub(crate) daemon_peers:
         Arc<Mutex<HashMap<NodeId, mpsc::UnboundedSender<ServerToDaemonMessage>>>>,
+    pub(crate) pending_node_fs:
+        Arc<Mutex<HashMap<String, oneshot::Sender<NodeFsResponse>>>>,
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -41,6 +43,7 @@ impl ApiServerState {
             lease_ttl_ms,
             extensions: ApiServerExtensions::default(),
             daemon_peers: Arc::new(Mutex::new(HashMap::new())),
+            pending_node_fs: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
         };
         state.spawn_background_workers();
@@ -156,6 +159,10 @@ pub fn build_router(state: ApiServerState) -> Router {
     Router::new()
         .route("/api/v1/nodes", get(http::handle_list_nodes))
         .route("/api/v1/nodes/{node_id}", get(http::handle_get_node))
+        .route(
+            "/api/v1/nodes/{node_id}/fs",
+            post(http::handle_node_fs_query),
+        )
         .route(
             "/api/v1/sessions",
             post(http::handle_create_session).get(http::handle_list_sessions),

@@ -409,6 +409,19 @@ fn handle_daemon_message(
                 });
             }
         },
+        DaemonToServerMessage::NodeFsReply {
+            request_id,
+            response,
+        } => {
+            if let Some(tx) = state
+                .pending_node_fs
+                .lock()
+                .expect("pending_node_fs mutex poisoned")
+                .remove(&request_id)
+            {
+                let _ = tx.send(*response);
+            }
+        }
     }
 }
 

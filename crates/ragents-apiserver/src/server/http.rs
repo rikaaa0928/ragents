@@ -77,6 +77,106 @@ pub(crate) async fn handle_get_node(
     Ok(Json(node))
 }
 
+pub(crate) async fn handle_node_fs_query(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+    Json(req): Json<NodeFsRequest>,
+) -> Result<Json<NodeFsResponse>, ApiError> {
+    let principal = state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "POST",
+            &format!("/api/v1/nodes/{node_id}/fs"),
+            &headers,
+        )
+        .await?;
+    let id = NodeId::new(node_id.clone());
+    let node = state
+        .store
+        .get_node(&id)?
+        .ok_or_else(|| StoreError::NotFound(format!("node {id}")))?;
+    let selector = state
+        .extensions
+        .authorize(
+            &principal,
+            ResourceVerb::Get,
+            ResourceKind::Node,
+            Some(&node_id),
+            &node.metadata.labels,
+        )
+        .await?;
+    if !labels_match_selector(&node.metadata.labels, &selector) {
+        return Err(ApiError::Http(
+            StatusCode::FORBIDDEN,
+            "Forbidden by label selector".into(),
+        ));
+    }
+
+    let maybe_tx = state
+        .daemon_peers
+        .lock()
+        .expect("peers mutex poisoned")
+        .get(&id)
+        .cloned();
+    let Some(daemon_tx) = maybe_tx else {
+        return Ok(Json(NodeFsResponse {
+            ok: false,
+            error: Some(format!("Node '{id}' is currently offline / not connected")),
+            ..Default::default()
+        }));
+    };
+
+    let request_id = format!("fsreq_{}", uuid::Uuid::now_v7());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .pending_node_fs
+        .lock()
+        .expect("pending_node_fs mutex poisoned")
+        .insert(request_id.clone(), tx);
+
+    if daemon_tx
+        .send(ServerToDaemonMessage::NodeFsQuery {
+            request_id: request_id.clone(),
+            request: req,
+        })
+        .is_err()
+    {
+        state
+            .pending_node_fs
+            .lock()
+            .expect("pending_node_fs mutex poisoned")
+            .remove(&request_id);
+        return Ok(Json(NodeFsResponse {
+            ok: false,
+            error: Some(format!("Failed to send request to node '{id}' tunnel")),
+            ..Default::default()
+        }));
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(resp)) => Ok(Json(resp)),
+        Ok(Err(_)) => Ok(Json(NodeFsResponse {
+            ok: false,
+            error: Some("Node tunnel closed while waiting for file operation".to_string()),
+            ..Default::default()
+        })),
+        Err(_) => {
+            state
+                .pending_node_fs
+                .lock()
+                .expect("pending_node_fs mutex poisoned")
+                .remove(&request_id);
+            Ok(Json(NodeFsResponse {
+                ok: false,
+                error: Some("Node file operation timed out after 30s".to_string()),
+                ..Default::default()
+            }))
+        }
+    }
+}
+
 pub(crate) async fn handle_create_session(
     State(state): State<ApiServerState>,
     headers: HeaderMap,

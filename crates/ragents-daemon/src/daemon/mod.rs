@@ -1,3 +1,4 @@
+pub mod fs;
 mod host;
 
 use crate::config::{DaemonConfig, ExecutorMode, LocalModelConfig};
@@ -322,6 +323,26 @@ impl AgentDaemon {
                                         .join("floating")
                                         .join(session_id.as_str()),
                                 );
+                                false
+                            }
+                            Some(DaemonPushEvent::NodeFsQuery {
+                                request_id,
+                                request,
+                            }) => {
+                                let cfg_for_fs = daemon.config.clone();
+                                let tunnel_for_fs = tunnel.clone();
+                                tokio::spawn(async move {
+                                    let resp = tokio::task::spawn_blocking(move || {
+                                        fs::execute_node_fs_request(&cfg_for_fs, request)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| NodeFsResponse {
+                                        ok: false,
+                                        error: Some(format!("fs worker panicked: {e}")),
+                                        ..Default::default()
+                                    });
+                                    tunnel_for_fs.send_node_fs_reply(request_id, resp);
+                                });
                                 false
                             }
                             Some(DaemonPushEvent::Disconnected) | None => true,

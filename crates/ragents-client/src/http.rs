@@ -313,4 +313,22 @@ impl RagentsClient {
 
         Ok(Box::pin(mapped))
     }
+
+    pub async fn node_fs_query(
+        &self,
+        node_id: &NodeId,
+        request: &NodeFsRequest,
+    ) -> Result<NodeFsResponse, ClientError> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/api/v1/nodes/{}/fs",
+                self.base_url,
+                node_id.as_str()
+            ))
+            .json(request)
+            .send()
+            .await?;
+        Self::parse_response(resp).await
+    }
 }
