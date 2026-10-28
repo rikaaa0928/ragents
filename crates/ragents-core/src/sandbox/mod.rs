@@ -504,7 +504,7 @@ impl SandboxState {
             let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
             c.arg("-p").arg(profile).arg("sh").arg("-c").arg(command);
             c
-        } else if cfg!(target_os = "linux") && Path::new("/usr/bin/bwrap").exists() {
+        } else if cfg!(target_os = "linux") && is_linux_bwrap_usable() {
             build_linux_bwrap_command(work_dir, command, &writable, &denied_write, &denied_read)
         } else if self.mode == SandboxMode::Enforce {
             return Err(
@@ -767,6 +767,23 @@ pub fn build_macos_seatbelt_profile(
     profile
 }
 
+fn is_linux_bwrap_usable() -> bool {
+    static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USABLE.get_or_init(|| {
+        if !Path::new("/usr/bin/bwrap").exists() {
+            return false;
+        }
+        std::process::Command::new("/usr/bin/bwrap")
+            .args(["--ro-bind", "/", "/", "--", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
 fn build_linux_bwrap_command(
     work_dir: &Path,
     command: &str,
@@ -782,6 +799,24 @@ fn build_linux_bwrap_command(
         .arg("/dev")
         .arg("--proc")
         .arg("/proc");
+
+    // Preserve GPU compute & shared-memory device nodes inside the bwrap /dev mount
+    for dev_node in ["/dev/kfd", "/dev/dri", "/dev/shm", "/dev/udmabuf"] {
+        if Path::new(dev_node).exists() {
+            c.arg("--dev-bind-try").arg(dev_node).arg(dev_node);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(s) = name.to_str() {
+                if s.starts_with("nvidia") {
+                    let p = entry.path();
+                    c.arg("--dev-bind-try").arg(&p).arg(&p);
+                }
+            }
+        }
+    }
 
     for p in expand_canonical_paths(writable_paths) {
         if Path::new(&p).exists() {
