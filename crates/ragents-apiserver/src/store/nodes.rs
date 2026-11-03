@@ -573,6 +573,32 @@ impl SqliteStore {
         }
     }
 
+    pub fn patch_node(
+        &self,
+        node_id: &NodeId,
+        patch: PatchNodeSpecRequest,
+    ) -> Result<Node, StoreError> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut node = Self::load_node_in_tx(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if let Some(unsched) = patch.unschedulable {
+            node.spec.unschedulable = unsched;
+        }
+        if let Some(prompt_override) = patch.node_prompt_override {
+            node.spec.node_prompt_override = prompt_override;
+        }
+        if let Some(granted) = patch.granted_permissions {
+            node.spec.granted_permissions = granted;
+        }
+        if let Some(ws_perms) = patch.workspace_permissions {
+            node.spec.workspace_permissions = ws_perms;
+        }
+        Self::save_node_spec_in_tx(&tx, &mut node)?;
+        tx.commit()?;
+        Ok(node)
+    }
+
     /// Two-stage lease patrol:
     /// 1. When `now > lease_expires_at` (e.g. 30s):
     ///    - Marks `Ready` nodes as `NotReady`.

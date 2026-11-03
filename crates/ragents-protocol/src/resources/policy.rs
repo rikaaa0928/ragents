@@ -159,6 +159,38 @@ impl PermissionPolicyLayer {
         merge_ruleset(&mut self.http_hosts, &other.http_hosts);
         merge_ruleset(&mut self.command_work_dir, &other.command_work_dir);
     }
+
+    /// Removes `rule` from the specified `category` (`file_read`, `file_write`, `http_hosts`, `command_work_dir`)
+    /// and `list_kind` (`allow` or `deny`). Returns `true` if a matching rule was removed.
+    pub fn revoke_rule(&mut self, category: &str, list_kind: &str, rule: &str) -> bool {
+        let slot = match category {
+            "file_read" => &mut self.file_read,
+            "file_write" => &mut self.file_write,
+            "http_hosts" => &mut self.http_hosts,
+            "command_work_dir" => &mut self.command_work_dir,
+            _ => return false,
+        };
+        let Some(rs) = slot.as_mut() else {
+            return false;
+        };
+        let vec_opt = match list_kind {
+            "deny" => &mut rs.deny,
+            _ => &mut rs.allow,
+        };
+        let Some(vec) = vec_opt.as_mut() else {
+            return false;
+        };
+        let before = vec.len();
+        vec.retain(|r| r != rule);
+        let removed = vec.len() < before;
+        if vec.is_empty() {
+            *vec_opt = None;
+        }
+        if rs.allow.is_none() && rs.deny.is_none() && rs.default.is_none() {
+            *slot = None;
+        }
+        removed
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

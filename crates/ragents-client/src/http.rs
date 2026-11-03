@@ -85,6 +85,16 @@ impl RagentsClient {
         Self::parse_response(resp).await.map(Some)
     }
 
+    pub async fn patch_node(
+        &self,
+        node_id: &NodeId,
+        patch: PatchNodeSpecRequest,
+    ) -> Result<Node, ClientError> {
+        let url = format!("{}/api/v1/nodes/{}", self.base_url, node_id);
+        let resp = self.http.patch(url).json(&patch).send().await?;
+        Self::parse_response(resp).await
+    }
+
     pub async fn create_session(
         &self,
         req: CreateSessionRequest,

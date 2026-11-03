@@ -77,6 +77,46 @@ pub(crate) async fn handle_get_node(
     Ok(Json(node))
 }
 
+pub(crate) async fn handle_patch_node(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+    Json(patch): Json<PatchNodeSpecRequest>,
+) -> Result<Json<Node>, ApiError> {
+    let principal = state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "PATCH",
+            &format!("/api/v1/nodes/{node_id}"),
+            &headers,
+        )
+        .await?;
+    let id = NodeId::new(node_id.clone());
+    let existing = state
+        .store
+        .get_node(&id)?
+        .ok_or_else(|| StoreError::NotFound(format!("node {id}")))?;
+    let selector = state
+        .extensions
+        .authorize(
+            &principal,
+            ResourceVerb::Patch,
+            ResourceKind::Node,
+            Some(&node_id),
+            &existing.metadata.labels,
+        )
+        .await?;
+    if !labels_match_selector(&existing.metadata.labels, &selector) {
+        return Err(ApiError::Http(
+            StatusCode::FORBIDDEN,
+            "Forbidden by label selector".into(),
+        ));
+    }
+    let updated = state.store.patch_node(&id, patch)?;
+    Ok(Json(updated))
+}
+
 pub(crate) async fn handle_node_fs_query(
     State(state): State<ApiServerState>,
     headers: HeaderMap,

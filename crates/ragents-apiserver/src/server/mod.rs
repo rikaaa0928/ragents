@@ -158,7 +158,10 @@ impl ApiServerState {
 pub fn build_router(state: ApiServerState) -> Router {
     Router::new()
         .route("/api/v1/nodes", get(http::handle_list_nodes))
-        .route("/api/v1/nodes/{node_id}", get(http::handle_get_node))
+        .route(
+            "/api/v1/nodes/{node_id}",
+            get(http::handle_get_node).patch(http::handle_patch_node),
+        )
         .route(
             "/api/v1/nodes/{node_id}/fs",
             post(http::handle_node_fs_query),

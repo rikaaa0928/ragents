@@ -38,6 +38,18 @@ pub struct CreateSessionResponse {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PatchNodeSpecRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unschedulable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_prompt_override: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted_permissions: Option<PermissionPolicyLayer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_permissions: Option<BTreeMap<String, PermissionPolicyLayer>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PatchSessionSpecRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desired_phase: Option<DesiredSessionPhase>,
