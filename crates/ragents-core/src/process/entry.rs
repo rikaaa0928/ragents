@@ -158,18 +158,18 @@ pub(crate) fn format_exit_notification(info: &ManagedProcessInfo) -> String {
 
 pub(crate) async fn kill_process_group(pid: u32) {
     #[cfg(unix)]
-    {
-        let neg_pgid = format!("-{pid}");
-        let _ = tokio::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(&neg_pgid)
-            .output()
-            .await;
+    if pid > 1 {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let pgid = -(pid as i32);
+        // POSIX SIGTERM = 15, SIGKILL = 9
+        unsafe {
+            let _ = kill(pgid, 15);
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = tokio::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(&neg_pgid)
-            .output()
-            .await;
+        unsafe {
+            let _ = kill(pgid, 9);
+        }
     }
 }

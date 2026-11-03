@@ -300,6 +300,10 @@ impl CoreExecutor for SubprocessExecutor {
             .current_dir(&run_spec.workspace_root)
             .env_remove("RAGENTS_API_KEY")
             .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,

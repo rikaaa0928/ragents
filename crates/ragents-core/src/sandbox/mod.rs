@@ -305,12 +305,13 @@ impl SandboxState {
                 #[cfg(unix)]
                 if let Some(pid) = self.0 {
                     if pid > 1 {
-                        let pgid = -(pid as i32);
-                        let _ = std::process::Command::new("kill")
-                            .args(["-9", &pgid.to_string()])
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status();
+                        extern "C" {
+                            fn kill(pid: i32, sig: i32) -> i32;
+                        }
+                        // POSIX SIGKILL = 9; negative pid targets the process group `pid`
+                        unsafe {
+                            let _ = kill(-(pid as i32), 9);
+                        }
                     }
                 }
             }
