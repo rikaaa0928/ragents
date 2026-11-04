@@ -102,6 +102,105 @@ impl SqliteStore {
             };
 
             let input_items = activation.spec.input.clone();
+
+            // If a prior activation was interrupted mid-tool-call without committing a FunctionCallOutput,
+            // synthesize and persist the interrupted tool output batch before starting this activation.
+            if let Ok(local_batches) = Self::read_local_batches_from_conn(tx, &sess_id) {
+                let mut answered_calls = std::collections::HashSet::new();
+                for b in &local_batches {
+                    for it in &b.items {
+                        if let openresponses_rust::Item::FunctionCallOutput { call_id, .. } = it {
+                            answered_calls.insert(call_id.clone());
+                        }
+                    }
+                }
+                for it in &input_items {
+                    if let openresponses_rust::Item::FunctionCallOutput { call_id, .. } = it {
+                        answered_calls.insert(call_id.clone());
+                    }
+                }
+
+                let mut unanswered = Vec::new();
+                for b in &local_batches {
+                    for it in &b.items {
+                        if let openresponses_rust::Item::FunctionCall { call_id, name, .. } = it {
+                            if !answered_calls.contains(call_id) {
+                                answered_calls.insert(call_id.clone());
+                                unanswered.push((
+                                    b.activation_id.clone(),
+                                    b.turn_id.clone(),
+                                    call_id.clone(),
+                                    name.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                for (prev_act_id, prev_turn_id, call_id, tool_name) in unanswered {
+                    let out_batch_seq = BatchSeq::new(session.status.batch_count);
+                    let first_seq = LocalItemSeq::new(session.status.local_item_count);
+                    let synth_items = vec![openresponses_rust::Item::FunctionCallOutput {
+                        id: None,
+                        status: None,
+                        call_id: call_id.clone(),
+                        output: openresponses_rust::FunctionOutput::Text(
+                            "[Tool execution was interrupted before completion.]".to_string(),
+                        ),
+                    }];
+                    let out_batch = ItemBatch {
+                        session_id: sess_id.clone(),
+                        batch_seq: out_batch_seq,
+                        first_local_item_seq: first_seq,
+                        kind: ItemBatchKind::ToolOutput,
+                        activation_id: prev_act_id.clone(),
+                        turn_id: prev_turn_id.clone(),
+                        response_id: None,
+                        created_at: chrono::Utc::now(),
+                        items: synth_items.clone(),
+                    };
+                    tx.execute(
+                        "INSERT INTO batches (
+                            session_id, batch_seq, first_local_item_seq, last_local_item_seq,
+                            kind, activation_id, turn_id, response_id, created_at, payload_json
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            sess_id.as_str(),
+                            out_batch_seq.value() as i64,
+                            first_seq.value() as i64,
+                            out_batch.last_local_item_seq().value() as i64,
+                            "tool_output",
+                            prev_act_id.as_str(),
+                            prev_turn_id.as_ref().map(|t| t.as_str()),
+                            Option::<String>::None,
+                            out_batch.created_at.to_rfc3339(),
+                            serde_json::to_string(&out_batch)?,
+                        ],
+                    )?;
+                    session.status.batch_count += 1;
+                    session.status.local_item_count += 1;
+                    session.status.effective_context_item_count += 1;
+
+                    let tool_fin_ev = Self::append_event_in_tx(
+                        tx,
+                        &sess_id,
+                        Some(prev_act_id),
+                        prev_turn_id,
+                        Some(out_batch_seq),
+                        SessionEvent::ToolCallFinished {
+                            call_id,
+                            name: tool_name,
+                            success: false,
+                            duration_ms: 0,
+                            output_batch_seq: Some(out_batch_seq),
+                            items: synth_items,
+                        },
+                    )?;
+                    session.status.event_count = tool_fin_ev.event_seq.value() + 1;
+                    events_out.push(tool_fin_ev);
+                }
+            }
+
             let batch_seq = BatchSeq::new(session.status.batch_count);
             let item_count = input_items.len() as u64;
             if !input_items.is_empty() {
@@ -139,21 +238,21 @@ impl SqliteStore {
                 session.status.batch_count += 1;
                 session.status.local_item_count += item_count;
                 session.status.effective_context_item_count += item_count;
-            }
 
-            let submitted_ev = Self::append_event_in_tx(
-                tx,
-                &sess_id,
-                Some(act_id.clone()),
-                None,
-                (!input_items.is_empty()).then_some(batch_seq),
-                SessionEvent::ActivationSubmitted {
-                    input_batch_seq: batch_seq,
-                    items: input_items,
-                },
-            )?;
-            session.status.event_count = submitted_ev.event_seq.value() + 1;
-            events_out.push(submitted_ev);
+                let submitted_ev = Self::append_event_in_tx(
+                    tx,
+                    &sess_id,
+                    Some(act_id.clone()),
+                    None,
+                    Some(batch_seq),
+                    SessionEvent::ActivationSubmitted {
+                        input_batch_seq: batch_seq,
+                        items: input_items,
+                    },
+                )?;
+                session.status.event_count = submitted_ev.event_seq.value() + 1;
+                events_out.push(submitted_ev);
+            }
 
             let next_epoch = activation.status.lease_epoch.next();
             activation.status.lease_epoch = next_epoch;

@@ -140,7 +140,10 @@ impl OpenResponsesModelBackend {
         accept_sse: bool,
     ) -> Result<reqwest::Response, CoreError> {
         let url = Self::build_endpoint_url(&endpoint.base_url);
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .tcp_keepalive(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let mut attempt = 0u32;
 
         loop {
@@ -217,23 +220,38 @@ impl ModelBackend for OpenResponsesModelBackend {
                 .await;
         }
 
-        let resp = Self::send_with_retry(endpoint, &request_json, false).await?;
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let mut stream_attempt = 0u32;
+        loop {
+            let resp = Self::send_with_retry(endpoint, &request_json, false).await?;
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
 
-        if content_type.contains("text/event-stream") {
-            return parse_sse_response_stream(resp, &request_json, None).await;
+            let res = if content_type.contains("text/event-stream") {
+                parse_sse_response_stream(resp, &request_json, None).await
+            } else {
+                match resp.text().await {
+                    Ok(body_text) => serde_json::from_str(&body_text).map_err(CoreError::Json),
+                    Err(e) => Err(CoreError::ResponseFailed(format!(
+                        "HTTP read body error: {e}"
+                    ))),
+                }
+            };
+
+            match res {
+                Ok(parsed) => return Ok(parsed),
+                Err(err) if stream_attempt < MAX_TRANSIENT_RETRIES => {
+                    stream_attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << (stream_attempt - 1))))
+                        .await;
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
         }
-
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| CoreError::ResponseFailed(format!("HTTP read body error: {e}")))?;
-        serde_json::from_str(&body_text).map_err(CoreError::Json)
     }
 
     async fn create_response_streaming(
@@ -258,27 +276,45 @@ impl ModelBackend for OpenResponsesModelBackend {
             obj.insert("stream".to_string(), serde_json::Value::Bool(true));
         }
 
-        let resp = Self::send_with_retry(endpoint, &request_json, true).await?;
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let mut stream_attempt = 0u32;
+        loop {
+            let resp = Self::send_with_retry(endpoint, &request_json, true).await?;
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
 
-        if content_type.contains("text/event-stream") {
-            parse_sse_response_stream(resp, &request_json, on_delta).await
-        } else {
-            let body_text = resp
-                .text()
-                .await
-                .map_err(|e| CoreError::ResponseFailed(format!("HTTP read body error: {e}")))?;
-            let parsed: ResponseResource =
-                serde_json::from_str(&body_text).map_err(CoreError::Json)?;
-            if let Some(ref cb) = on_delta {
-                emit_synthetic_deltas_from_items(&parsed.output, cb);
+            let res = if content_type.contains("text/event-stream") {
+                parse_sse_response_stream(resp, &request_json, on_delta.clone()).await
+            } else {
+                match resp.text().await {
+                    Ok(body_text) => match serde_json::from_str::<ResponseResource>(&body_text) {
+                        Ok(parsed) => {
+                            if let Some(ref cb) = on_delta {
+                                emit_synthetic_deltas_from_items(&parsed.output, cb);
+                            }
+                            Ok(parsed)
+                        }
+                        Err(e) => Err(CoreError::Json(e)),
+                    },
+                    Err(e) => Err(CoreError::ResponseFailed(format!(
+                        "HTTP read body error: {e}"
+                    ))),
+                }
+            };
+
+            match res {
+                Ok(parsed) => return Ok(parsed),
+                Err(err) if stream_attempt < MAX_TRANSIENT_RETRIES => {
+                    stream_attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << (stream_attempt - 1))))
+                        .await;
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
             }
-            Ok(parsed)
         }
     }
 }
