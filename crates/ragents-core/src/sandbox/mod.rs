@@ -60,10 +60,11 @@ pub struct SandboxState {
 
 impl SandboxState {
     pub fn from_run_spec(run_spec: &CoreRunSpec) -> Self {
-        Self::from_policy(
+        Self::from_policy_with_extra_tmp(
             SandboxMode::Auto,
             &run_spec.workspace_root,
             &run_spec.session_tmp_dir,
+            &run_spec.extra_tmp_dirs,
             &run_spec.effective_permissions,
         )
     }
@@ -74,10 +75,28 @@ impl SandboxState {
         session_tmp_dir: &Path,
         policy: &PermissionPolicyLayer,
     ) -> Self {
+        Self::from_policy_with_extra_tmp(mode, workspace_root, session_tmp_dir, &[], policy)
+    }
+
+    pub fn from_policy_with_extra_tmp(
+        mode: SandboxMode,
+        workspace_root: &Path,
+        session_tmp_dir: &Path,
+        extra_tmp_dirs: &[PathBuf],
+        policy: &PermissionPolicyLayer,
+    ) -> Self {
         let mut writable_paths = vec![workspace_root.to_path_buf(), session_tmp_dir.to_path_buf()];
         let mut denied_write_paths = Vec::new();
         let mut denied_read_paths = Vec::new();
         let mut allowed_read_paths = Vec::new();
+        for extra in extra_tmp_dirs {
+            if !writable_paths.contains(extra) {
+                writable_paths.push(extra.clone());
+            }
+            if !allowed_read_paths.contains(extra) {
+                allowed_read_paths.push(extra.clone());
+            }
+        }
 
         let resolve = |raw: &str| -> PathBuf {
             let expanded = if raw == "~" || raw.starts_with("~/") {

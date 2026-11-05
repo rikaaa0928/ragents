@@ -153,6 +153,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             model: model.map(ModelRequestSpec::new),
                             extensions: vec![],
                             permissions: PermissionPolicyLayer::default(),
+                            extra_tmp_dirs: vec![],
                         },
                         initial_activation: Some(InitialActivationRequest {
                             input: vec![Item::user_message(prompt_text)],
@@ -284,6 +285,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             model: model.map(ModelRequestSpec::new),
                             extensions: parsed_exts,
                             permissions: PermissionPolicyLayer::default(),
+                            extra_tmp_dirs: vec![],
                         },
                         initial_activation: prompt.map(|p| InitialActivationRequest {
                             input: vec![Item::user_message(p)],
@@ -358,8 +360,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             desired_phase: phase.map(Into::into),
                             system_prompt,
                             model: model.map(ModelRequestSpec::new),
-                            extensions: None,
-                            permissions: None,
+                            ..Default::default()
                         },
                     )
                     .await?;
@@ -412,6 +413,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             model: model.map(ModelRequestSpec::new),
                             extensions: parsed_exts,
                             permissions: PermissionPolicyLayer::default(),
+                            extra_tmp_dirs: vec![],
                         },
                         initial_activation: Some(InitialActivationRequest {
                             input: vec![Item::user_message(prompt)],

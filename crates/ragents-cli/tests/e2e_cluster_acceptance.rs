@@ -189,6 +189,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
                     http_hosts: None,
                     command_work_dir: None,
                 },
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("please write approved.txt")],

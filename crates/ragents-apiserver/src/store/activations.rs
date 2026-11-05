@@ -613,6 +613,7 @@ impl SqliteStore {
                 model: from_session.spec.model.clone(),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             };
 
             let mut compact_status =
@@ -811,6 +812,7 @@ impl SqliteStore {
                 model: from_session.spec.model.clone(),
                 extensions: from_session.spec.extensions.clone(),
                 permissions: from_session.spec.permissions.clone(),
+                extra_tmp_dirs: from_session.spec.extra_tmp_dirs.clone(),
             };
             let mut cont_status =
                 SessionStatus::initial(from_session.status.bound_node_id.clone(), inherited_count);

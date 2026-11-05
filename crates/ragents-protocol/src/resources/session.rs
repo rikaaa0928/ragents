@@ -190,6 +190,11 @@ pub struct SessionSpec {
     pub extensions: Vec<ExtensionSpec>,
     #[serde(default)]
     pub permissions: PermissionPolicyLayer,
+    /// Additional shared temporary directories bound to this session (e.g. `/tmp/ragents/rooms/<room_id>`).
+    /// When `scheduling` is `Floating` (no external workspace specified), the first directory in `extra_tmp_dirs`
+    /// serves as the session's `workspace_root`; if `extra_tmp_dirs` is empty, `session_tmp_dir` is used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_tmp_dirs: Vec<PathBuf>,
 }
 
 impl SessionSpec {

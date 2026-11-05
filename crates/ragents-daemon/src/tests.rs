@@ -135,6 +135,7 @@ async fn test_multi_daemon_floating_failover_and_context_continuity() {
                 model: Some(ModelRequestSpec::new("claude-sonnet-4")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("hello turn 1")],
@@ -379,6 +380,7 @@ async fn test_daemon_model_interceptor_mutates_params_headers_and_vendor_fields(
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("test model interceptor")],
@@ -714,6 +716,7 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: None,
         })
@@ -1109,6 +1112,7 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message(
@@ -1420,6 +1424,7 @@ async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("Start session background sleep")],
@@ -1506,10 +1511,7 @@ async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
             &sess_id,
             PatchSessionSpecRequest {
                 desired_phase: Some(DesiredSessionPhase::Closed),
-                system_prompt: None,
-                model: None,
-                extensions: None,
-                permissions: None,
+                ..Default::default()
             },
         )
         .await
@@ -1660,6 +1662,7 @@ async fn test_daemon_auto_discover_models_from_v1_models_endpoint() {
                 model: Some(ModelRequestSpec::new("discovered-model-alpha")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("hello discovered model")],
@@ -1791,6 +1794,7 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: None,
         })
@@ -1817,6 +1821,7 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: None,
         })
@@ -1945,6 +1950,7 @@ async fn test_four_segment_system_prompt_ssot_permissions_and_disabled_tools() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("hello")],

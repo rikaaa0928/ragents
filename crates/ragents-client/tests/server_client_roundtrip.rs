@@ -59,6 +59,7 @@ async fn test_http_sse_and_ws_daemon_tunnel_roundtrip() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("ping over cluster")],
@@ -381,6 +382,7 @@ async fn test_apiserver_authn_authz_multitenant_isolation_and_mutating_validatin
                 model: Some(ModelRequestSpec::new("fast")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: None,
         })
@@ -422,6 +424,7 @@ async fn test_apiserver_authn_authz_multitenant_isolation_and_mutating_validatin
                 model: Some(ModelRequestSpec::new("restricted-ultra")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: None,
         })
@@ -448,6 +451,7 @@ async fn test_apiserver_authn_authz_multitenant_isolation_and_mutating_validatin
                 model: Some(ModelRequestSpec::new("fast")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: None,
         })

@@ -61,6 +61,10 @@ pub struct PatchSessionSpecRequest {
     pub extensions: Option<Vec<ExtensionSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<PermissionPolicyLayer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_node_id: Option<Option<NodeId>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_tmp_dirs: Option<Vec< std::path::PathBuf>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +297,8 @@ pub struct NodeFsRequest {
     pub zone: NodeFsZone,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmp_dir: Option<String>,
     pub op: NodeFsOp,
 }
 

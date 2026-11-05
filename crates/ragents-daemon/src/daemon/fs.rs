@@ -375,7 +375,20 @@ fn resolve_zone_root(
             Ok((ws_path, String::new()))
         }
         NodeFsZone::Tmp => {
-            if let Some(ws_str) = req
+            if let Some(tmp_str) = req
+                .tmp_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let tmp_path = PathBuf::from(tmp_str);
+                let _ = std::fs::create_dir_all(&tmp_path);
+                config
+                    .validate_workspace_path(&tmp_path)
+                    .map_err(|e| e.to_string())?;
+                let prefix = tmp_str.trim_end_matches('/').to_string();
+                Ok((tmp_path, prefix))
+            } else if let Some(ws_str) = req
                 .workspace_path
                 .as_deref()
                 .map(str::trim)

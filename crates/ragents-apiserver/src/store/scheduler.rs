@@ -68,15 +68,51 @@ impl SqliteStore {
                     node_id.clone()
                 }
                 SchedulingMode::Floating { node_selector } => {
-                    let candidates = Self::find_candidate_nodes_in_tx(
-                        tx,
-                        required_model,
-                        node_selector,
-                        previous_assigned.as_ref(),
-                    )?;
-                    match candidates.into_iter().next() {
-                        Some(chosen) => chosen,
-                        None => continue,
+                    if let Some(ref prev_id) = previous_assigned {
+                        if let Some(prev_node) = Self::load_node_in_tx(tx, prev_id)? {
+                            if Self::node_is_eligible(&prev_node, required_model, node_selector) {
+                                if prev_node.status.active_runners
+                                    < prev_node.status.max_concurrent_runners
+                                {
+                                    prev_id.clone()
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                let candidates = Self::find_candidate_nodes_in_tx(
+                                    tx,
+                                    required_model,
+                                    node_selector,
+                                    None,
+                                )?;
+                                match candidates.into_iter().next() {
+                                    Some(chosen) => chosen,
+                                    None => continue,
+                                }
+                            }
+                        } else {
+                            let candidates = Self::find_candidate_nodes_in_tx(
+                                tx,
+                                required_model,
+                                node_selector,
+                                None,
+                            )?;
+                            match candidates.into_iter().next() {
+                                Some(chosen) => chosen,
+                                None => continue,
+                            }
+                        }
+                    } else {
+                        let candidates = Self::find_candidate_nodes_in_tx(
+                            tx,
+                            required_model,
+                            node_selector,
+                            None,
+                        )?;
+                        match candidates.into_iter().next() {
+                            Some(chosen) => chosen,
+                            None => continue,
+                        }
                     }
                 }
             };
@@ -317,15 +353,12 @@ impl SqliteStore {
         Ok(dispatches)
     }
 
-    pub(crate) fn node_can_run(
+    pub(crate) fn node_is_eligible(
         node: &Node,
         required_model: Option<&str>,
         selector: &BTreeMap<String, String>,
     ) -> bool {
         if node.spec.unschedulable || node.status.phase != NodePhase::Ready {
-            return false;
-        }
-        if node.status.active_runners >= node.status.max_concurrent_runners {
             return false;
         }
         for (k, v) in selector {
@@ -337,6 +370,17 @@ impl SqliteStore {
             Some(model_name) => node.status.supported_models.iter().any(|m| m == model_name),
             None => node.status.default_model.is_some() || !node.status.supported_models.is_empty(),
         }
+    }
+
+    pub(crate) fn node_can_run(
+        node: &Node,
+        required_model: Option<&str>,
+        selector: &BTreeMap<String, String>,
+    ) -> bool {
+        if !Self::node_is_eligible(node, required_model, selector) {
+            return false;
+        }
+        node.status.active_runners < node.status.max_concurrent_runners
     }
 
     pub(crate) fn find_candidate_nodes_in_tx(

@@ -468,20 +468,24 @@ impl AgentDaemon {
                 }
             };
 
-            let workspace_root = match &session.spec.scheduling {
-                SchedulingMode::Pinned { workspace_path, .. } => workspace_path.clone(),
-                SchedulingMode::Floating { .. } => daemon
-                    .config
-                    .temp_root_dir
-                    .join("floating")
-                    .join(sess_id.as_str())
-                    .join(act_id.as_str()),
-            };
             let session_tmp_dir = daemon
                 .config
                 .temp_root_dir
                 .join("sessions")
                 .join(sess_id.as_str());
+            let extra_tmp_dirs = session.spec.extra_tmp_dirs.clone();
+            let workspace_root = match &session.spec.scheduling {
+                SchedulingMode::Pinned { workspace_path, .. } => workspace_path.clone(),
+                SchedulingMode::Floating { .. } => extra_tmp_dirs
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| session_tmp_dir.clone()),
+            };
+            let _ = std::fs::create_dir_all(&workspace_root);
+            let _ = std::fs::create_dir_all(&session_tmp_dir);
+            for extra_dir in &extra_tmp_dirs {
+                let _ = std::fs::create_dir_all(extra_dir);
+            }
 
             let task_cancel = daemon_shutdown.child_token();
             if activation.spec.desired_phase == DesiredActivationPhase::Cancelled {
@@ -594,10 +598,11 @@ impl AgentDaemon {
                 }
             }
 
-            let sandbox_state = Arc::new(SandboxState::from_policy(
+            let sandbox_state = Arc::new(SandboxState::from_policy_with_extra_tmp(
                 SandboxMode::Auto,
                 &workspace_root,
                 &session_tmp_dir,
+                &extra_tmp_dirs,
                 &runtime_permissions,
             ));
 
@@ -629,6 +634,7 @@ impl AgentDaemon {
                 activation_id: act_id.clone(),
                 workspace_root,
                 session_tmp_dir,
+                extra_tmp_dirs,
                 effective_config,
                 effective_permissions: runtime_permissions,
                 disabled_tools: activation.spec.disabled_tools.clone(),

@@ -72,7 +72,11 @@ impl SqliteStore {
                     }
                     Some(node_id.clone())
                 }
-                SchedulingMode::Floating { .. } => None,
+                SchedulingMode::Floating { .. } => req
+                    .labels
+                    .get("ragents.io/preferred-node")
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| NodeId::new(s.trim())),
             };
 
             let mut inherited_item_count = 0u64;
@@ -346,6 +350,14 @@ impl SqliteStore {
             }
             if let Some(perms) = patch.permissions {
                 session.spec.permissions = perms;
+            }
+            if let Some(extra_tmp) = patch.extra_tmp_dirs {
+                session.spec.extra_tmp_dirs = extra_tmp;
+            }
+            if let Some(bound_opt) = patch.bound_node_id {
+                if session.spec.scheduling.is_floating() {
+                    session.status.bound_node_id = bound_opt;
+                }
             }
 
             let mut phase_transition_event: Option<SessionEvent> = None;

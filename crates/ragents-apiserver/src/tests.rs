@@ -49,6 +49,7 @@ fn test_pinned_session_never_migrates_across_nodes() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("edit main.rs")],
@@ -118,6 +119,7 @@ fn test_floating_session_failover_and_fencing_token() {
                 model: Some(ModelRequestSpec::new("claude-sonnet-4")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("analyze algorithm")],
@@ -232,6 +234,7 @@ fn test_cross_session_source_lineage_context_resolution() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("turn 1 user")],
@@ -279,6 +282,7 @@ fn test_cross_session_source_lineage_context_resolution() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("child follow-up")],
@@ -314,6 +318,7 @@ fn test_deferred_queued_activation_batch_and_atomic_withdrawal() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("turn 1 running")],
@@ -419,6 +424,7 @@ fn test_running_activation_grace_period_and_reconnect_reconciliation() {
                 model: Some(ModelRequestSpec::new("gpt-4.1")),
                 extensions: vec![],
                 permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
             },
             initial_activation: Some(InitialActivationRequest {
                 input: vec![Item::user_message("long running task")],

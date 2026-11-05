@@ -58,6 +58,8 @@ pub struct CoreRunSpec {
     pub activation_id: ActivationId,
     pub workspace_root: PathBuf,
     pub session_tmp_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_tmp_dirs: Vec<PathBuf>,
     pub effective_config: ConfigRevision,
     #[serde(default)]
     pub effective_permissions: PermissionPolicyLayer,

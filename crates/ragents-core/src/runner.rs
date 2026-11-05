@@ -248,6 +248,9 @@ impl CoreExecutor for InProcessExecutor {
     ) -> Result<CoreRunSummary, CoreError> {
         let _ = std::fs::create_dir_all(&run_spec.workspace_root);
         let _ = std::fs::create_dir_all(&run_spec.session_tmp_dir);
+        for extra_dir in &run_spec.extra_tmp_dirs {
+            let _ = std::fs::create_dir_all(extra_dir);
+        }
 
         let mut hook_manager = HookManager::empty();
         let sandbox_state = Arc::new(SandboxState::from_run_spec(&run_spec));
@@ -255,6 +258,11 @@ impl CoreExecutor for InProcessExecutor {
             run_spec.workspace_root.clone(),
             run_spec.session_tmp_dir.clone(),
         ];
+        for extra_dir in &run_spec.extra_tmp_dirs {
+            if !base_preopen_dirs.contains(extra_dir) {
+                base_preopen_dirs.push(extra_dir.clone());
+            }
+        }
         let (w_dirs, r_dirs) = sandbox_state.wasi_preopen_dirs();
         for dir in w_dirs.into_iter().chain(r_dirs.into_iter()) {
             if !base_preopen_dirs.contains(&dir) {
