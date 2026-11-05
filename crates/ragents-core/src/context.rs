@@ -1,4 +1,4 @@
-use openresponses_rust::{FunctionOutput, Input, Item, MessageContent};
+use openresponses_rust::{FunctionOutput, Input, Item, MessageContent, MessageRole};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -29,10 +29,17 @@ impl ContextProjection {
             })
             .collect();
 
+        let last_user_msg_idx = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::Message { role: MessageRole::User, .. }))
+            .unwrap_or(0);
+
         let mut cleaned = Vec::with_capacity(self.items.len());
         let mut pending_unanswered_calls: Vec<String> = Vec::new();
+        let mut seen_output_call_ids: HashSet<&str> = HashSet::new();
 
-        for raw_item in &self.items {
+        for (idx, raw_item) in self.items.iter().enumerate() {
             if matches!(raw_item, Item::Message { .. }) && !pending_unanswered_calls.is_empty() {
                 for call_id in pending_unanswered_calls.drain(..) {
                     cleaned.push(Item::FunctionCallOutput {
@@ -53,7 +60,20 @@ impl ContextProjection {
                 }
             }
 
-            cleaned.push(strip_reasoning_summary(raw_item.clone()));
+            if let Item::FunctionCallOutput { call_id, .. } = raw_item {
+                if !seen_output_call_ids.insert(call_id.as_str()) {
+                    // Skip duplicate FunctionCallOutput for the same call_id
+                    continue;
+                }
+            }
+
+            let sanitized = strip_reasoning_summary(raw_item.clone());
+            let sanitized = if idx < last_user_msg_idx {
+                strip_historical_tool_image_data(sanitized)
+            } else {
+                sanitized
+            };
+            cleaned.push(sanitized);
         }
 
         for call_id in pending_unanswered_calls {
@@ -68,6 +88,37 @@ impl ContextProjection {
         }
 
         Input::Items(cleaned)
+    }
+}
+
+fn strip_historical_tool_image_data(item: Item) -> Item {
+    match item {
+        Item::FunctionCallOutput {
+            id,
+            status,
+            call_id,
+            output: FunctionOutput::Content(parts),
+        } => {
+            let new_parts: Vec<MessageContent> = parts
+                .into_iter()
+                .map(|part| match part {
+                    MessageContent::InputImage {
+                        image_url: Some(ref url),
+                        ..
+                    } if url.starts_with("data:") => MessageContent::InputText {
+                        text: "[Historical image data omitted in subsequent turns to save bandwidth; call view_image again if you need to re-inspect this image.]".to_string(),
+                    },
+                    other => other,
+                })
+                .collect();
+            Item::FunctionCallOutput {
+                id,
+                status,
+                call_id,
+                output: FunctionOutput::Content(new_parts),
+            }
+        }
+        other => other,
     }
 }
 

@@ -523,6 +523,41 @@ impl SqliteStore {
         for batch in local_batches {
             effective.extend(batch.items);
         }
+        let last_user_msg_idx = effective
+            .iter()
+            .rposition(|item| {
+                matches!(
+                    item,
+                    Item::Message {
+                        role: openresponses_rust::MessageRole::User,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or(0);
+        for (idx, item) in effective.iter_mut().enumerate() {
+            if idx < last_user_msg_idx {
+                if let Item::FunctionCallOutput {
+                    output: openresponses_rust::FunctionOutput::Content(parts),
+                    ..
+                } = item
+                {
+                    for part in parts.iter_mut() {
+                        if let openresponses_rust::MessageContent::InputImage {
+                            image_url: Some(ref url),
+                            ..
+                        } = part
+                        {
+                            if url.starts_with("data:") {
+                                *part = openresponses_rust::MessageContent::InputText {
+                                    text: "[Historical image data omitted in subsequent turns to save bandwidth; call view_image again if you need to re-inspect this image.]".to_string(),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(effective)
     }
 
