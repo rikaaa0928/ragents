@@ -324,7 +324,7 @@ impl DaemonTunnelHandle {
                     active_runners,
                     running_activation_ids,
                 },
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(45),
                 1,
             )
             .await?;
