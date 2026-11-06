@@ -292,6 +292,12 @@ pub enum NodeFsOp {
         rel_path: String,
         data_base64: String,
     },
+    UploadFileToHttp {
+        rel_path: String,
+        upload_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upload_token: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

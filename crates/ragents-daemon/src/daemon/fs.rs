@@ -42,6 +42,7 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
         NodeFsOp::ListDir { rel_path } => rel_path.as_str(),
         NodeFsOp::ReadFile { rel_path, .. } => rel_path.as_str(),
         NodeFsOp::WriteTempFile { rel_path, .. } => rel_path.as_str(),
+        NodeFsOp::UploadFileToHttp { rel_path, .. } => rel_path.as_str(),
     };
 
     let clean_rel = match sanitize_rel_path(raw_rel) {
@@ -375,6 +376,88 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
                 resolved_rel_path: clean_rel_str,
                 agent_path,
                 size: Some(bytes.len() as u64),
+                mime_type: Some(mime_type),
+                ..Default::default()
+            }
+        }
+        NodeFsOp::UploadFileToHttp {
+            upload_url,
+            upload_token,
+            ..
+        } => {
+            if !target_path.exists() || !target_path.is_file() {
+                return NodeFsResponse {
+                    ok: false,
+                    error: Some(format!("file not found: {}", clean_rel_str)),
+                    root_dir: root_dir.to_string_lossy().to_string(),
+                    resolved_rel_path: clean_rel_str,
+                    agent_path,
+                    ..Default::default()
+                };
+            }
+
+            let meta = match std::fs::metadata(&target_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    return NodeFsResponse {
+                        ok: false,
+                        error: Some(format!("failed to stat file: {e}")),
+                        root_dir: root_dir.to_string_lossy().to_string(),
+                        resolved_rel_path: clean_rel_str,
+                        agent_path,
+                        ..Default::default()
+                    };
+                }
+            };
+            let total_size = meta.len();
+
+            let mut header_buf = Vec::new();
+            if let Ok(f) = std::fs::File::open(&target_path) {
+                let _ = f.take(4096).read_to_end(&mut header_buf);
+            }
+            let mime_type = detect_mime_type(&target_path, &header_buf);
+
+            let path_for_upload = target_path.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let file = match tokio::fs::File::open(&path_for_upload).await {
+                    Ok(f) => f,
+                    Err(_) => return,
+                };
+                let stream = futures::stream::unfold(file, |mut f| async move {
+                    let mut buf = vec![0u8; 128 * 1024];
+                    match f.read(&mut buf).await {
+                        Ok(0) => None,
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Some((Ok::<Vec<u8>, std::io::Error>(buf), f))
+                        }
+                        Err(e) => Some((Err(e), f)),
+                    }
+                });
+                let client = reqwest::Client::builder()
+                    .tcp_keepalive(std::time::Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+                let mut req_builder = client
+                    .put(&upload_url)
+                    .header("content-type", "application/octet-stream")
+                    .header("content-length", total_size.to_string());
+                if let Some(tok) = upload_token {
+                    req_builder = req_builder.header("x-upload-token", tok);
+                }
+                let _ = req_builder
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .send()
+                    .await;
+            });
+
+            NodeFsResponse {
+                ok: true,
+                root_dir: root_dir.to_string_lossy().to_string(),
+                resolved_rel_path: clean_rel_str,
+                agent_path,
+                size: Some(total_size),
                 mime_type: Some(mime_type),
                 ..Default::default()
             }
