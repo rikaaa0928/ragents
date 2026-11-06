@@ -284,6 +284,8 @@ pub enum NodeFsOp {
     ReadFile {
         rel_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<usize>,
     },
     WriteTempFile {

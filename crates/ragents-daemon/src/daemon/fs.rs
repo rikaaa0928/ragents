@@ -173,7 +173,9 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
                 ..Default::default()
             }
         }
-        NodeFsOp::ReadFile { max_bytes, .. } => {
+        NodeFsOp::ReadFile {
+            offset, max_bytes, ..
+        } => {
             if !target_path.exists() || !target_path.is_file() {
                 return NodeFsResponse {
                     ok: false,
@@ -199,11 +201,12 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
                 }
             };
             let total_size = meta.len();
+            let start_offset = offset.unwrap_or(0);
             let limit = max_bytes
                 .unwrap_or(DEFAULT_MAX_READ_BYTES)
                 .min(HARD_MAX_FILE_BYTES);
 
-            let file = match std::fs::File::open(&target_path) {
+            let mut file = match std::fs::File::open(&target_path) {
                 Ok(f) => f,
                 Err(e) => {
                     return NodeFsResponse {
@@ -217,6 +220,32 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
                 }
             };
 
+            if start_offset > 0 {
+                use std::io::{Seek, SeekFrom};
+                if start_offset >= total_size {
+                    return NodeFsResponse {
+                        ok: true,
+                        root_dir: root_dir.to_string_lossy().to_string(),
+                        resolved_rel_path: clean_rel_str,
+                        agent_path,
+                        data_base64: Some(String::new()),
+                        size: Some(total_size),
+                        truncated: false,
+                        ..Default::default()
+                    };
+                }
+                if let Err(e) = file.seek(SeekFrom::Start(start_offset)) {
+                    return NodeFsResponse {
+                        ok: false,
+                        error: Some(format!("failed to seek file: {e}")),
+                        root_dir: root_dir.to_string_lossy().to_string(),
+                        resolved_rel_path: clean_rel_str,
+                        agent_path,
+                        ..Default::default()
+                    };
+                }
+            }
+
             let mut buf = Vec::new();
             if let Err(e) = file.take(limit as u64).read_to_end(&mut buf) {
                 return NodeFsResponse {
@@ -229,9 +258,9 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
                 };
             }
 
-            let truncated = (total_size as usize) > buf.len();
+            let truncated = start_offset.saturating_add(buf.len() as u64) < total_size;
             let mime_type = detect_mime_type(&target_path, &buf);
-            let is_text = is_likely_utf8_text(&buf);
+            let is_text = start_offset == 0 && is_likely_utf8_text(&buf);
             let text_preview = if is_text {
                 let preview_slice = &buf[..buf.len().min(MAX_TEXT_PREVIEW_BYTES)];
                 Some(String::from_utf8_lossy(preview_slice).into_owned())

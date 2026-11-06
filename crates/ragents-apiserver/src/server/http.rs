@@ -195,7 +195,7 @@ pub(crate) async fn handle_node_fs_query(
         }));
     }
 
-    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
         Ok(Ok(resp)) => Ok(Json(resp)),
         Ok(Err(_)) => Ok(Json(NodeFsResponse {
             ok: false,
@@ -210,7 +210,7 @@ pub(crate) async fn handle_node_fs_query(
                 .remove(&request_id);
             Ok(Json(NodeFsResponse {
                 ok: false,
-                error: Some("Node file operation timed out after 30s".to_string()),
+                error: Some("Node file operation timed out after 120s".to_string()),
                 ..Default::default()
             }))
         }
