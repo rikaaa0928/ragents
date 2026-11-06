@@ -419,37 +419,107 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
 
             let path_for_upload = target_path.clone();
             tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let file = match tokio::fs::File::open(&path_for_upload).await {
-                    Ok(f) => f,
-                    Err(_) => return,
-                };
-                let stream = futures::stream::unfold(file, |mut f| async move {
-                    let mut buf = vec![0u8; 128 * 1024];
-                    match f.read(&mut buf).await {
-                        Ok(0) => None,
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Some((Ok::<Vec<u8>, std::io::Error>(buf), f))
-                        }
-                        Err(e) => Some((Err(e), f)),
-                    }
-                });
+                use futures::StreamExt;
+                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
                 let client = reqwest::Client::builder()
+                    .http1_only()
                     .tcp_keepalive(std::time::Duration::from_secs(15))
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new());
-                let mut req_builder = client
-                    .put(&upload_url)
-                    .header("content-type", "application/octet-stream")
-                    .header("content-length", total_size.to_string());
-                if let Some(tok) = upload_token {
-                    req_builder = req_builder.header("x-upload-token", tok);
+
+                const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                const CONCURRENCY: usize = 8;
+
+                if total_size <= CHUNK_SIZE {
+                    let bytes = match tokio::fs::read(&path_for_upload).await {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    let mut req_builder = client
+                        .put(&upload_url)
+                        .header("content-type", "application/octet-stream")
+                        .header("content-length", bytes.len().to_string());
+                    if let Some(ref tok) = upload_token {
+                        req_builder = req_builder.header("x-upload-token", tok);
+                    }
+                    let _ = req_builder.body(bytes).send().await;
+                    return;
                 }
-                let _ = req_builder
-                    .body(reqwest::Body::wrap_stream(stream))
-                    .send()
+
+                let mut offsets = Vec::new();
+                let mut cur = 0u64;
+                while cur < total_size {
+                    let len = (total_size - cur).min(CHUNK_SIZE);
+                    offsets.push((cur, len));
+                    cur += len;
+                }
+
+                let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                futures::stream::iter(offsets)
+                    .for_each_concurrent(CONCURRENCY, |(offset, len)| {
+                        let client = client.clone();
+                        let path = path_for_upload.clone();
+                        let base_url = upload_url.clone();
+                        let token = upload_token.clone();
+                        let failed = failed.clone();
+                        async move {
+                            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            let mut buf = vec![0u8; len as usize];
+                            let read_ok = async {
+                                let mut f = tokio::fs::File::open(&path).await?;
+                                f.seek(std::io::SeekFrom::Start(offset)).await?;
+                                f.read_exact(&mut buf).await?;
+                                Ok::<(), std::io::Error>(())
+                            }
+                            .await;
+                            if read_ok.is_err() {
+                                failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+
+                            let chunk_url = format!("{base_url}?offset={offset}");
+                            let mut ok = false;
+                            for _attempt in 0..3 {
+                                let mut rb = client
+                                    .put(&chunk_url)
+                                    .header("content-type", "application/octet-stream")
+                                    .header("content-length", buf.len().to_string());
+                                if let Some(ref tok) = token {
+                                    rb = rb.header("x-upload-token", tok);
+                                }
+                                if let Ok(resp) = rb.body(buf.clone()).send().await {
+                                    if resp.status().is_success() {
+                                        ok = true;
+                                        break;
+                                    }
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            }
+                            if !ok {
+                                failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    })
                     .await;
+
+                if !failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    let complete_url = format!("{upload_url}?complete=1");
+                    let mut rb = client.post(&complete_url).header("content-length", "0");
+                    if let Some(ref tok) = upload_token {
+                        rb = rb.header("x-upload-token", tok);
+                    }
+                    let _ = rb.send().await;
+                } else {
+                    let fail_url = format!("{upload_url}?failed=1");
+                    let mut rb = client.post(&fail_url).header("content-length", "0");
+                    if let Some(ref tok) = upload_token {
+                        rb = rb.header("x-upload-token", tok);
+                    }
+                    let _ = rb.send().await;
+                }
             });
 
             NodeFsResponse {
