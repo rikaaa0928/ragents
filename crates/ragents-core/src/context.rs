@@ -1,4 +1,4 @@
-use openresponses_rust::{FunctionOutput, Input, Item, MessageContent};
+use openresponses_rust::{FunctionOutput, Input, Item, MessageContent, MessageRole};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -29,10 +29,10 @@ impl ContextProjection {
             })
             .collect();
 
-        let last_turn_boundary_idx = self
+        let last_user_msg_idx = self
             .items
             .iter()
-            .rposition(|item| !matches!(item, Item::FunctionCallOutput { .. }))
+            .rposition(|item| matches!(item, Item::Message { role: MessageRole::User, .. }))
             .unwrap_or(0);
 
         let mut cleaned = Vec::with_capacity(self.items.len());
@@ -68,7 +68,7 @@ impl ContextProjection {
             }
 
             let sanitized = strip_reasoning_summary(raw_item.clone());
-            let sanitized = if idx < last_turn_boundary_idx {
+            let sanitized = if idx < last_user_msg_idx {
                 strip_historical_tool_image_data(sanitized)
             } else {
                 sanitized

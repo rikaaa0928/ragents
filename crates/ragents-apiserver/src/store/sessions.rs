@@ -523,12 +523,20 @@ impl SqliteStore {
         for batch in local_batches {
             effective.extend(batch.items);
         }
-        let last_turn_boundary_idx = effective
+        let last_user_msg_idx = effective
             .iter()
-            .rposition(|item| !matches!(item, Item::FunctionCallOutput { .. }))
+            .rposition(|item| {
+                matches!(
+                    item,
+                    Item::Message {
+                        role: openresponses_rust::MessageRole::User,
+                        ..
+                    }
+                )
+            })
             .unwrap_or(0);
         for (idx, item) in effective.iter_mut().enumerate() {
-            if idx < last_turn_boundary_idx {
+            if idx < last_user_msg_idx {
                 if let Item::FunctionCallOutput {
                     output: openresponses_rust::FunctionOutput::Content(parts),
                     ..
