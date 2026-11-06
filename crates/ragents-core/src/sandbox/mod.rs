@@ -85,11 +85,14 @@ impl SandboxState {
         extra_tmp_dirs: &[PathBuf],
         policy: &PermissionPolicyLayer,
     ) -> Self {
+        let _ = std::fs::create_dir_all(session_tmp_dir);
         let mut writable_paths = vec![workspace_root.to_path_buf(), session_tmp_dir.to_path_buf()];
         let mut denied_write_paths = Vec::new();
         let mut denied_read_paths = Vec::new();
-        let mut allowed_read_paths = Vec::new();
+        let mut allowed_read_paths =
+            vec![workspace_root.to_path_buf(), session_tmp_dir.to_path_buf()];
         for extra in extra_tmp_dirs {
+            let _ = std::fs::create_dir_all(extra);
             if !writable_paths.contains(extra) {
                 writable_paths.push(extra.clone());
             }

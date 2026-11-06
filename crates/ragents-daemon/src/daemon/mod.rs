@@ -614,6 +614,7 @@ impl AgentDaemon {
                 workspace_root: workspace_root.clone(),
                 norm_workspace_key: norm_ws_key,
                 session_tmp_dir: session_tmp_dir.clone(),
+                extra_tmp_dirs: extra_tmp_dirs.clone(),
                 effective_config: effective_config.clone(),
                 effective_permission: effective_permission.clone(),
                 effective_policy: runtime_permissions.clone(),

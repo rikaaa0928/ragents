@@ -14,24 +14,43 @@ pub fn evaluate_capability_policy(
     session_tmp_dir: &Path,
     capability: &CapabilityRequest,
 ) -> PolicyEvalResult {
+    evaluate_capability_policy_with_extra_tmp(
+        policy,
+        workspace_root,
+        session_tmp_dir,
+        &[],
+        capability,
+    )
+}
+
+pub fn evaluate_capability_policy_with_extra_tmp(
+    policy: &PermissionPolicyLayer,
+    workspace_root: &Path,
+    session_tmp_dir: &Path,
+    extra_tmp_dirs: &[PathBuf],
+    capability: &CapabilityRequest,
+) -> PolicyEvalResult {
     match capability {
         CapabilityRequest::FileRead { path } => evaluate_path_rules(
             policy.file_read.as_ref(),
             path,
             workspace_root,
             session_tmp_dir,
+            extra_tmp_dirs,
         ),
         CapabilityRequest::FileWrite { path } => evaluate_path_rules(
             policy.file_write.as_ref(),
             path,
             workspace_root,
             session_tmp_dir,
+            extra_tmp_dirs,
         ),
         CapabilityRequest::CommandWorkDir { work_dir } => evaluate_path_rules(
             policy.command_work_dir.as_ref(),
             work_dir,
             workspace_root,
             session_tmp_dir,
+            extra_tmp_dirs,
         ),
         CapabilityRequest::Http { host, .. } => {
             if let Some(ref rules) = policy.http_hosts {
@@ -63,6 +82,7 @@ fn evaluate_path_rules(
     target_path: &Path,
     workspace_root: &Path,
     session_tmp_dir: &Path,
+    extra_tmp_dirs: &[PathBuf],
 ) -> PolicyEvalResult {
     let norm_target = normalize_path(target_path, workspace_root);
     let norm_ws = normalize_path(workspace_root, workspace_root);
@@ -73,8 +93,10 @@ fn evaluate_path_rules(
     let is_default_safe = !require_exact
         && (norm_target.starts_with(&norm_ws)
             || norm_target.starts_with(&norm_tmp)
-            || norm_target.starts_with(Path::new("/tmp"))
-            || norm_target.starts_with(Path::new("/private/tmp")));
+            || extra_tmp_dirs.iter().any(|d| {
+                let norm_extra = normalize_path(d, workspace_root);
+                norm_target.starts_with(&norm_extra)
+            }));
 
     if let Some(rule_set) = rules {
         if let Some(ref denies) = rule_set.deny {

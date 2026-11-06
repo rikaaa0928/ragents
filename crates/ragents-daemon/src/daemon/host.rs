@@ -1,5 +1,7 @@
 use crate::interceptors::DaemonInterceptorChain;
-use crate::permission::{capability_covered_by, evaluate_capability_policy, PolicyEvalResult};
+use crate::permission::{
+    capability_covered_by, evaluate_capability_policy_with_extra_tmp, PolicyEvalResult,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use openresponses_rust::{Item, MessageContent, Usage};
@@ -87,6 +89,7 @@ pub(crate) struct DaemonCoreHost {
     pub(crate) workspace_root: PathBuf,
     pub(crate) norm_workspace_key: PathBuf,
     pub(crate) session_tmp_dir: PathBuf,
+    pub(crate) extra_tmp_dirs: Vec<PathBuf>,
     pub(crate) effective_config: ConfigRevision,
     pub(crate) effective_permission: PermissionSnapshot,
     pub(crate) effective_policy: PermissionPolicyLayer,
@@ -397,19 +400,21 @@ impl CoreHost for DaemonCoreHost {
         }
 
         let eval = forced_eval.unwrap_or_else(|| {
-            let primary = evaluate_capability_policy(
+            let primary = evaluate_capability_policy_with_extra_tmp(
                 &self.effective_policy,
                 &self.workspace_root,
                 &self.session_tmp_dir,
+                &self.extra_tmp_dirs,
                 &capability,
             );
             if primary == PolicyEvalResult::Ask {
                 if let Some(ref orig) = original_path {
                     let exact_cap = capability.with_override_path(Some(orig.as_path()));
-                    let exact_eval = evaluate_capability_policy(
+                    let exact_eval = evaluate_capability_policy_with_extra_tmp(
                         &self.effective_policy,
                         &self.workspace_root,
                         &self.session_tmp_dir,
+                        &self.extra_tmp_dirs,
                         &exact_cap,
                     );
                     if exact_eval != PolicyEvalResult::Ask {

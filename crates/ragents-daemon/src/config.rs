@@ -767,7 +767,7 @@ pub fn merge_permission_layers(
 }
 
 /// Ensures `command_work_dir`, `file_read`, and `file_write` always include the session's
-/// working directory (`"."`) and `"/tmp"` in their default allowlist.
+/// working directory (`"."`) in their default allowlist.
 pub fn ensure_builtin_path_whitelist(policy: &mut PermissionPolicyLayer) {
     for slot in [
         &mut policy.file_read,
@@ -781,7 +781,7 @@ pub fn ensure_builtin_path_whitelist(policy: &mut PermissionPolicyLayer) {
         });
         let allow_list = rules.allow.get_or_insert_with(Vec::new);
         if !allow_list.iter().any(|p| p == "*") {
-            for builtin in [".", "/tmp"] {
+            for builtin in ["."] {
                 if !allow_list.iter().any(|p| p == builtin) {
                     allow_list.push(builtin.to_string());
                 }
