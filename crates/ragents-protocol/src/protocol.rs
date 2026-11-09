@@ -284,13 +284,7 @@ pub enum NodeFsOp {
     ReadFile {
         rel_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        offset: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<usize>,
-    },
-    WriteTempFile {
-        rel_path: String,
-        data_base64: String,
     },
     UploadFileToHttp {
         rel_path: String,
@@ -341,8 +335,6 @@ pub struct NodeFsResponse {
     pub agent_path: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<NodeFsEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
