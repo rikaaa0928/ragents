@@ -43,6 +43,7 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
         NodeFsOp::ReadFile { rel_path, .. } => rel_path.as_str(),
         NodeFsOp::WriteTempFile { rel_path, .. } => rel_path.as_str(),
         NodeFsOp::UploadFileToHttp { rel_path, .. } => rel_path.as_str(),
+        NodeFsOp::DownloadFileFromHttp { rel_path, .. } => rel_path.as_str(),
     };
 
     let clean_rel = match sanitize_rel_path(raw_rel) {
@@ -529,6 +530,184 @@ pub fn execute_node_fs_request(config: &DaemonConfig, req: NodeFsRequest) -> Nod
                 agent_path,
                 size: Some(total_size),
                 mime_type: Some(mime_type),
+                ..Default::default()
+            }
+        }
+        NodeFsOp::DownloadFileFromHttp {
+            download_url,
+            download_token,
+            expected_size,
+            ..
+        } => {
+            if req.zone != NodeFsZone::Tmp {
+                return NodeFsResponse {
+                    ok: false,
+                    error: Some(
+                        "DownloadFileFromHttp is only permitted in the temporary directory zone"
+                            .to_string(),
+                    ),
+                    root_dir: root_dir.to_string_lossy().to_string(),
+                    resolved_rel_path: clean_rel_str,
+                    agent_path,
+                    ..Default::default()
+                };
+            }
+
+            if clean_rel.as_os_str().is_empty() {
+                return NodeFsResponse {
+                    ok: false,
+                    error: Some("relative file path cannot be empty".to_string()),
+                    root_dir: root_dir.to_string_lossy().to_string(),
+                    resolved_rel_path: clean_rel_str,
+                    agent_path,
+                    ..Default::default()
+                };
+            }
+
+            if let Some(parent) = target_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return NodeFsResponse {
+                        ok: false,
+                        error: Some(format!("failed to create parent dir: {e}")),
+                        root_dir: root_dir.to_string_lossy().to_string(),
+                        resolved_rel_path: clean_rel_str,
+                        agent_path,
+                        ..Default::default()
+                    };
+                }
+                if let Err(err) = verify_within_root(&root_dir, parent) {
+                    return NodeFsResponse {
+                        ok: false,
+                        error: Some(err),
+                        root_dir: root_dir.to_string_lossy().to_string(),
+                        resolved_rel_path: clean_rel_str,
+                        agent_path,
+                        ..Default::default()
+                    };
+                }
+            }
+
+            let target_for_dl = target_path.clone();
+            tokio::spawn(async move {
+                use futures::StreamExt;
+                use tokio::io::AsyncWriteExt;
+
+                let client = reqwest::Client::builder()
+                    .tcp_keepalive(std::time::Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+
+                let part_path = target_for_dl.with_extension(format!(
+                    "part.{}",
+                    uuid::Uuid::now_v7().simple()
+                ));
+
+                let mut last_err = String::new();
+                let mut success = false;
+
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64))
+                            .await;
+                    }
+                    let mut rb = client.get(&download_url);
+                    if let Some(ref tok) = download_token {
+                        rb = rb.header("x-distribute-token", tok);
+                    }
+                    let resp = match rb.send().await {
+                        Ok(r) if r.status().is_success() => r,
+                        Ok(r) => {
+                            last_err = format!("HTTP {}", r.status());
+                            continue;
+                        }
+                        Err(e) => {
+                            last_err = e.to_string();
+                            continue;
+                        }
+                    };
+
+                    let mut file = match tokio::fs::File::create(&part_path).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            last_err = e.to_string();
+                            break;
+                        }
+                    };
+
+                    let mut stream = resp.bytes_stream();
+                    let mut received = 0u64;
+                    let mut stream_ok = true;
+                    while let Some(chunk_res) = stream.next().await {
+                        match chunk_res {
+                            Ok(chunk) => {
+                                if let Err(e) = file.write_all(&chunk).await {
+                                    last_err = e.to_string();
+                                    stream_ok = false;
+                                    break;
+                                }
+                                received += chunk.len() as u64;
+                            }
+                            Err(e) => {
+                                last_err = e.to_string();
+                                stream_ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    let _ = file.flush().await;
+                    drop(file);
+
+                    if !stream_ok {
+                        let _ = tokio::fs::remove_file(&part_path).await;
+                        continue;
+                    }
+                    if let Some(exp) = expected_size {
+                        if received != exp {
+                            last_err =
+                                format!("size mismatch: received {received}, expected {exp}");
+                            let _ = tokio::fs::remove_file(&part_path).await;
+                            continue;
+                        }
+                    }
+
+                    if let Err(e) = tokio::fs::rename(&part_path, &target_for_dl).await {
+                        last_err = e.to_string();
+                        let _ = tokio::fs::remove_file(&part_path).await;
+                        break;
+                    }
+
+                    success = true;
+                    break;
+                }
+
+                if success {
+                    let complete_url = format!("{download_url}?complete=1");
+                    let mut rb = client.post(&complete_url).header("content-length", "0");
+                    if let Some(ref tok) = download_token {
+                        rb = rb.header("x-distribute-token", tok);
+                    }
+                    let _ = rb.send().await;
+                } else {
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    let fail_url = format!("{download_url}?failed=1");
+                    let mut rb = client
+                        .post(&fail_url)
+                        .header("content-type", "text/plain; charset=utf-8")
+                        .body(last_err);
+                    if let Some(ref tok) = download_token {
+                        rb = rb.header("x-distribute-token", tok);
+                    }
+                    let _ = rb.send().await;
+                }
+            });
+
+            NodeFsResponse {
+                ok: true,
+                root_dir: root_dir.to_string_lossy().to_string(),
+                resolved_rel_path: clean_rel_str,
+                agent_path,
+                size: expected_size,
                 ..Default::default()
             }
         }

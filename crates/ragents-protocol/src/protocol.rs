@@ -298,6 +298,14 @@ pub enum NodeFsOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         upload_token: Option<String>,
     },
+    DownloadFileFromHttp {
+        rel_path: String,
+        download_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        download_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_size: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
