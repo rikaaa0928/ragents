@@ -217,6 +217,7 @@ async fn test_in_process_executor_with_wasm_file_editor_extension() {
             enabled: true,
             config: serde_json::json!({}),
             allowed_dirs: vec![],
+            filter_env: vec![],
         }],
     );
 
@@ -308,6 +309,7 @@ async fn test_subprocess_executor_with_wasm_file_editor_extension() {
             enabled: true,
             config: serde_json::json!({}),
             allowed_dirs: vec![],
+            filter_env: vec![],
         }],
     );
 
@@ -549,6 +551,7 @@ async fn test_multi_directory_auto_permission_escalation_loop_in_single_shell_ca
             enabled: true,
             config: serde_json::json!({}),
             allowed_dirs: vec![],
+            filter_env: vec![],
         }],
     );
 
@@ -713,6 +716,7 @@ async fn test_wasm_external_file_dynamic_mount_and_http_fetch_permission_unifica
                 enabled: true,
                 config: serde_json::json!({}),
                 allowed_dirs: vec![],
+                filter_env: vec![],
             },
             ExtensionSpec {
                 name: "file_editor".to_string(),
@@ -720,6 +724,7 @@ async fn test_wasm_external_file_dynamic_mount_and_http_fetch_permission_unifica
                 enabled: true,
                 config: serde_json::json!({}),
                 allowed_dirs: vec![],
+                filter_env: vec![],
             },
         ],
     );
@@ -973,6 +978,7 @@ async fn test_blocking_shell_timeout_preserves_partial_output_and_kills_process_
             enabled: true,
             config: serde_json::json!({}),
             allowed_dirs: vec![],
+            filter_env: vec![],
         }],
     );
 
@@ -1151,6 +1157,7 @@ async fn test_file_editor_pagination_non_overlapping_edits_and_shell_output_trun
                 enabled: true,
                 config: serde_json::json!({}),
                 allowed_dirs: vec![],
+                filter_env: vec![],
             },
             ExtensionSpec {
                 name: "shell".to_string(),
@@ -1158,6 +1165,7 @@ async fn test_file_editor_pagination_non_overlapping_edits_and_shell_output_trun
                 enabled: true,
                 config: serde_json::json!({}),
                 allowed_dirs: vec![],
+                filter_env: vec![],
             },
         ],
     );
@@ -1432,6 +1440,7 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
                 enabled: true,
                 config: serde_json::json!({}),
                 allowed_dirs: vec![],
+                filter_env: vec![],
             },
             ExtensionSpec {
                 name: "skills".to_string(),
@@ -1442,6 +1451,7 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
                     "skill_dirs": [&ext_skills_str],
                 }),
                 allowed_dirs: vec![ext_skills_str],
+                filter_env: vec![],
             },
         ],
     );
@@ -1599,5 +1609,55 @@ fn test_setuid_and_system_bin_per_command_sandbox_authorization() {
 
         let _ = std::fs::remove_dir_all(&base_tmp);
     }
+}
+
+#[tokio::test]
+async fn test_extension_filter_env_strips_secrets_from_session_execution() {
+    assert!(crate::sandbox::env_key_matches_glob("MY_EXT_*", "MY_EXT_SECRET_KEY"));
+    assert!(crate::sandbox::env_key_matches_glob("*_API_TOKEN", "FOO_API_TOKEN"));
+    assert!(!crate::sandbox::env_key_matches_glob("MY_EXT_*", "OTHER_SECRET"));
+
+    std::env::set_var("RAGENTS_TEST_EXT_SECRET", "top_secret_val_1");
+    std::env::set_var("RAGENTS_TEST_GLOB_KEY", "top_secret_val_2");
+    std::env::set_var("RAGENTS_TEST_PUBLIC_VAR", "visible_val");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ConfigRevision::new_merged(
+        "sys".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![ExtensionSpec {
+            name: "shell".to_string(),
+            path: String::new(),
+            enabled: true,
+            config: serde_json::json!({}),
+            allowed_dirs: vec![],
+            filter_env: vec![
+                "RAGENTS_TEST_EXT_SECRET".to_string(),
+                "RAGENTS_TEST_GLOB_*".to_string(),
+            ],
+        }],
+    );
+    let run_spec = CoreRunSpec {
+        session_id: SessionId::new("sess_env_filter"),
+        activation_id: ActivationId::new("act_env_filter"),
+        workspace_root: tmp.path().to_path_buf(),
+        session_tmp_dir: tmp.path().join("tmp"),
+        extra_tmp_dirs: vec![],
+        effective_config: cfg,
+        effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
+        model_endpoint: ModelEndpointConfig::default(),
+        max_turns: None,
+    };
+    let sandbox = crate::sandbox::SandboxState::from_run_spec(&run_spec);
+    let out = sandbox
+        .execute_command(
+            tmp.path(),
+            "printf 'SEC=%s|GLOB=%s|PUB=%s' \"$RAGENTS_TEST_EXT_SECRET\" \"$RAGENTS_TEST_GLOB_KEY\" \"$RAGENTS_TEST_PUBLIC_VAR\"",
+            5000,
+        )
+        .await;
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "SEC=|GLOB=|PUB=visible_val");
 }
 

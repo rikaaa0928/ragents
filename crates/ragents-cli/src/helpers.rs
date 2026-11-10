@@ -75,6 +75,7 @@ pub(crate) fn parse_extension_specs(raw_exts: &[String]) -> Result<Vec<Extension
             enabled: true,
             config,
             allowed_dirs,
+            filter_env: Vec::new(),
         });
     }
     Ok(specs)

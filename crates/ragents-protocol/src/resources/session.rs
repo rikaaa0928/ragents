@@ -171,6 +171,23 @@ pub struct ExtensionSpec {
     pub config: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_dirs: Vec<String>,
+    /// Environment variable names or `*` glob patterns (e.g. `["MY_EXT_SECRET", "CUSTOM_TOKEN_*"]`)
+    /// to strip when starting `ragents-core` (and shell child processes) to execute a session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter_env: Vec<String>,
+}
+
+impl Default for ExtensionSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            path: String::new(),
+            enabled: true,
+            config: empty_json_object(),
+            allowed_dirs: Vec::new(),
+            filter_env: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

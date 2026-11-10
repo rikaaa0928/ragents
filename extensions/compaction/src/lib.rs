@@ -10,12 +10,13 @@ wit_bindgen::generate!({
 
 const COMPACTION_SUMMARY_PREFIX: &str = "[Compaction Summary]";
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
+const MAX_TRACKED_FILES_PER_LIST: usize = 60;
 
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
-const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this exact structure:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this exact structure:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise (total summary under ~2,000 words). Preserve exact file paths, function names, and error messages.";
 
-const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact file paths, function names, and error messages\n- If something is no longer relevant, you may remove it\n\nUse this exact structure:\n\n## Goal\n[Preserve existing goals, add new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND newly completed items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- [Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE active goals, constraints, key architectural decisions, and critical context from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- CONSOLIDATE older \"Done\" items into concise high-level milestones and PRUNE obsolete/superseded details so the summary stays compact (under ~2,000 words total) and does NOT grow unboundedly across multiple compactions\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact file paths, function names, and error messages relevant to ongoing work\n\nUse this exact structure:\n\n## Goal\n[Preserve active goals, add new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones discovered]\n\n## Progress\n### Done\n- [x] [Consolidated completed milestones and newly completed items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (keep active decisions, prune superseded ones)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- [Preserve important context, add new if needed]\n\nKeep each section concise (under ~2,000 words total). Preserve exact file paths, function names, and error messages.";
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the early part of a turn that was too large to keep. The (more recent)Suffix of this turn is retained in the conversation.\n\nSummarize this prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent messages]\n\nBe concise. Preserve exact file paths, function names, and error messages.";
 
@@ -345,14 +346,19 @@ fn extract_file_ops_from_items(items: &[Value], ops: &mut FileOps) {
 }
 
 fn compute_file_lists(ops: &FileOps) -> (Vec<String>, Vec<String>) {
-    let modified: BTreeSet<String> = ops.edited.union(&ops.written).cloned().collect();
+    let modified_set: BTreeSet<String> = ops.edited.union(&ops.written).cloned().collect();
     let read_only: Vec<String> = ops
         .read
         .iter()
-        .filter(|p| !modified.contains(*p))
+        .filter(|p| !modified_set.contains(*p))
+        .take(MAX_TRACKED_FILES_PER_LIST)
         .cloned()
         .collect();
-    (read_only, modified.into_iter().collect())
+    let modified: Vec<String> = modified_set
+        .into_iter()
+        .take(MAX_TRACKED_FILES_PER_LIST)
+        .collect();
+    (read_only, modified)
 }
 
 fn truncate_for_summary(text: &str, max_chars: usize) -> String {

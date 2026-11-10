@@ -479,6 +479,7 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
         enabled: true,
         config: serde_json::json!({}),
         allowed_dirs: vec![],
+        filter_env: vec![],
     });
 
     struct BgTestBackend {
@@ -1074,6 +1075,7 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
             enabled: true,
             config: serde_json::json!({}),
             allowed_dirs: vec![],
+            filter_env: vec![],
         },
         ExtensionSpec {
             name: "compaction".into(),
@@ -1085,6 +1087,7 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
                 "keep_recent_tokens": 25
             }),
             allowed_dirs: vec![],
+            filter_env: vec![],
         },
     ];
 
@@ -1399,6 +1402,7 @@ async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
         enabled: true,
         config: serde_json::json!({}),
         allowed_dirs: vec![],
+        filter_env: vec![],
     }];
 
     let daemon = AgentDaemon::new(cfg).with_model_backend(Arc::new(ReconnectTestBackend {
@@ -1880,6 +1884,7 @@ async fn test_four_segment_system_prompt_ssot_permissions_and_disabled_tools() {
             enabled: true,
             config: serde_json::json!({}),
             allowed_dirs: vec![],
+            filter_env: vec![],
         },
         ExtensionSpec {
             name: "file_editor".to_string(),
@@ -1887,6 +1892,7 @@ async fn test_four_segment_system_prompt_ssot_permissions_and_disabled_tools() {
             enabled: true,
             config: serde_json::json!({}),
             allowed_dirs: vec![],
+            filter_env: vec![],
         },
     ];
 

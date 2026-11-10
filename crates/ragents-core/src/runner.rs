@@ -302,6 +302,9 @@ impl CoreExecutor for InProcessExecutor {
                     sandbox_state.clone(),
                 )
                 .await?;
+                if !plugin.metadata().filter_env.is_empty() {
+                    sandbox_state.add_filtered_env(&plugin.metadata().filter_env);
+                }
                 hook_manager.add_plugin_with_config(plugin, ext.config.clone())?;
             }
         }

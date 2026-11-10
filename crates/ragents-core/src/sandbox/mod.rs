@@ -56,17 +56,22 @@ pub struct SandboxState {
     denied_write_paths: Mutex<Vec<PathBuf>>,
     denied_read_paths: Mutex<Vec<PathBuf>>,
     allowed_read_paths: Mutex<Vec<PathBuf>>,
+    filtered_env: Mutex<Vec<String>>,
 }
 
 impl SandboxState {
     pub fn from_run_spec(run_spec: &CoreRunSpec) -> Self {
-        Self::from_policy_with_extra_tmp(
+        let state = Self::from_policy_with_extra_tmp(
             SandboxMode::Auto,
             &run_spec.workspace_root,
             &run_spec.session_tmp_dir,
             &run_spec.extra_tmp_dirs,
             &run_spec.effective_permissions,
-        )
+        );
+        for ext in &run_spec.effective_config.extensions {
+            state.add_filtered_env(&ext.filter_env);
+        }
+        state
     }
 
     pub fn from_policy(
@@ -190,6 +195,17 @@ impl SandboxState {
             denied_write_paths: Mutex::new(denied_write_paths),
             denied_read_paths: Mutex::new(denied_read_paths),
             allowed_read_paths: Mutex::new(allowed_read_paths),
+            filtered_env: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn add_filtered_env(&self, patterns: &[String]) {
+        let mut guard = self.filtered_env.lock().expect("filtered_env poisoned");
+        for pat in patterns {
+            let trimmed = pat.trim();
+            if !trimmed.is_empty() && !guard.iter().any(|existing| existing == trimmed) {
+                guard.push(trimmed.to_string());
+            }
         }
     }
 
@@ -545,7 +561,15 @@ impl SandboxState {
             .env("TMP", hermetic_tmp)
             .env("TEMP", hermetic_tmp)
             .env_remove("RAGENTS_API_KEY")
+            .env_remove("RAGENTS_AUTH_TOKEN")
             .kill_on_drop(true);
+
+        let filtered = self
+            .filtered_env
+            .lock()
+            .expect("filtered_env poisoned")
+            .clone();
+        apply_filtered_env_to_command(&mut cmd, &filtered);
 
         Ok(cmd)
     }
@@ -872,4 +896,58 @@ fn command_error(error: impl ToString) -> CommandOutput {
         stderr: String::new(),
         error: Some(error.to_string()),
     }
+}
+
+/// Removes environment variables matching `patterns` (supporting exact names like `"MY_SECRET_KEY"`
+/// as well as `*` glob patterns like `"MY_EXT_*"` or `"*_TOKEN"`) from `cmd`.
+pub fn apply_filtered_env_to_command(cmd: &mut tokio::process::Command, patterns: &[String]) {
+    if patterns.is_empty() {
+        return;
+    }
+    let current_env_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+    for raw_pat in patterns {
+        let pat = raw_pat.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        if pat.contains('*') {
+            for key in &current_env_keys {
+                if env_key_matches_glob(pat, key) {
+                    cmd.env_remove(key);
+                }
+            }
+        } else {
+            cmd.env_remove(pat);
+        }
+    }
+}
+
+pub fn env_key_matches_glob(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let mut rem = text;
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if idx == 0 {
+            let Some(rest) = rem.strip_prefix(part) else {
+                return false;
+            };
+            rem = rest;
+        } else if idx == parts.len() - 1 {
+            return rem.ends_with(part);
+        } else {
+            let Some(pos) = rem.find(part) else {
+                return false;
+            };
+            rem = &rem[pos + part.len()..];
+        }
+    }
+    true
 }

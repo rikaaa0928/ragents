@@ -760,6 +760,11 @@ impl DaemonConfig {
                         merged.allowed_dirs.push(dir.clone());
                     }
                 }
+                for env_pat in &existing.filter_env {
+                    if !merged.filter_env.contains(env_pat) {
+                        merged.filter_env.push(env_pat.clone());
+                    }
+                }
                 let is_empty_cfg = merged.config.is_null()
                     || merged
                         .config

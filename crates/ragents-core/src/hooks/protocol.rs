@@ -44,6 +44,8 @@ pub struct ExtensionMetadata {
     pub version: String,
     #[serde(default)]
     pub subscriptions: Vec<HookSubscription>,
+    #[serde(default)]
+    pub filter_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

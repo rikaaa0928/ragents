@@ -302,7 +302,11 @@ impl CoreExecutor for SubprocessExecutor {
             .arg(&ipc_token)
             .current_dir(&run_spec.workspace_root)
             .env_remove("RAGENTS_API_KEY")
+            .env_remove("RAGENTS_AUTH_TOKEN")
             .kill_on_drop(true);
+        for ext in &run_spec.effective_config.extensions {
+            crate::sandbox::apply_filtered_env_to_command(&mut cmd, &ext.filter_env);
+        }
         #[cfg(unix)]
         {
             cmd.process_group(0);
