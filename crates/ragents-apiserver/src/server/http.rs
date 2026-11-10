@@ -1,6 +1,5 @@
 use super::{ApiError, ApiServerState};
-use crate::extensions::labels_match_selector;
-use crate::store::{SqliteStore, StoreError};
+use crate::store::StoreError;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -9,33 +8,18 @@ use axum::{
 };
 use futures::Stream;
 use ragents_protocol::*;
-use std::{collections::BTreeMap, convert::Infallible};
+use std::convert::Infallible;
 use tokio::sync::mpsc;
 
 pub(crate) async fn handle_list_nodes(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<Node>>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(AuthScope::ClientHttp, "GET", "/api/v1/nodes", &headers)
         .await?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::List,
-            ResourceKind::Node,
-            None,
-            &BTreeMap::new(),
-        )
-        .await?;
-    let nodes = state
-        .store
-        .list_nodes()?
-        .into_iter()
-        .filter(|n| labels_match_selector(&n.metadata.labels, &selector))
-        .collect();
+    let nodes = state.store.list_nodes()?;
     Ok(Json(nodes))
 }
 
@@ -44,7 +28,7 @@ pub(crate) async fn handle_get_node(
     headers: HeaderMap,
     Path(node_id): Path<String>,
 ) -> Result<Json<Node>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -53,27 +37,11 @@ pub(crate) async fn handle_get_node(
             &headers,
         )
         .await?;
-    let id = NodeId::new(node_id.clone());
+    let id = NodeId::new(node_id);
     let node = state
         .store
         .get_node(&id)?
         .ok_or_else(|| StoreError::NotFound(format!("node {id}")))?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Get,
-            ResourceKind::Node,
-            Some(&node_id),
-            &node.metadata.labels,
-        )
-        .await?;
-    if !labels_match_selector(&node.metadata.labels, &selector) {
-        return Err(ApiError::Http(
-            StatusCode::FORBIDDEN,
-            "Forbidden by label selector".into(),
-        ));
-    }
     Ok(Json(node))
 }
 
@@ -83,7 +51,7 @@ pub(crate) async fn handle_patch_node(
     Path(node_id): Path<String>,
     Json(patch): Json<PatchNodeSpecRequest>,
 ) -> Result<Json<Node>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -92,67 +60,31 @@ pub(crate) async fn handle_patch_node(
             &headers,
         )
         .await?;
-    let id = NodeId::new(node_id.clone());
-    let existing = state
-        .store
-        .get_node(&id)?
-        .ok_or_else(|| StoreError::NotFound(format!("node {id}")))?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Patch,
-            ResourceKind::Node,
-            Some(&node_id),
-            &existing.metadata.labels,
-        )
-        .await?;
-    if !labels_match_selector(&existing.metadata.labels, &selector) {
-        return Err(ApiError::Http(
-            StatusCode::FORBIDDEN,
-            "Forbidden by label selector".into(),
-        ));
-    }
+    let id = NodeId::new(node_id);
     let updated = state.store.patch_node(&id, patch)?;
     Ok(Json(updated))
 }
 
-pub(crate) async fn handle_node_fs_query(
+pub(crate) async fn handle_node_extension_call(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Path(node_id): Path<String>,
-    Json(req): Json<NodeFsRequest>,
-) -> Result<Json<NodeFsResponse>, ApiError> {
-    let principal = state
+    Json(req): Json<NodeExtensionCallRequest>,
+) -> Result<Json<NodeExtensionCallResponse>, ApiError> {
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
             "POST",
-            &format!("/api/v1/nodes/{node_id}/fs"),
+            &format!("/api/v1/nodes/{node_id}/extensions/call"),
             &headers,
         )
         .await?;
-    let id = NodeId::new(node_id.clone());
-    let node = state
+    let id = NodeId::new(node_id);
+    let _node = state
         .store
         .get_node(&id)?
         .ok_or_else(|| StoreError::NotFound(format!("node {id}")))?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Get,
-            ResourceKind::Node,
-            Some(&node_id),
-            &node.metadata.labels,
-        )
-        .await?;
-    if !labels_match_selector(&node.metadata.labels, &selector) {
-        return Err(ApiError::Http(
-            StatusCode::FORBIDDEN,
-            "Forbidden by label selector".into(),
-        ));
-    }
 
     let maybe_tx = state
         .daemon_peers
@@ -161,56 +93,56 @@ pub(crate) async fn handle_node_fs_query(
         .get(&id)
         .cloned();
     let Some(daemon_tx) = maybe_tx else {
-        return Ok(Json(NodeFsResponse {
+        return Ok(Json(NodeExtensionCallResponse {
             ok: false,
             error: Some(format!("Node '{id}' is currently offline / not connected")),
             ..Default::default()
         }));
     };
 
-    let request_id = format!("fsreq_{}", uuid::Uuid::now_v7());
+    let request_id = format!("extreq_{}", uuid::Uuid::now_v7());
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
-        .pending_node_fs
+        .pending_node_ext
         .lock()
-        .expect("pending_node_fs mutex poisoned")
+        .expect("pending_node_ext mutex poisoned")
         .insert(request_id.clone(), tx);
 
     if daemon_tx
-        .send(ServerToDaemonMessage::NodeFsQuery {
+        .send(ServerToDaemonMessage::NodeExtensionCall {
             request_id: request_id.clone(),
             request: req,
         })
         .is_err()
     {
         state
-            .pending_node_fs
+            .pending_node_ext
             .lock()
-            .expect("pending_node_fs mutex poisoned")
+            .expect("pending_node_ext mutex poisoned")
             .remove(&request_id);
-        return Ok(Json(NodeFsResponse {
+        return Ok(Json(NodeExtensionCallResponse {
             ok: false,
             error: Some(format!("Failed to send request to node '{id}' tunnel")),
             ..Default::default()
         }));
     }
 
-    match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
         Ok(Ok(resp)) => Ok(Json(resp)),
-        Ok(Err(_)) => Ok(Json(NodeFsResponse {
+        Ok(Err(_)) => Ok(Json(NodeExtensionCallResponse {
             ok: false,
-            error: Some("Node tunnel closed while waiting for file operation".to_string()),
+            error: Some("Node tunnel closed while waiting for extension call".to_string()),
             ..Default::default()
         })),
         Err(_) => {
             state
-                .pending_node_fs
+                .pending_node_ext
                 .lock()
-                .expect("pending_node_fs mutex poisoned")
+                .expect("pending_node_ext mutex poisoned")
                 .remove(&request_id);
-            Ok(Json(NodeFsResponse {
+            Ok(Json(NodeExtensionCallResponse {
                 ok: false,
-                error: Some("Node file operation timed out after 120s".to_string()),
+                error: Some("Node extension call timed out after 600s".to_string()),
                 ..Default::default()
             }))
         }
@@ -222,25 +154,11 @@ pub(crate) async fn handle_create_session(
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(AuthScope::ClientHttp, "POST", "/api/v1/sessions", &headers)
         .await?;
-    state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Create,
-            ResourceKind::Session,
-            req.session_id.as_ref().map(|s| s.as_str()),
-            &req.labels,
-        )
-        .await?;
-    let admitted = state
-        .extensions
-        .admit(&principal, AdmissionOperation::CreateSession, req)
-        .await?;
-    let (resp, _) = state.store.create_session(admitted)?;
+    let (resp, _) = state.store.create_session(req)?;
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -248,26 +166,11 @@ pub(crate) async fn handle_list_sessions(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<Session>>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(AuthScope::ClientHttp, "GET", "/api/v1/sessions", &headers)
         .await?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::List,
-            ResourceKind::Session,
-            None,
-            &BTreeMap::new(),
-        )
-        .await?;
-    let sessions = state
-        .store
-        .list_sessions()?
-        .into_iter()
-        .filter(|s| labels_match_selector(&s.metadata.labels, &selector))
-        .collect();
+    let sessions = state.store.list_sessions()?;
     Ok(Json(sessions))
 }
 
@@ -276,7 +179,7 @@ pub(crate) async fn handle_get_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<Session>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -285,27 +188,11 @@ pub(crate) async fn handle_get_session(
             &headers,
         )
         .await?;
-    let id = SessionId::new(session_id.clone());
+    let id = SessionId::new(session_id);
     let session = state
         .store
         .get_session(&id)?
         .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Get,
-            ResourceKind::Session,
-            Some(&session_id),
-            &session.metadata.labels,
-        )
-        .await?;
-    if !labels_match_selector(&session.metadata.labels, &selector) {
-        return Err(ApiError::Http(
-            StatusCode::FORBIDDEN,
-            "Forbidden by tenant label selector".into(),
-        ));
-    }
     Ok(Json(session))
 }
 
@@ -315,7 +202,7 @@ pub(crate) async fn handle_patch_session(
     Path(session_id): Path<String>,
     Json(patch): Json<PatchSessionSpecRequest>,
 ) -> Result<Json<Session>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -324,32 +211,8 @@ pub(crate) async fn handle_patch_session(
             &headers,
         )
         .await?;
-    let id = SessionId::new(session_id.clone());
-    let existing = state
-        .store
-        .get_session(&id)?
-        .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Patch,
-            ResourceKind::Session,
-            Some(&session_id),
-            &existing.metadata.labels,
-        )
-        .await?;
-    if !labels_match_selector(&existing.metadata.labels, &selector) {
-        return Err(ApiError::Http(
-            StatusCode::FORBIDDEN,
-            "Forbidden by tenant label selector".into(),
-        ));
-    }
-    let admitted = state
-        .extensions
-        .admit(&principal, AdmissionOperation::PatchSession, patch)
-        .await?;
-    let session = state.store.patch_session(&id, admitted)?;
+    let id = SessionId::new(session_id);
+    let session = state.store.patch_session(&id, patch)?;
     Ok(Json(session))
 }
 
@@ -358,7 +221,7 @@ pub(crate) async fn handle_get_session_context(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionContextResponse>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -367,27 +230,11 @@ pub(crate) async fn handle_get_session_context(
             &headers,
         )
         .await?;
-    let id = SessionId::new(session_id.clone());
-    let existing = state
+    let id = SessionId::new(session_id);
+    let _existing = state
         .store
         .get_session(&id)?
         .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Get,
-            ResourceKind::Session,
-            Some(&session_id),
-            &existing.metadata.labels,
-        )
-        .await?;
-    if !labels_match_selector(&existing.metadata.labels, &selector) {
-        return Err(ApiError::Http(
-            StatusCode::FORBIDDEN,
-            "Forbidden by tenant label selector".into(),
-        ));
-    }
     let ctx = state.store.read_effective_context(&id)?;
     Ok(Json(ctx))
 }
@@ -397,7 +244,7 @@ pub(crate) async fn handle_list_session_activations(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<Vec<Activation>>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -406,27 +253,11 @@ pub(crate) async fn handle_list_session_activations(
             &headers,
         )
         .await?;
-    let id = SessionId::new(session_id.clone());
-    let existing = state
+    let id = SessionId::new(session_id);
+    let _existing = state
         .store
         .get_session(&id)?
         .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::List,
-            ResourceKind::Activation,
-            Some(&session_id),
-            &existing.metadata.labels,
-        )
-        .await?;
-    if !labels_match_selector(&existing.metadata.labels, &selector) {
-        return Err(ApiError::Http(
-            StatusCode::FORBIDDEN,
-            "Forbidden by tenant label selector".into(),
-        ));
-    }
     let activations = state.store.list_session_activations(&id)?;
     Ok(Json(activations))
 }
@@ -436,7 +267,7 @@ pub(crate) async fn handle_create_activation(
     headers: HeaderMap,
     Json(req): Json<CreateActivationRequest>,
 ) -> Result<(StatusCode, Json<Activation>), ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -445,21 +276,7 @@ pub(crate) async fn handle_create_activation(
             &headers,
         )
         .await?;
-    state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Create,
-            ResourceKind::Activation,
-            req.activation_id.as_ref().map(|a| a.as_str()),
-            &req.labels,
-        )
-        .await?;
-    let admitted = state
-        .extensions
-        .admit(&principal, AdmissionOperation::CreateActivation, req)
-        .await?;
-    let (act, _) = state.store.create_activation(admitted)?;
+    let (act, _) = state.store.create_activation(req)?;
     Ok((StatusCode::CREATED, Json(act)))
 }
 
@@ -469,7 +286,7 @@ pub(crate) async fn handle_push_realtime_message(
     Path(session_id): Path<String>,
     Json(req): Json<PushRealtimeMessageRequest>,
 ) -> Result<(StatusCode, Json<PushRealtimeMessageResponse>), ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -478,30 +295,10 @@ pub(crate) async fn handle_push_realtime_message(
             &headers,
         )
         .await?;
-    let id = SessionId::new(session_id.clone());
-    let sess = state
+    let id = SessionId::new(session_id);
+    let resp = state
         .store
-        .get_session(&id)?
-        .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
-    state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Patch,
-            ResourceKind::Session,
-            Some(&session_id),
-            &sess.metadata.labels,
-        )
-        .await?;
-    let admitted = state
-        .extensions
-        .admit(&principal, AdmissionOperation::PushRealtimeMessage, req)
-        .await?;
-    let resp = state.store.push_realtime_message_with_options(
-        &id,
-        admitted.content,
-        admitted.disabled_tools,
-    )?;
+        .push_realtime_message_with_options(&id, req.content, req.disabled_tools)?;
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -511,7 +308,7 @@ pub(crate) async fn handle_withdraw_realtime_message(
     Path(session_id): Path<String>,
     Json(req): Json<WithdrawRealtimeMessageRequest>,
 ) -> Result<Json<WithdrawRealtimeMessageResponse>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -520,21 +317,7 @@ pub(crate) async fn handle_withdraw_realtime_message(
             &headers,
         )
         .await?;
-    let id = SessionId::new(session_id.clone());
-    let sess = state
-        .store
-        .get_session(&id)?
-        .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
-    state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Patch,
-            ResourceKind::Session,
-            Some(&session_id),
-            &sess.metadata.labels,
-        )
-        .await?;
+    let id = SessionId::new(session_id);
     let resp = state.store.withdraw_realtime_messages(&id, req)?;
     Ok(Json(resp))
 }
@@ -544,7 +327,7 @@ pub(crate) async fn handle_withdraw_activation(
     headers: HeaderMap,
     Path(activation_id): Path<String>,
 ) -> Result<Json<Activation>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -553,21 +336,7 @@ pub(crate) async fn handle_withdraw_activation(
             &headers,
         )
         .await?;
-    let id = ActivationId::new(activation_id.clone());
-    let existing = state
-        .store
-        .get_activation(&id)?
-        .ok_or_else(|| StoreError::NotFound(format!("activation {id}")))?;
-    state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Patch,
-            ResourceKind::Activation,
-            Some(&activation_id),
-            &existing.metadata.labels,
-        )
-        .await?;
+    let id = ActivationId::new(activation_id);
     let act = state.store.withdraw_queued_activation(&id)?;
     Ok(Json(act))
 }
@@ -577,7 +346,7 @@ pub(crate) async fn handle_get_activation(
     headers: HeaderMap,
     Path(activation_id): Path<String>,
 ) -> Result<Json<Activation>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -586,21 +355,11 @@ pub(crate) async fn handle_get_activation(
             &headers,
         )
         .await?;
-    let id = ActivationId::new(activation_id.clone());
+    let id = ActivationId::new(activation_id);
     let act = state
         .store
         .get_activation(&id)?
         .ok_or_else(|| StoreError::NotFound(format!("activation {id}")))?;
-    state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Get,
-            ResourceKind::Activation,
-            Some(&activation_id),
-            &act.metadata.labels,
-        )
-        .await?;
     Ok(Json(act))
 }
 
@@ -610,7 +369,7 @@ pub(crate) async fn handle_patch_activation(
     Path(activation_id): Path<String>,
     Json(patch): Json<PatchActivationSpecRequest>,
 ) -> Result<Json<Activation>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
@@ -619,26 +378,8 @@ pub(crate) async fn handle_patch_activation(
             &headers,
         )
         .await?;
-    let id = ActivationId::new(activation_id.clone());
-    let existing = state
-        .store
-        .get_activation(&id)?
-        .ok_or_else(|| StoreError::NotFound(format!("activation {id}")))?;
-    state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Patch,
-            ResourceKind::Activation,
-            Some(&activation_id),
-            &existing.metadata.labels,
-        )
-        .await?;
-    let admitted = state
-        .extensions
-        .admit(&principal, AdmissionOperation::PatchActivation, patch)
-        .await?;
-    let outcome = state.store.patch_activation(&id, admitted)?;
+    let id = ActivationId::new(activation_id);
+    let outcome = state.store.patch_activation(&id, patch)?;
     Ok(Json(outcome.activation))
 }
 
@@ -647,34 +388,13 @@ pub(crate) async fn handle_read_events(
     headers: HeaderMap,
     Query(query): Query<WatchQuery>,
 ) -> Result<Json<Vec<SessionEventEnvelope>>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(AuthScope::ClientHttp, "GET", "/api/v1/events", &headers)
         .await?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Watch,
-            ResourceKind::EventStream,
-            query.session_id.as_ref().map(|s| s.as_str()),
-            &BTreeMap::new(),
-        )
-        .await?;
-    let mut events = state
+    let events = state
         .store
         .read_events_after(query.session_id.as_ref(), query.after_rv.unwrap_or(0))?;
-    if !selector.is_empty() {
-        events.retain(|ev| {
-            state
-                .store
-                .get_session(&ev.session_id)
-                .ok()
-                .flatten()
-                .map(|s| labels_match_selector(&s.metadata.labels, &selector))
-                .unwrap_or(false)
-        });
-    }
     Ok(Json(events))
 }
 
@@ -683,56 +403,26 @@ pub(crate) async fn handle_watch_events(
     headers: HeaderMap,
     Query(query): Query<WatchQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(AuthScope::ClientHttp, "GET", "/api/v1/watch", &headers)
-        .await?;
-    let selector = state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::Watch,
-            ResourceKind::EventStream,
-            query.session_id.as_ref().map(|s| s.as_str()),
-            &BTreeMap::new(),
-        )
         .await?;
     let live_rx = state.store.subscribe_events();
     let after_rv = query.after_rv.unwrap_or(0);
     let filter_session = query.session_id.clone();
 
-    let mut historical = state
+    let historical = state
         .store
         .read_events_after(filter_session.as_ref(), after_rv)?;
-    if !selector.is_empty() {
-        historical.retain(|ev| {
-            state
-                .store
-                .get_session(&ev.session_id)
-                .ok()
-                .flatten()
-                .map(|s| labels_match_selector(&s.metadata.labels, &selector))
-                .unwrap_or(false)
-        });
-    }
 
-    let stream = async_stream_events(
-        state.store.clone(),
-        historical,
-        live_rx,
-        filter_session,
-        selector,
-        after_rv,
-    );
+    let stream = async_stream_events(historical, live_rx, filter_session, after_rv);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 fn async_stream_events(
-    store: SqliteStore,
     historical: Vec<SessionEventEnvelope>,
     mut live_rx: tokio::sync::broadcast::Receiver<SessionEventEnvelope>,
     filter_session: Option<SessionId>,
-    selector: BTreeMap<String, String>,
     after_rv: u64,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let (tx, rx) = mpsc::unbounded_channel::<Result<SseEvent, Infallible>>();
@@ -763,17 +453,6 @@ fn async_stream_events(
             }
             if let Some(ref target_sess) = filter_session {
                 if &ev.session_id != target_sess {
-                    continue;
-                }
-            }
-            if !selector.is_empty() {
-                let matched = store
-                    .get_session(&ev.session_id)
-                    .ok()
-                    .flatten()
-                    .map(|s| labels_match_selector(&s.metadata.labels, &selector))
-                    .unwrap_or(false);
-                if !matched {
                     continue;
                 }
             }

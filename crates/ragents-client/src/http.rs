@@ -324,15 +324,15 @@ impl RagentsClient {
         Ok(Box::pin(mapped))
     }
 
-    pub async fn node_fs_query(
+    pub async fn node_extension_call(
         &self,
         node_id: &NodeId,
-        request: &NodeFsRequest,
-    ) -> Result<NodeFsResponse, ClientError> {
+        request: &NodeExtensionCallRequest,
+    ) -> Result<NodeExtensionCallResponse, ClientError> {
         let resp = self
             .http
             .post(format!(
-                "{}/api/v1/nodes/{}/fs",
+                "{}/api/v1/nodes/{}/extensions/call",
                 self.base_url,
                 node_id.as_str()
             ))

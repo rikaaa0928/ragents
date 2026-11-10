@@ -1,4 +1,3 @@
-pub mod fs;
 mod host;
 
 use crate::config::{DaemonConfig, ExecutorMode, LocalModelConfig};
@@ -325,23 +324,16 @@ impl AgentDaemon {
                                 );
                                 false
                             }
-                            Some(DaemonPushEvent::NodeFsQuery {
+                            Some(DaemonPushEvent::NodeExtensionCall {
                                 request_id,
                                 request,
                             }) => {
-                                let cfg_for_fs = daemon.config.clone();
-                                let tunnel_for_fs = tunnel.clone();
+                                let cfg_for_ext = daemon.config.clone();
+                                let tunnel_for_ext = tunnel.clone();
                                 tokio::spawn(async move {
-                                    let resp = tokio::task::spawn_blocking(move || {
-                                        fs::execute_node_fs_request(&cfg_for_fs, request)
-                                    })
-                                    .await
-                                    .unwrap_or_else(|e| NodeFsResponse {
-                                        ok: false,
-                                        error: Some(format!("fs worker panicked: {e}")),
-                                        ..Default::default()
-                                    });
-                                    tunnel_for_fs.send_node_fs_reply(request_id, resp);
+                                    let resp =
+                                        execute_node_extension_call(&cfg_for_ext, request).await;
+                                    tunnel_for_ext.send_node_extension_reply(request_id, resp);
                                 });
                                 false
                             }
@@ -770,3 +762,146 @@ fn policy_layer_to_capability_grants(policy: &PermissionPolicyLayer) -> Vec<Capa
     }
     grants
 }
+
+async fn execute_node_extension_call(
+    config: &DaemonConfig,
+    req: NodeExtensionCallRequest,
+) -> NodeExtensionCallResponse {
+    let raw_ext = req.extension.trim();
+    if raw_ext.is_empty() {
+        return NodeExtensionCallResponse {
+            ok: false,
+            error: Some("extension name cannot be empty".to_string()),
+            ..Default::default()
+        };
+    }
+
+    let wasm_path = config.resolve_extension_wasm_path(raw_ext);
+    if !wasm_path.is_file() {
+        return NodeExtensionCallResponse {
+            ok: false,
+            error: Some(format!(
+                "extension wasm not found at '{}'",
+                wasm_path.display()
+            )),
+            ..Default::default()
+        };
+    }
+
+    let _ = std::fs::create_dir_all(&config.temp_root_dir);
+    let mut preopen_dirs: Vec<PathBuf> = config.effective_allowed_workspace_dirs();
+    if !preopen_dirs.contains(&config.temp_root_dir) {
+        preopen_dirs.push(config.temp_root_dir.clone());
+    }
+    let sys_tmp = std::env::temp_dir();
+    if !preopen_dirs.contains(&sys_tmp) {
+        preopen_dirs.push(sys_tmp);
+    }
+
+    if let Some(arr) = req.config.get("preopen_dirs").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(dir_str) = item.as_str() {
+                let p = PathBuf::from(dir_str);
+                if let Some(create_flag) = req.config.get("create_preopen_dirs") {
+                    if create_flag.as_bool().unwrap_or(false) {
+                        let _ = std::fs::create_dir_all(&p);
+                    }
+                }
+                if config.validate_workspace_path(&p).is_ok() && !preopen_dirs.contains(&p) {
+                    preopen_dirs.push(p);
+                }
+            }
+        }
+    }
+
+    let primary_root = req
+        .config
+        .get("primary_root")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .filter(|p| config.validate_workspace_path(p).is_ok())
+        .or_else(|| preopen_dirs.first().cloned())
+        .unwrap_or_else(|| config.temp_root_dir.clone());
+
+    let plugin = match ragents_core::WasmPlugin::load_from_file_with_workspace(
+        raw_ext,
+        &wasm_path,
+        &primary_root,
+        &preopen_dirs,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return NodeExtensionCallResponse {
+                ok: false,
+                error: Some(format!("failed to instantiate extension: {e}")),
+                ..Default::default()
+            };
+        }
+    };
+
+    let mut init_cfg = match req.config {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    init_cfg.insert(
+        "node_allowed_workspace_dirs".to_string(),
+        serde_json::to_value(config.effective_allowed_workspace_dir_strings()).unwrap_or_default(),
+    );
+    init_cfg.insert(
+        "node_temp_root_dir".to_string(),
+        serde_json::Value::String(config.temp_root_dir.to_string_lossy().to_string()),
+    );
+
+    if let Err(e) = plugin
+        .initialize(&serde_json::Value::Object(init_cfg))
+        .await
+    {
+        return NodeExtensionCallResponse {
+            ok: false,
+            error: Some(format!("extension initialize failed: {e}")),
+            ..Default::default()
+        };
+    }
+
+    let hook_req = ragents_core::hooks::HookRequest {
+        hook: "node.call".to_string(),
+        protocol_version: 1,
+        invocation_id: 1,
+        iteration: None,
+        payload: req.payload,
+    };
+
+    let invoke_res = plugin.invoke(&hook_req).await;
+    let _ = plugin.shutdown().await;
+
+    match invoke_res {
+        Ok(val) => {
+            if val.get("action").and_then(|a| a.as_str()) == Some("reject") {
+                let reason = val
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("extension rejected request")
+                    .to_string();
+                return NodeExtensionCallResponse {
+                    ok: false,
+                    error: Some(reason),
+                    ..Default::default()
+                };
+            }
+            let output = val.get("payload").cloned().unwrap_or(val);
+            NodeExtensionCallResponse {
+                ok: true,
+                error: None,
+                output,
+            }
+        }
+        Err(e) => NodeExtensionCallResponse {
+            ok: false,
+            error: Some(e.to_string()),
+            ..Default::default()
+        },
+    }
+}
+

@@ -27,9 +27,9 @@ pub enum DaemonPushEvent {
     CleanupSession {
         session_id: SessionId,
     },
-    NodeFsQuery {
+    NodeExtensionCall {
         request_id: String,
-        request: NodeFsRequest,
+        request: NodeExtensionCallRequest,
     },
     Disconnected,
 }
@@ -615,12 +615,16 @@ impl DaemonTunnelHandle {
         }
     }
 
-    pub fn send_node_fs_reply(&self, request_id: String, response: NodeFsResponse) {
+    pub fn send_node_extension_reply(
+        &self,
+        request_id: String,
+        response: NodeExtensionCallResponse,
+    ) {
         let out_tx = {
             let guard = self.inner.lock().expect("tunnel mutex poisoned");
             guard.out_tx.clone()
         };
-        let _ = out_tx.send(DaemonToServerMessage::NodeFsReply {
+        let _ = out_tx.send(DaemonToServerMessage::NodeExtensionReply {
             request_id,
             response: Box::new(response),
         });
@@ -667,7 +671,7 @@ impl DaemonTunnelHandle {
             | DaemonToServerMessage::DrainRealtimeMessages { request_id, .. }
             | DaemonToServerMessage::CompleteActivation { request_id, .. }
             | DaemonToServerMessage::RolloverCompactedSession { request_id, .. }
-            | DaemonToServerMessage::NodeFsReply { request_id, .. } => request_id,
+            | DaemonToServerMessage::NodeExtensionReply { request_id, .. } => request_id,
         }
     }
 }
@@ -780,11 +784,11 @@ pub async fn connect_daemon_tunnel_with_token(
                 ServerToDaemonMessage::CleanupSession { session_id } => {
                     let _ = push_tx.send(DaemonPushEvent::CleanupSession { session_id });
                 }
-                ServerToDaemonMessage::NodeFsQuery {
+                ServerToDaemonMessage::NodeExtensionCall {
                     request_id,
                     request,
                 } => {
-                    let _ = push_tx.send(DaemonPushEvent::NodeFsQuery {
+                    let _ = push_tx.send(DaemonPushEvent::NodeExtensionCall {
                         request_id,
                         request,
                     });

@@ -21,8 +21,17 @@ impl WasiHttpView for HostState {
     fn send_request(
         &mut self,
         request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+        mut config: wasmtime_wasi_http::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+        config.connect_timeout = config
+            .connect_timeout
+            .max(std::time::Duration::from_secs(30));
+        config.first_byte_timeout = config
+            .first_byte_timeout
+            .max(std::time::Duration::from_secs(600));
+        config.between_bytes_timeout = config
+            .between_bytes_timeout
+            .max(std::time::Duration::from_secs(600));
         let core_host = self.core_host.clone();
         let plugin_name = self.plugin_name.clone();
         let scheme = if config.use_tls { "https" } else { "http" }.to_string();

@@ -7,51 +7,26 @@ use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use openresponses_rust::Item;
 use ragents_apiserver::{
-    serve_tcp, ApiServerExtensions, ApiServerState, AuthnPluginSpec, ConfiguredAuthnPlugin,
-    SqliteStore, StaticTokenAuthnPlugin, DEFAULT_LEASE_TTL_MS,
+    serve_tcp, ApiServerExtensions, ApiServerState, SqliteStore, StaticTokenAuthnPlugin,
+    DEFAULT_LEASE_TTL_MS,
 };
 use ragents_client::RagentsClient;
 use ragents_core::run_subprocess_worker;
 use ragents_daemon::{parse_workspace_dirs_csv, AgentDaemon, DaemonConfig};
 use ragents_protocol::*;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-fn build_apiserver_extensions(
-    auth_token: &Option<String>,
-    authn_wasm: Option<PathBuf>,
-    authn_config: Option<String>,
-) -> Result<ApiServerExtensions> {
+fn build_apiserver_extensions(auth_token: &Option<String>) -> ApiServerExtensions {
     let mut exts = ApiServerExtensions::new();
-    if let Some(wasm_path) = authn_wasm {
-        let cfg_val = match authn_config {
-            Some(raw) => serde_json::from_str(&raw)
-                .map_err(|e| anyhow!("invalid --authn-config JSON: {e}"))?,
-            None => match auth_token {
-                Some(tok) => serde_json::json!({ "token": tok }),
-                None => serde_json::json!({}),
-            },
-        };
-        let plugin = ConfiguredAuthnPlugin::new(AuthnPluginSpec {
-            id: "wasm-authn".to_string(),
-            driver: ExtensionDriverConfig::Wasm {
-                path: wasm_path,
-                allowed_dirs: vec![],
-            },
-            scopes: vec![AuthScope::ClientHttp, AuthScope::DaemonTunnel],
-            timeout_ms: 2000,
-            config: cfg_val,
-        });
-        exts.add_authn(Arc::new(plugin));
-    } else if let Some(ref tok) = auth_token {
+    if let Some(ref tok) = auth_token {
         if !tok.trim().is_empty() {
             exts.add_authn(Arc::new(StaticTokenAuthnPlugin::new(tok.clone())));
         }
     }
-    Ok(exts)
+    exts
 }
 
 pub async fn run_cli(cli: Cli) -> Result<()> {
@@ -72,8 +47,6 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             db,
             node_id,
             daemon_config,
-            authn_wasm,
-            authn_config,
             workdir,
             prompt,
             model,
@@ -81,7 +54,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             allowed_workspace_dirs,
         } => {
             let store = SqliteStore::open(&db)?;
-            let exts = build_apiserver_extensions(&auth_token, authn_wasm, authn_config)?;
+            let exts = build_apiserver_extensions(&auth_token);
             let state = ApiServerState::new(store, DEFAULT_LEASE_TTL_MS).with_extensions(exts);
             let cancel = CancellationToken::new();
             let listener = TcpListener::bind(&bind).await?;
@@ -183,11 +156,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             bind,
             db,
             lease_ttl_ms,
-            authn_wasm,
-            authn_config,
         } => {
             let store = SqliteStore::open(&db)?;
-            let exts = build_apiserver_extensions(&auth_token, authn_wasm, authn_config)?;
+            let exts = build_apiserver_extensions(&auth_token);
             let state = ApiServerState::new(store, lease_ttl_ms).with_extensions(exts);
             let cancel = CancellationToken::new();
             let listener = TcpListener::bind(&bind).await?;

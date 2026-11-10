@@ -31,8 +31,8 @@ pub struct ApiServerState {
     pub extensions: ApiServerExtensions,
     pub(crate) daemon_peers:
         Arc<Mutex<HashMap<NodeId, mpsc::UnboundedSender<ServerToDaemonMessage>>>>,
-    pub(crate) pending_node_fs:
-        Arc<Mutex<HashMap<String, oneshot::Sender<NodeFsResponse>>>>,
+    pub(crate) pending_node_ext:
+        Arc<Mutex<HashMap<String, oneshot::Sender<NodeExtensionCallResponse>>>>,
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -43,7 +43,7 @@ impl ApiServerState {
             lease_ttl_ms,
             extensions: ApiServerExtensions::default(),
             daemon_peers: Arc::new(Mutex::new(HashMap::new())),
-            pending_node_fs: Arc::new(Mutex::new(HashMap::new())),
+            pending_node_ext: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
         };
         state.spawn_background_workers();
@@ -163,8 +163,8 @@ pub fn build_router(state: ApiServerState) -> Router {
             get(http::handle_get_node).patch(http::handle_patch_node),
         )
         .route(
-            "/api/v1/nodes/{node_id}/fs",
-            post(http::handle_node_fs_query),
+            "/api/v1/nodes/{node_id}/extensions/call",
+            post(http::handle_node_extension_call),
         )
         .route(
             "/api/v1/sessions",

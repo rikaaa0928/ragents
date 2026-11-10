@@ -260,91 +260,29 @@ pub enum DaemonToServerMessage {
         request_id: String,
         request: Box<RolloverCompactedSessionRequest>,
     },
-    /// Daemon replies to a `NodeFsQuery` file-system inspection / temp upload request from `api-server`
-    NodeFsReply {
+    /// Daemon replies to a `NodeExtensionCall` request from `api-server`
+    NodeExtensionReply {
         request_id: String,
-        response: Box<NodeFsResponse>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeFsZone {
-    Workspace,
-    Tmp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum NodeFsOp {
-    ListDir {
-        #[serde(default)]
-        rel_path: String,
-    },
-    ReadFile {
-        rel_path: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        max_bytes: Option<usize>,
-    },
-    UploadFileToHttp {
-        rel_path: String,
-        upload_url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        upload_token: Option<String>,
-    },
-    DownloadFileFromHttp {
-        rel_path: String,
-        download_url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        download_token: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_size: Option<u64>,
+        response: Box<NodeExtensionCallResponse>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeFsRequest {
-    pub zone: NodeFsZone,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmp_dir: Option<String>,
-    pub op: NodeFsOp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeFsEntry {
-    pub name: String,
-    pub rel_path: String,
-    pub is_dir: bool,
-    pub size: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modified_at: Option<String>,
+pub struct NodeExtensionCallRequest {
+    pub extension: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
+    #[serde(default)]
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeFsResponse {
+pub struct NodeExtensionCallResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
-    pub root_dir: String,
-    #[serde(default)]
-    pub resolved_rel_path: String,
-    #[serde(default)]
-    pub agent_path: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entries: Vec<NodeFsEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    #[serde(default)]
-    pub is_text: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_preview: Option<String>,
-    #[serde(default)]
-    pub truncated: bool,
+    pub output: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -489,9 +427,9 @@ pub enum ServerToDaemonMessage {
     CleanupSession { session_id: SessionId },
     /// Server notifies daemon that a session Event was committed (useful for local observers)
     EventNotification { envelope: Box<SessionEventEnvelope> },
-    /// Server requests workspace/tmp directory listing, file preview/download, or temp file upload on this node
-    NodeFsQuery {
+    /// Server invokes a stateless WASM extension (`node.call`) on this node
+    NodeExtensionCall {
         request_id: String,
-        request: NodeFsRequest,
+        request: NodeExtensionCallRequest,
     },
 }

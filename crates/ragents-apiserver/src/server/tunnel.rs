@@ -9,7 +9,6 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use ragents_protocol::*;
-use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
 pub(crate) async fn handle_daemon_tunnel(
@@ -17,23 +16,13 @@ pub(crate) async fn handle_daemon_tunnel(
     headers: HeaderMap,
     State(state): State<ApiServerState>,
 ) -> Result<Response, ApiError> {
-    let principal = state
+    state
         .extensions
         .authenticate(
             AuthScope::DaemonTunnel,
             "GET",
             "/api/v1/daemon/tunnel",
             &headers,
-        )
-        .await?;
-    state
-        .extensions
-        .authorize(
-            &principal,
-            ResourceVerb::ConnectTunnel,
-            ResourceKind::DaemonTunnel,
-            None,
-            &BTreeMap::new(),
         )
         .await?;
     Ok(ws.on_upgrade(move |socket| run_daemon_tunnel_socket(socket, state)))
@@ -409,14 +398,14 @@ fn handle_daemon_message(
                 });
             }
         },
-        DaemonToServerMessage::NodeFsReply {
+        DaemonToServerMessage::NodeExtensionReply {
             request_id,
             response,
         } => {
             if let Some(tx) = state
-                .pending_node_fs
+                .pending_node_ext
                 .lock()
-                .expect("pending_node_fs mutex poisoned")
+                .expect("pending_node_ext mutex poisoned")
                 .remove(&request_id)
             {
                 let _ = tx.send(*response);

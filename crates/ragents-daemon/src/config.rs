@@ -462,6 +462,86 @@ impl DaemonConfig {
             .collect()
     }
 
+    pub fn resolve_extension_wasm_path(&self, name_or_path: &str) -> PathBuf {
+        let mut local_wasm_dirs: Vec<PathBuf> = vec![self.extensions_dir.clone()];
+        for ext in &self.extensions {
+            if !ext.path.trim().is_empty() {
+                if let Some(parent) = Path::new(&ext.path).parent() {
+                    if !parent.as_os_str().is_empty()
+                        && !local_wasm_dirs.contains(&parent.to_path_buf())
+                    {
+                        local_wasm_dirs.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+        let etc_dir = PathBuf::from("/etc/ragents/wasm");
+        if !local_wasm_dirs.contains(&etc_dir) {
+            local_wasm_dirs.push(etc_dir);
+        }
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            let user_dir = Path::new(&home).join(".config/ragents/wasm");
+            if !local_wasm_dirs.contains(&user_dir) {
+                local_wasm_dirs.push(user_dir);
+            }
+        }
+
+        let trimmed = name_or_path.trim();
+        if !trimmed.is_empty() && Path::new(trimmed).is_absolute() && Path::new(trimmed).exists() {
+            return PathBuf::from(trimmed);
+        }
+
+        if let Some(found) = self
+            .extensions
+            .iter()
+            .find(|e| e.name == trimmed && !e.path.trim().is_empty() && Path::new(&e.path).exists())
+        {
+            return PathBuf::from(&found.path);
+        }
+
+        let clean_name = trimmed
+            .trim_end_matches(".wasm")
+            .trim_start_matches("ragent_")
+            .trim_end_matches("_extension");
+
+        let mut candidate_names: Vec<String> = Vec::new();
+        if !trimmed.is_empty() {
+            if let Some(fname) = Path::new(trimmed).file_name() {
+                candidate_names.push(fname.to_string_lossy().to_string());
+            }
+        }
+        let std_name = format!("ragent_{clean_name}_extension.wasm");
+        if !candidate_names.contains(&std_name) {
+            candidate_names.push(std_name.clone());
+        }
+        let short_name = format!("{clean_name}.wasm");
+        if !candidate_names.contains(&short_name) {
+            candidate_names.push(short_name);
+        }
+
+        for dir in &local_wasm_dirs {
+            for fname in &candidate_names {
+                let direct = dir.join(fname);
+                if direct.exists() {
+                    return direct;
+                }
+                let nested = dir
+                    .join(clean_name)
+                    .join("target/wasm32-wasip2/release")
+                    .join(fname);
+                if nested.exists() {
+                    return nested;
+                }
+            }
+        }
+
+        if !trimmed.is_empty() && Path::new(trimmed).is_absolute() {
+            PathBuf::from(trimmed)
+        } else {
+            self.extensions_dir.join(std_name)
+        }
+    }
+
     /// Merges node-level defaults with `SessionSpec` and `ActivationSpec` to produce:
     /// 1. Content-addressed `ConfigRevision` (without secrets)
     /// 2. Content-addressed `PermissionSnapshot`

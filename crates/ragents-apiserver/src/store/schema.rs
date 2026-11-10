@@ -20,18 +20,6 @@ impl SqliteStore {
                 lease_expires_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS configs (
-                config_ref   TEXT PRIMARY KEY,
-                created_at   TEXT NOT NULL,
-                payload_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS permission_snapshots (
-                permission_ref TEXT PRIMARY KEY,
-                created_at     TEXT NOT NULL,
-                payload_json   TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id       TEXT PRIMARY KEY,
                 generation       INTEGER NOT NULL,

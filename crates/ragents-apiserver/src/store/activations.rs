@@ -137,24 +137,6 @@ impl SqliteStore {
             let mut session = Self::load_session_in_tx(&tx, session_id)?
                 .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
 
-            tx.execute(
-                "INSERT OR IGNORE INTO configs (config_ref, created_at, payload_json) VALUES (?1, ?2, ?3)",
-                params![
-                    effective_config.config_ref.as_str(),
-                    effective_config.created_at.to_rfc3339(),
-                    serde_json::to_string(&effective_config)?,
-                ],
-            )?;
-
-            tx.execute(
-                "INSERT OR IGNORE INTO permission_snapshots (permission_ref, created_at, payload_json) VALUES (?1, ?2, ?3)",
-                params![
-                    effective_permission.permission_snapshot_ref.as_str(),
-                    effective_permission.created_at.to_rfc3339(),
-                    serde_json::to_string(&effective_permission)?,
-                ],
-            )?;
-
             let node_id = act
                 .status
                 .assigned_node
@@ -1139,14 +1121,6 @@ impl SqliteStore {
                     }
                     combined_policy.merge_from(&session.spec.permissions);
                     let snap = PermissionSnapshot::from_effective_policy(combined_policy);
-                    tx.execute(
-                        "INSERT OR IGNORE INTO permission_snapshots (permission_ref, created_at, payload_json) VALUES (?1, ?2, ?3)",
-                        params![
-                            snap.permission_snapshot_ref.as_str(),
-                            snap.created_at.to_rfc3339(),
-                            serde_json::to_string(&snap)?,
-                        ],
-                    )?;
                     act.status.effective_permission_ref =
                         Some(snap.permission_snapshot_ref.clone());
 
