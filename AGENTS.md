@@ -1,42 +1,19 @@
-# AGENTS.md — 核心设计理念、开发规范与架构约束
+# AGENTS.md — 核心设计理念与架构约束
 
 ## 1. 严禁向前兼容代码（No Backward Compatibility）
-- **当前项目处于快速迭代开发阶段，所有部署与运行环境均为测试环境。**
-- **开发过程中严禁编写任何向前兼容（Backward Compatibility）或历史遗留兜底逻辑**，包括但不限于：
-  - 数据库初始化或运行时的 `ALTER TABLE ... ADD COLUMN`、schema 版本对比与增量迁移脚本、历史字段回填（backfill）SQL；
-  - 协议/配置结构体中的旧字段别名（如 `#[serde(alias = "...")]`）或废弃字段兼容解析；
-  - 业务逻辑或前端 UI 中针对旧版缺失字段的回退推断（fallback inference）。
-- **可接受数据丢失**：当数据表结构、协议字段或存储格式发生变更时，直接修改主建表 DDL / 数据结构定义；若测试环境中的历史 SQLite 数据或旧会话结构不匹配，直接清理或重建数据库即可，无需保留历史脏数据兼容路径。
+- 所有环境均为快速迭代测试环境，**严禁编写任何向前兼容或历史兜底逻辑**（禁止 `ALTER TABLE`、增量迁移脚本、数据回填 SQL、`#[serde(alias = "...")]` 或前后端旧字段回退推断）。
+- 数据表或协议结构变更时直接修改主 DDL 与结构体定义，测试库不兼容时直接清理重建。
 
-## 2. 极简控制面与业务完全解耦（Lean Control Plane & Business Agnosticism）
-- **`ragents-apiserver` 保持纯粹与精简**：
-  - `ragents-apiserver` 仅负责集群声明式状态协调（`Node`、`Session`、`Activation`、`ItemBatch`、`SessionEvent`、`RealtimeQueue`）、双模调度、租约巡检与 SSE 事件广播。
-  - `ragents-apiserver` 不依赖 `ragents-core`（Wasmtime）或 `reqwest`，仅保留轻量级内置常量时间 Bearer Token 鉴权（`StaticTokenAuthnPlugin`），多租户与业务级 ACL 交由上层应用网关（如 `ragents-chat` 的 `token_acl` 扩展）实现。
-- **严禁在 `ragents` 核心中耦合上层应用业务概念**：
-  - 不得在 `ragents-protocol`、`ragents-apiserver`、`ragents-daemon` 或 `ragents-core` 中引入聊天室业务、特定模型内置工具名（如硬编码 `"web_search"`）或节点文件浏览/上传/下载（`NodeFs*`）等上层业务结构体。
-- **插件业务自治与数据直连上层服务**：
-  - 上层应用（如 `ragents-chat`）的节点侧功能（如 `chatroom_speak`、节点目录浏览、文件上传与下载）统一由上层应用提供的 `.wasm` 插件（`ragent_chatroom_extension.wasm`）闭环实现。
-  - 当需要在空闲期唤醒节点插件时，统一通过通用无状态节点扩展调用原语 `POST /api/v1/nodes/{node_id}/extensions/call`（触发 WASM `hook = "node.call"`）；插件内部通过 `wasi:http` 直接连接 `ragents-chat` Server 传输数据，**所有文件上传/下载均先暂存至 `ragents-chat` Server 再与节点插件后台传输，彻底绕过 `ragents-apiserver`**。
+## 2. 极简控制面与插件业务自治（Lean Control Plane & Plugin Autonomy）
+- **`ragents-apiserver` 保持纯粹精简**：仅负责 `Node`、`Session`、`Activation`、`ItemBatch`、`SessionEvent` 与 `RealtimeQueue` 的状态协调、双模调度、租约巡检与 SSE 广播；不依赖 `ragents-core`/`wasmtime`/`reqwest`，不承载或转发任何文件二进制/Base64 数据。
+- **`ragents` 核心零业务耦合**：严禁在 `protocol`/`apiserver`/`daemon`/`core` 中硬编码聊天室、文件管理（`NodeFs*`）或特定内置工具名（如 `"web_search"`）等上层业务概念。
+- **插件直连上层服务**：上层业务（如 `ragents-chat` 的发言回调、节点目录浏览、文件上传/下载）统一由 `.wasm` 插件（通过 `tools.call` 或通用 `POST /api/v1/nodes/{node_id}/extensions/call` $\rightarrow$ `node.call`）闭环实现，插件内通过 `wasi:http` 直连上层服务传输数据，完全绕过 `api-server`。
 
 ## 3. `api-server` 唯一事实源（SSOT）与 `NodeSpec` 基础/增量分层
-- **`api-server` 是集群唯一的配置与权限事实源（Single Source of Truth）**：
-  - 集群级提示词（`store_meta.cluster_system_prompt`）、节点级提示词与权限（`NodeSpec` / `NodeStatus`）、会话级提示词与权限（`SessionSpec.system_prompt`、`SessionSpec.permissions`）以及激活级工具开关（`ActivationSpec.disabled_tools`）全部持久化在 `api-server` 中。
-  - 权限审批（`AllowSession`、`AllowWorkspace`、`AllowNode`）在 `api-server` 处理 `patch_activation` 时直接落盘至 `SessionSpec` 与 `NodeSpec`，节点重启后权限不丢失。
-- **`NodeSpec` 基础配置与控制面增量分离 + `NodeStatus` 最终生效视图**：
-  - 每次 `agent-daemon` 启动注册（`RegisterNode`）时，用本地 `daemon.toml` 的最新配置刷新 `NodeSpec.node_prompt` 与 `NodeSpec.base_permissions`（以及 `NodeStatus` 中的模型列表、扩展列表、允许工作区目录）。
-  - 运行时通过控制面追加的 `NodeSpec.granted_permissions`（`AllowNode`）、`NodeSpec.workspace_permissions`（`AllowWorkspace`）与可选 `NodeSpec.node_prompt_override` 跨 Daemon 重启持久保留。
-  - `api-server` 自动计算合并结果并维护在 `NodeStatus.effective_node_prompt` 与 `NodeStatus.effective_permissions` 中供全局统一消费。
-  - `agent-daemon` 本地仅独享保管不落控制面的敏感配置：模型 `base_url`、`api_key` 及本地 `.wasm` 插件二进制路径。
+- 集群/节点/会话级提示词、权限策略与激活级 `disabled_tools` 全部以 `api-server` 为唯一事实源持久化。
+- `NodeSpec` 分离 Daemon 启动上报的基础配置（`node_prompt`、`base_permissions`）与控制面动态增量（`granted_permissions`、`workspace_permissions`、`node_prompt_override`），由 `api-server` 合并至 `NodeStatus`；`agent-daemon` 本地仅独享保管模型 `base_url`、`api_key` 与本地 `.wasm` 路径。
 
-## 4. 四段式 System Prompt (`PromptParts`)、三层受控目录与收窄的扩展边界
-- **四段式结构化 System Prompt (`PromptParts`)**：
-  1. `system_prompt`：集群全局级系统提示词（`api-server` 托管）；
-  2. `node_prompt`：节点环境级提示词（`NodeStatus.effective_node_prompt`）；
-  3. `client_prompt`：会话/角色人设提示词（`SessionSpec.system_prompt`，支持随时声明式修改，下一轮 Activation 立即生效）；
-  4. `extension_prompts`：`agent-core` WASM 扩展在 `agent.prepare` 阶段追加的协议/工作区指令（固定 `agents_md` 排在首位，其余按扩展顺序排列）。
-  - 在 `agent.prepare` 完成后，`agent-core` 必须通过 `ReportPreparedConfig` 将组装好的 `PromptParts`、`effective_system_prompt` 与过滤 `disabled_tools` 后的 `effective_tools` 实时回写至 `api-server`（更新 `ConfigRevision` 与 `SessionStatus`），保证控制面、UI 透视面板与发往大模型的 `instructions` / `tools` 100% 一致。
-- **三层受控目录隔离**：
-  - 默认内置路径白名单严格限定于三层受控目录：`workspace_root`（`.`）、`extra_tmp_dirs`（如 `/tmp/ragents/rooms/<room_id>` 房间共享临时目录）与 `session_tmp_dir`（`$TMPDIR` 会话私有临时目录），不默认放行全局 `/tmp`。
-- **收窄 `agent-core` WASM 扩展钩子**：
-  - `agent.prepare` 仅允许返回只读追加的 `ExtensionPrepareOutput { append_system_prompt, tools }`，严禁读取或覆写上层 `system_prompt` 与 `model`。
-  - 严禁在 `agent-core` 中引入中途篡改用户 `input`、历史消息或模型请求体的 Transform 钩子；单次激活的工具禁用统一通过控制面 `ActivationSpec.disabled_tools` / `PushRealtimeMessageRequest.disabled_tools` 声明。
+## 4. 四段式提示词、三层目录沙箱与收窄的扩展边界
+- **四段式 `PromptParts`**：按 `1. system_prompt`（集群）$\rightarrow$ `2. node_prompt`（节点）$\rightarrow$ `3. client_prompt`（会话）$\rightarrow$ `4. extension_prompts`（扩展只读追加，`agents_md` 居首）组装，并在 `agent.prepare` 后通过 `ReportPreparedConfig` 实时回写 `api-server`。
+- **三层受控目录**：默认路径白名单仅放行 `workspace_root`（`.`）、`extra_tmp_dirs`（房间共享临时目录）与 `session_tmp_dir`（`$TMPDIR`），不默认放行全局 `/tmp`。
+- **收窄 WASM 钩子**：`agent.prepare` 仅允许返回只读追加的 `ExtensionPrepareOutput { append_system_prompt, tools }`，严禁覆写上层提示词/模型或篡改历史消息。
