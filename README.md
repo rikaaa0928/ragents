@@ -1,41 +1,55 @@
 # ragents
 
-**`ragents`** 是一个受 Kubernetes 声明式控制面启发的 **跨机器、跨平台 AI Agent 集群管理与安全执行系统**。
+**`ragents`** 是一个受 Kubernetes 声明式控制面启发的 **跨机器、跨平台 AI Agent 集群管理与安全执行基座**。
 
-它将控制面状态协调（`api-server`）、客户端交互（`api-server-client` CLI & SDK）、节点宿主守护进程（`agent-daemon`）与容器化执行内核（`agent-core`）解耦为四个独立模块，支持在多台异构机器上统一调度、隔离执行、细粒度审计和扩展 AI Agent 任务。
+它将控制面状态协调（`ragents-apiserver`）、客户端 SDK（`ragents-client`）、节点宿主守护进程（`ragents-daemon`）与容器化安全执行内核（`ragents-core`）解耦为四个职责正交的模块，为上层多智能体应用（如 [`ragents-chat`](https://github.com/rikaaa0928/ragents-chat)）提供纯粹、通用的声明式调度与沙箱执行原语。
 
 ---
 
-## 1. 核心特性
+## 1. 核心设计理念与架构边界（Design Philosophy）
 
-1. **Kubernetes 风格声明式架构与单端口复合协议**
-   - 所有集群状态收敛于 `Node`、`Session`、`Activation`、`ConfigRevision`、`PermissionSnapshot`、`ItemBatch`、`SessionEventEnvelope` 声明式资源，支持全局单调递增 `ResourceVersion (rv)` 与 `lease_epoch` Fencing Token 防脑裂校验。
-   - 单一端口复用：`HTTP REST`（资源 CRUD/Patch）+ `SSE (/api/v1/watch)`（基于 `after_rv` 游标的实时与断点续传事件流）+ `WebSocket (/api/v1/daemon/tunnel)`（Daemon 主动外拨穿透 NAT 的双向控制隧道）。
-2. **`Pinned`（固定节点/目录）与 `Floating`（浮动调度/容灾）双模式调度**
-   - **`Pinned` 模式**：严格绑定指定 `node_id` 与绝对路径 `workspace_path`（如操作某台开发机上的本地代码仓），节点离线时任务等待或中断，**绝不跨机漂移**。
-   - **`Floating` 模式**：不绑定机器与本地路径，由 `api-server` 自动调度至支持目标模型的健康节点（优先复原节点亲和性，其次按最小负载），在节点临时目录执行；当节点故障离线时支持**自动跨机重调度并无缝接续历史上下文**。
-3. **节点本地模型凭证保险箱（Zero-Trust Secret Locality）**
-   - 模型 `base_url` 与 `api_key` 仅保存在各节点本地的 `agent-daemon` 中，**永不上传至 `api-server` 数据库或网络层**；`agent-daemon` 仅向控制面上报该节点支持的模型名称列表（`supported_models: Vec<String>`）。
-4. **纯 OpenResponses 协议、流式增量推送（SSE Streaming）与双向 ID 穿透**
-   - 统一基于 `openresponses-rust` 标准格式通信；默认开启 SSE 流式响应（`stream = true`）并内置对 `429` / `502` / `503` / `504` 的指数退避自动重试。
-   - 生成过程中通过 `SessionEvent::ModelTextDelta` / `ModelReasoningDelta` 向客户端实时广播低延迟流式增量（不写入 SQLite 防止碎片膨胀），而在每轮结束时通过 `TurnCompleted { items }` 持久化并下发完整权威输出，供客户端自动对账自愈。
-   - 工具调用 `call_id`、消息 `Item` ID 原生贯通，且自动将 `ragents.session_id` / `ragents.activation_id` / `ragents.turn_id` 注入 OpenResponses 请求 `metadata`。
-5. **子进程容器化 + WASI 沙箱 + OS 内核级命令沙箱**
-   - 默认采用 `SubprocessExecutor`：每次 `Activation` 派生独立 OS 子进程（`ragents internal-core-worker`），自动剥离环境变量中的 `RAGENTS_API_KEY`，通过单 Daemon 共享的 Unix Domain Socket（`SharedIpcHub`，不可用时自动回退本地回环 TCP）与父进程通信。
-   - Wasmtime 组件预编译缓存（`.cwasm` SHA-256 内容寻址，`< 1ms` 极速加载）。
-   - **OS 内核级命令沙箱**：macOS 下自动启用 `/usr/bin/sandbox-exec`（Seatbelt），Linux 下自动启用 `/usr/bin/bwrap`（Bubblewrap），拦截一切未授权的工作区外文件写入与受限目录读取。
-6. **三大能力边界统一鉴权（宿主 Shell + WASI 0.2 文件系统 + WASI 0.2 网络）与 5 级权限审批**
-   - **最小化宿主导入**：WIT `ragent:extension/host` 仅暴露唯一的进程管理接口 `manage-process`；WASM 插件内部的文件读写与网络请求全部走 **WASI 0.2 标准接口**。
-   - **宿主进程管理（`manage-process`）**：当 `uv run`、`pip install` 等命令访问工作区外部目录（如 `~/.cache/uv`）被内核沙箱拦截时，系统在**单次工具调用内部**自动捕获受阻路径（支持 `stderr` 快速提取 + macOS 内核沙箱日志兜底），支持单次命令内**多目录循环递进审批**，获批后原地自动解锁沙箱并重跑命令。
-   - **WASI 0.2 文件系统（`wasi:filesystem/types::HostDescriptor`）**：直接接管 WASI 0.2 底层 `open-at`、`create-directory-at`、`unlink-file-at`、`rename-at` 等异步系统调用。无论 WASM 插件（如 `file_editor.wasm` 或任意第三方黑盒 `.wasm`）如何构造路径并调用 `std::fs`，只要触碰未授权目录，均在 WASI `open-at` 系统调用处直接挂起并发起 `FileRead` / `FileWrite` 审批，批准后当场返回文件描述符完成读写。
-   - **WASI 0.2 网络（`wasi:http/outgoing-handler` & `wasi:sockets`）**：通过 Wasmtime WASI 0.2 内置的 `WasiHttpView::send_request` 与 `WasiCtxBuilder::socket_addr_check` 拦截所有出站 HTTP 与 TCP/UDP 连接，自动触发 `CapabilityRequest::Http` 权限校验与交互式域名审批（支持 `--path "*.example.com"` 通配符覆盖）。
-   - 审批时统一展示 `original_path`（原始受阻文件路径或完整 URL）与 `suggested_path`（自动收敛建议目录或目标域名），支持用户通过 `--path` 手动收窄或放宽范围，并提供 **`allow-once` / `allow-activation` / `allow-session` / `allow-workspace` / `allow-node`** 5 级生效周期。其中 `allow-session`、`allow-workspace`、`allow-node` 直接持久化落盘至 `api-server` 的 `SessionSpec.permissions`、`NodeSpec.workspace_permissions` 与 `NodeSpec.permissions`（`api-server` 唯一事实源，节点重启不丢失）。
-7. **四段式结构化 System Prompt (`PromptParts`) 与三层扩展边界**
-   - **四段式 System Prompt**：按确定性顺序自动拼装 `1. system_prompt`（集群级） $\rightarrow$ `2. node_prompt`（`NodeSpec` 节点级） $\rightarrow$ `3. client_prompt`（`SessionSpec` 会话/角色级，支持随时动态修改） $\rightarrow$ `4. extension_prompts`（`agents_md` 及其他 WASM 扩展只读追加），并在 `agent.prepare` 完成后通过 `ReportPreparedConfig` 将完整 `PromptParts` 与过滤 `disabled_tools` 后的 `effective_tools` 实时回写 `api-server`。
-   - **三层扩展体系**：
-     - `api-server`：支持自定义 `Authn`（客户端与节点隧道认证）、`Authz`（含 `enforced_label_selector` 多租户透明隔离）及 `Mutating / Validating Admission`（含 `CreateSession`、`SubmitPromptTurn`、`PushRealtimeMessage`）。
-     - `agent-daemon`：支持 `before_model_request`、`after_model_response`、`evaluate_permission` 拦截器（Native Trait / WASM / Webhook）。
-     - `agent-core`：WASM 扩展 `agent.prepare` 收窄为只读追加 `append_system_prompt` 与注册 `tools`，严禁中途篡改上层提示词、模型名或历史消息。
+后续所有架构演进与功能改动均严格遵循以下 6 条核心设计理念：
+
+### 1.1 极简、业务无关的控制面（Lean & Business-Agnostic Control Plane）
+- **`ragents-apiserver` 只做纯粹的集群状态协调与事件分发**：维护 `Node`、`Session`、`Activation`、`ItemBatch`、`SessionEvent` 与 `RealtimeQueue` 的声明式状态机，负责双模调度（`Pinned` / `Floating`）、两阶段节点租约巡检（5 分钟运行期宽限 + 双向 `running_activation_ids` 对账）及基于 `ResourceVersion (rv)` 的 SSE 事件流广播。
+- **严禁在 `ragents` 核心中耦合上层应用业务概念**：不在 `ragents-protocol`、`ragents-apiserver`、`ragents-daemon` 或 `ragents-core` 中硬编码任何具体业务语义（例如聊天室发言逻辑、特定模型内置工具名 `"web_search"`、节点文件管理 `ListDir`/`Upload`/`Download` 等）。
+- **零重型依赖与零二进制数据中转**：`ragents-apiserver` 不依赖 `ragents-core`（Wasmtime）或 `reqwest`，不存储或转发任何文件二进制/Base64 载荷；控制面鉴权仅保留内置常量时间 Bearer Token 校验（`StaticTokenAuthnPlugin`），多租户与业务级 ACL 交由上层应用网关实现。
+
+### 1.2 `api-server` 唯一事实源（SSOT）与 `NodeSpec` 基础/增量分层
+- **配置与权限唯一事实源（Single Source of Truth）**：集群级提示词（`store_meta.cluster_system_prompt`）、节点级提示词与权限（`NodeSpec` / `NodeStatus`）、会话级提示词与权限（`SessionSpec.system_prompt`、`SessionSpec.permissions`）以及激活级工具禁用（`ActivationSpec.disabled_tools`）全部持久化在 `api-server` 中。
+- **`NodeSpec` 静态基础与控制面动态增量分离**：
+  - 每次 `ragents-daemon` 启动注册（`RegisterNode`）时，用本地 `daemon.toml` 的最新配置刷新 `NodeSpec.node_prompt` 与 `NodeSpec.base_permissions`（以及 `NodeStatus` 中的模型列表、已安装扩展列表、允许工作区目录）。
+  - 运行时通过控制面审批追加的 `NodeSpec.granted_permissions`（`AllowNode`）、`NodeSpec.workspace_permissions`（`AllowWorkspace`）与 `NodeSpec.node_prompt_override` 跨 Daemon 重启持久保留，并支持通过 `PATCH /api/v1/nodes/{node_id}` 或 `PATCH /api/v1/sessions/{session_id}` 随时撤销非默认规则。
+  - `api-server` 自动计算合并结果并维护在 `NodeStatus.effective_node_prompt` 与 `NodeStatus.effective_permissions` 中供全局统一消费。
+- **敏感凭证本地独享（Zero-Trust Secret Locality）**：`ragents-daemon` 本地仅独享保管模型 `base_url`、`api_key` 及本地 `.wasm` 插件目录（`extensions_dir`），敏感密钥永不上传控制面或暴露给子进程环境变量。
+
+### 1.3 四段式结构化 System Prompt (`PromptParts`) 与收窄的 WASM 扩展边界
+- **四段式 System Prompt (`PromptParts`)**：按确定性顺序组装：
+  1. `system_prompt`：集群全局级系统提示词（`api-server` 托管）；
+  2. `node_prompt`：节点环境级提示词（`NodeStatus.effective_node_prompt`）；
+  3. `client_prompt`：会话/角色人设提示词（`SessionSpec.system_prompt`，支持随时声明式修改，下一轮 Activation 立即生效）；
+  4. `extension_prompts`：`ragents-core` WASM 扩展在 `agent.prepare` 阶段只读追加的协议/工作区指令（`agents_md` 固定排在首位，其余按扩展顺序排列）。
+- **Prepared Config 实时回写对账**：在 `agent.prepare` 完成后，`ragents-core` 立即通过 `ReportPreparedConfig` 将组装好的 `PromptParts`、`effective_system_prompt` 与过滤 `disabled_tools` 后的 `effective_tools` 实时回写至 `api-server`（更新 `SessionStatus.effective_config`），确保控制面、UI 透视面板与实际发往大模型的 `instructions` / `tools` 100% 一致。
+- **收窄 `ragents-core` WASM 扩展钩子**：`agent.prepare` 仅允许返回只读追加的 `ExtensionPrepareOutput { append_system_prompt, tools }`，严禁读取或覆写上层 `system_prompt` 与 `model`，严禁引入中途篡改用户 `input` 或历史消息的 Transform 钩子。
+
+### 1.4 插件直连上层服务 + 通用无状态节点扩展调用 (`NodeExtensionCall`)
+- **插件业务自治与数据直连**：上层应用的节点侧能力（如聊天室工具回调、节点目录浏览、大文件分块上传与拉取）全部封装在上层应用自己提供的 `.wasm` 插件中。
+- **双触发路径**：
+  1. **激活执行期（In-Activation）**：大模型在 ReAct 循环中调用工具（`hook = "tools.call"`），WASM 插件通过 `wasi:http` 直接请求上层业务服务。
+  2. **节点按需唤醒（Out-of-Band `NodeExtensionCall`）**：当没有任何 Activation 运行时，上层服务可通过通用透明接口 `POST /api/v1/nodes/{node_id}/extensions/call` 唤醒目标节点上的指定 `.wasm` 插件（`hook = "node.call"`）；插件内部通过 `wasi:http` **直接与上层服务流式传输数据，彻底绕过 `ragents-apiserver`**。
+
+### 1.5 三层目录隔离模型与最小权限内核沙箱（3-Tier Directory & Kernel Sandbox）
+- **三层受控目录模型**：
+  1. `workspace_root`（`.`）：Pinned 模式下绑定的项目工作目录（Floating 模式下与房间共享临时目录合一）；
+  2. `extra_tmp_dirs`（如 `/tmp/ragents/rooms/<room_id>`）：房间/任务组级跨 Agent 共享临时目录；
+  3. `session_tmp_dir`（`/tmp/ragents/sessions/<session_id>`）：单个 Session 独占的私有临时目录（自动注入子进程 `$TMPDIR`）。
+- **最小默认权限与双层沙箱（WASI 0.2 + OS 内核沙箱）**：
+  - 默认内置路径白名单**仅放行上述三层受控目录**（不放行全局 `/tmp`），`file_read` / `file_write` / `command_work_dir` / `http_hosts` 默认策略均为 `ask`。
+  - 子进程命令通过 macOS Seatbelt (`/usr/bin/sandbox-exec`) 或 Linux Bubblewrap (`/usr/bin/bwrap`) 实施内核级隔离，进程退出时通过直接 POSIX `kill(-pgid, SIGKILL)` 清理整个子进程组。
+  - `setuid`/`setgid` 二进制（如 `/bin/ps`）与系统执行目录（`/bin`, `/usr/bin` 等）精确按单文件粒度鉴权，不在审批时折叠为父目录。
+
+### 1.6 严禁向前兼容代码（No Backward Compatibility）
+- 所有开发迭代遵循 `AGENTS.md` 约束：严禁编写任何数据库增量迁移（`ALTER TABLE`）、历史字段回填 SQL、协议旧字段别名（`#[serde(alias = "...")]`）或前端/后端历史回退推断逻辑；数据结构变更时直接修改主建表 DDL 与协议定义。
 
 ---
 
@@ -44,30 +58,24 @@
 ```text
 ragents/
 ├── Cargo.toml                        # Workspace 根配置
+├── AGENTS.md                         # 开发规范与架构约束
 ├── scripts/build-extensions.sh       # 构建内置 wasm32-wasip2 工具扩展脚本
-├── wit/ragent-extension.wit          # WASM 扩展 WIT 接口契约
-├── extensions/                       # 内置 WASM 工具与控制面扩展源码 (wasm32-wasip2)
-│   ├── authn/                        # 控制面客户端与节点隧道 Bearer Token 鉴权扩展
-│   ├── shell/                        # 宿主前后台命令执行与进程管理扩展（含 2000行/50KB 尾部截断与落盘）
+├── wit/ragent-extension.wit          # WASM 扩展 WIT 接口契约 (host.manage-process + lifecycle)
+├── extensions/                       # 内置通用 WASM 工具扩展源码 (wasm32-wasip2)
+│   ├── shell/                        # 宿主前后台命令执行与进程管理扩展（含 duration_ms 与尾部截断落盘）
 │   ├── file_editor/                  # 文件分页读取 (offset/limit)、写入与非重叠精确替换扩展
-│   ├── image_viewer/                 # 多模态图像查看扩展
+│   ├── image_viewer/                 # 多模态图像读取扩展（历史轮次自动剥离 Base64 节省跨网带宽）
 │   ├── agents_md/                    # 工作区 AGENTS.md / CLAUDE.md 自动发现与指令注入扩展
 │   ├── skills/                       # Agent Skills (.agents/skills) 自动发现与按需加载扩展
 │   └── compaction/                   # 三会话自动上下文压缩与多代接力摘要扩展 (sess_1 -> sess_compact -> sess_2)
 ├── crates/
-│   ├── ragents-protocol/             # 核心声明式资源、事件、REST/SSE/WS 协议与扩展契约
-│   ├── ragents-apiserver/            # 控制面服务：SQLite WAL 存储、双模调度器、REST/SSE/WS 与 Authn/Authz/Admission 扩展
+│   ├── ragents-protocol/             # 核心声明式资源、事件、REST/SSE/WS 协议与 NodeExtensionCall 契约
+│   ├── ragents-apiserver/            # 极简控制面服务：SQLite WAL 存储、双模调度器、REST/SSE/WS 隧道与静态 Token 鉴权
 │   ├── ragents-client/               # 客户端 SDK (RagentsClient) 与 Daemon 隧道客户端 (DaemonTunnelHandle)
 │   ├── ragents-core/                 # Agent 容器执行内核：ReAct 循环、Wasmtime WASI P2、OS 内核沙箱、SubprocessExecutor
-│   ├── ragents-daemon/               # 节点守护进程：本地凭证库、多级配置合并、5 级权限引擎、DaemonInterceptor 管道
+│   ├── ragents-daemon/               # 节点守护进程：本地凭证库、配置合并、权限引擎、无状态节点扩展执行器
 │   └── ragents-cli/                  # 命令行工具 `ragents`（包含 `up`、`apiserver`、`daemon`、`node`、`session`、`run`、`approve` 等）
-└── docs/                             # 完整设计、配置与进度文档
-    ├── CONFIGURATION_GUIDE.zh-CN.md
-    ├── PRODUCT_REQUIREMENTS.zh-CN.md
-    ├── TECHNICAL_DESIGN.zh-CN.md
-    ├── EXTENSION_ARCHITECTURE.zh-CN.md
-    ├── IMPLEMENTATION_ROADMAP.zh-CN.md
-    └── IMPLEMENTATION_PROGRESS.zh-CN.md
+└── docs/                             # 设计与配置文档
 ```
 
 ---
@@ -77,17 +85,15 @@ ragents/
 ### 3.1 编译主程序与内置 WASM 扩展
 
 ```bash
-# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, agents_md, skills, compaction, authn)
+# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, agents_md, skills, compaction)
 ./scripts/build-extensions.sh
 
-# 2. 编译 ragents 工作区所有二进制
-cargo build --bins
+# 2. 编译 ragents 工作区所有二进制 (ragents, ragents-core-worker)
+cargo build --release -p ragents-cli -p ragents-core
 
 # 3. 运行全仓单元测试与端到端集成测试
 cargo test --workspace
 ```
-
-编译完成后，主入口二进制位于 `./target/debug/ragents`（Release 模式下为 `./target/release/ragents`）。
 
 ### 3.2 配置环境变量
 
@@ -95,253 +101,65 @@ cargo test --workspace
 export RAGENTS_BASE_URL="https://your-openresponses-endpoint.example.com/v1"
 export RAGENTS_API_KEY="sk-your-api-key"
 export RAGENTS_MODEL="gemini-3.8-flash"
+export RAGENTS_AUTH_TOKEN="your-cluster-bearer-token"
 ```
-
-> 详细的配置文件（`daemon.toml`）字段说明请参见 **[配置详解指南 (docs/CONFIGURATION_GUIDE.zh-CN.md)](./docs/CONFIGURATION_GUIDE.zh-CN.md)**。
 
 ---
 
-## 4. 详细使用指南（CLI 全场景实战）
+## 4. 快速使用指南（CLI）
 
-### 4.1 场景一：单机 All-in-One 模式极速运行 (`ragents up`)
-
-如果你在本地单机使用，无需分别启动多个进程，`ragents up` 会在单个进程内自动启动内嵌的 `api-server` 和本地 `agent-daemon`：
+### 4.1 单机 All-in-One 模式 (`ragents up`)
 
 ```bash
-# 1. 启动常驻 All-in-One 服务（Ctrl+C 优雅退出）
-./target/debug/ragents up \
+./target/release/ragents up \
   --bind 127.0.0.1:8080 \
   --db .ragents/control.sqlite3 \
   --daemon-config /path/to/daemon.toml
-
-# 2. 或者：启动 All-in-One 并立即在指定工作目录执行一次性任务，执行完毕自动退出
-./target/debug/ragents up \
-  --bind 127.0.0.1:0 \
-  --db /tmp/ragents-control.sqlite3 \
-  --daemon-config /path/to/daemon.toml \
-  --workdir $(pwd) \
-  --model gemini-3.8-flash \
-  --prompt "请阅读当前仓库结构并总结每个模块的作用。"
 ```
 
----
-
-### 4.2 场景二：分布式集群部署（独立启动 `apiserver` 与多台 `daemon`）
-
-在跨机器或多节点场景下，分别启动控制面与各个计算节点的守护进程：
+### 4.2 分布式集群部署（独立启动 `apiserver` 与多台 `daemon`）
 
 ```bash
-# 1. 在中心控制节点启动 api-server
-./target/debug/ragents apiserver \
+# 1. 启动中心控制面 ragents-apiserver
+RAGENTS_AUTH_TOKEN="your-cluster-bearer-token" \
+./target/release/ragents apiserver \
   --bind 0.0.0.0:8080 \
-  --db /var/lib/ragents/control.sqlite3 \
+  --db /var/lib/ragents/apiserver.sqlite3 \
   --lease-ttl-ms 30000
 
-# 2. 在节点 A（例如 macOS 开发机）启动 agent-daemon
-./target/debug/ragents daemon --config /etc/ragents/daemon-mac.toml
+# 2. 在各计算节点启动 ragents-daemon
+RAGENTS_AUTH_TOKEN="your-cluster-bearer-token" \
+./target/release/ragents daemon --config /etc/ragents/daemon.toml
 
-# 3. 在节点 B（例如 Linux 云服务器）启动 agent-daemon
-./target/debug/ragents --server http://apiserver-host:8080 daemon --node-id node-linux-01
-
-# 4. 查看当前集群已注册节点及负载、模型支持情况
-./target/debug/ragents --server http://127.0.0.1:8080 node list
-# 查看单个节点的详细声明式状态 JSON
-./target/debug/ragents --server http://127.0.0.1:8080 node get node-mac-studio-01
+# 3. 查看集群节点状态
+./target/release/ragents --server http://127.0.0.1:8080 node list
 ```
 
----
-
-### 4.3 场景三：`Pinned`（固定节点/本地目录）vs `Floating`（浮动调度）任务执行
-
-`ragents` 严格区分两种任务调度模式：
-
-#### 方式 A：`Pinned` 模式（必须同时指定 `--node` 和 `--workdir`）
-适用于修改某台机器上的指定本地代码仓库，任务严格绑定在该机器和目录，绝不跨机迁移：
+### 4.3 `Pinned`（固定节点/目录）与 `Floating`（浮动调度）任务执行
 
 ```bash
-./target/debug/ragents run \
-  --node node-mac-studio-01 \
-  --workdir ./my-project \
+# Pinned 模式：绑定指定节点与本地工作目录（extensions 仅需传名称，由节点按 extensions_dir 自动解析）
+./target/release/ragents run \
+  --node amd-fedora-01 \
+  --workdir /root/work/src/my-project \
   --model gemini-3.8-flash \
-  --extension shell=./extensions/shell/target/wasm32-wasip2/release/ragent_shell_extension.wasm \
-  --extension file_editor=./extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm \
-  --extension agents_md=./extensions/agents_md/target/wasm32-wasip2/release/ragent_agents_md_extension.wasm \
-  --extension "skills=./extensions/skills/target/wasm32-wasip2/release/ragent_skills_extension.wasm:~/.agents/skills" \
-  --extension 'compaction=./extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm#{"trigger_tokens":400000,"keep_recent_tokens":64000}' \
-  "请检查 src/main.rs 并运行 cargo check"
-```
+  --extension shell \
+  --extension file_editor \
+  --extension agents_md \
+  "请检查当前项目结构并运行测试"
 
-#### 方式 B：`Floating` 模式（指定 `--floating`，或同时省略 `--node` 与 `--workdir`）
-适用于通用分析、检索、问答或无需绑定特定宿主机目录的任务。`api-server` 会自动选择健康的且支持该模型的节点，在节点临时目录中运行，并在节点故障时支持自动重调度：
-
-```bash
-./target/debug/ragents run \
+# Floating 模式：自动调度至健康节点并在隔离临时目录执行
+./target/release/ragents run \
   --floating \
   --model gemini-3.8-flash \
-  "请帮我推导并验证 Raft 租约防脑裂的不变量"
-```
-
-> **提示**：`ragents run` 默认开启 `--wait=true`，会实时通过 SSE 流打印调度、Turn、工具调用、权限申请事件并在结束时输出模型回复；若希望后台异步提交立即返回，可传 `--wait=false`。
-
----
-
-### 4.4 场景四：多轮对话追问、会话管理与跨会话零复制 Fork
-
-```bash
-# 1. 列出所有会话及其调度模式、所处阶段、绑定节点和上下文条目数
-./target/debug/ragents session list
-
-# 2. 在已有 Session 上发起第二轮追问（传入 --session <session_id>）
-./target/debug/ragents run \
-  --session sess_01a13d8f-8fe9-7504-9e8b-1a344c074450 \
-  "基于刚才的分析，请继续帮我编写单元测试"
-
-# 3. 查看某个 Session 的完整上下文消息列表 (effective_items 与 local_batches)
-./target/debug/ragents session context sess_01a13d8f-8fe9-7504-9e8b-1a344c074450
-
-# 4. 跨会话零复制血缘继承 (Fork Session)：
-#    从父会话的 [0..3] 上下文切片派生一个全新的子会话（无需复制历史消息数据）
-./target/debug/ragents session create \
-  --floating \
-  --model gemini-3.8-flash \
-  --source "sess_01a13d8f-8fe9-7504-9e8b-1a344c074450:0..3" \
-  --prompt "我们换一个方向继续实现刚才讨论的方案 B"
-
-# 5. 动态更新会话的模型或状态 (Patch Session)
-./target/debug/ragents session patch sess_01a13d8f-8fe9-7504-9e8b-1a344c074450 \
-  --model gpt-4.1 \
-  --phase closed
+  "请推导并验证租约 Fencing Token 的安全性不变量"
 ```
 
 ---
 
-### 4.5 场景五：OS 沙箱拦截与交互式权限审批（支持 `--path` 目录微调与 5 级周期）
+## 5. 文档索引
 
-当 Agent 执行工具或外部命令（例如 `uv run --with pyyaml ...`）试图写入工作区外部目录（如 `/Users/alice/.cache/uv/sdists-v6/.git`）时：
-
-1. **自动拦截与挂起提示**：
-   终端或 `ragents watch` 会实时收到 `PermissionRequested` 事件，同时展示**原始触发路径 (`original_path`)** 与**系统自动优化的建议目录 (`suggested_path`)**：
-   ```text
-   [permission required] request_id=permreq_01a13dc1-828a-76f9-814e-84c2edfabc64
-     original_path : /Users/alice/.cache/uv/sdists-v6/.git
-     suggested_path: /Users/alice/.cache/uv (FileWrite { path: "/Users/alice/.cache/uv" })
-     reason        : Some("Command `uv run ...` requires file-write access...")
-     Approve default : ragents --server <url> approve act_... permreq_... --decision allow-session
-     Approve custom  : ragents --server <url> approve act_... permreq_... --decision <allow-once|allow-activation|allow-session|allow-workspace|allow-node> --path <custom_dir>
-   ```
-
-2. **执行审批命令（支持 5 种生效周期与 `--path` 手动微调目录）**：
-   ```bash
-   # 方式 A：直接按系统建议目录 (/Users/alice/.cache/uv) 批准，在当前 Session 内生效
-   ./target/debug/ragents approve <activation_id> <request_id> --decision allow-session
-
-   # 方式 B：手动修改授权目录（例如收窄到子目录，或放宽到上级目录），并指定在当前工作目录 (allow-workspace) 级别生效
-   ./target/debug/ragents approve <activation_id> <request_id> \
-     --decision allow-workspace \
-     --path /Users/alice/.cache/uv/sdists-v6
-
-   # 方式 C：仅允许单次命令执行 (allow-once，命令执行完立即从沙箱白名单撤销)
-   ./target/debug/ragents approve <activation_id> <request_id> --decision allow-once
-
-   # 方式 D：在整个节点 (allow-node) 范围永久允许该缓存目录
-   ./target/debug/ragents approve <activation_id> <request_id> --decision allow-node
-
-   # 方式 E：拒绝该权限请求
-   ./target/debug/ragents approve <activation_id> <request_id> --decision deny
-   ```
-   一旦批准，正在挂起的工具调用会在**同一次命令调用内自动解锁沙箱并重跑命令**；若命令后续还需访问其他新目录，会继续循环递进提示审批，直至命令完成。
-
----
-
-### 4.6 场景六：双消息队列（FollowUp 等待队列 vs Realtime 实时队列）与后台进程管理
-
-`ragents` 在 `api-server` 中维护每个会话的两条消息队列，并在 `agent-daemon` 中内置完整的后台命令进程管理系统：
-
-1. **实时队列注入 (`ragents steer`)**：
-   在某个 `Activation` 正在运行（例如执行多步代码测试）期间，用户或外部系统可随时向该会话的**实时队列 (Realtime Queue)** 推送一条或多条消息块。`agent-core` 会在每个 ReAct Turn 开始前（以及退出循环前）**一次性全部取出**待处理消息，并在单条 `Item::Message` 中保留多个独立的 `MessageContent` 块注入模型上下文：
-   ```bash
-   ./target/debug/ragents steer sess_01a13d8f-8fe9-7504-9e8b-1a344c074450 \
-     "请同时检查边界条件 n=0" \
-     "测试通过后先不要删除临时日志"
-   ```
-
-2. **后台进程管理 (`shell` / `process_status` / `process_logs` / `process_stop`)**：
-   `extensions/shell` 提供 4 个协同工具，支持前后台联合调试（如启动后台被测 Server + 前台运行测试脚本）：
-   - `shell`：支持 `wait: true | false`（默认 `true` 同步等待；`false` 异步后台启动并立即返回 `process_id` 与系统 `pid`）以及 `lifecycle: "activation" | "session"`（默认 `"activation"`，在当前 Activation 结束时自动按进程组清理；`"session"` 跨多次 Activation 持续保活）。
-   - `process_status`：查询指定 `process_id` 的运行状态（`running` / `exited` / `killed` / `timed_out`）、`pid`、`exit_code` 与运行时长。
-   - `process_logs`：按需拉取后台进程的 `stdout`、`stderr` 或 `combined`（标准输出+错误交织）日志，支持 `tail_lines` 与 `offset`。
-   - `process_stop`：主动终止指定 `process_id` 及其整个子进程组。
-   - **后台进程自然退出实时通知**：当 `wait = false` 的后台进程自行退出时，`agent-daemon` 会自动向 `api-server` 的实时队列推送一条包含 `process_id`、`pid`、`exit_code` 的系统通知，Agent 在下一个 Turn 会自动感知！
-
----
-
-### 4.7 场景七：实时事件流监控与任务取消 (`watch` / `cancel`)
-
-```bash
-# 1. 实时监听全集群事件流（支持从指定 ResourceVersion 断点续传）
-./target/debug/ragents watch --after-rv 0
-
-# 2. 仅监听指定 Session 的事件流
-./target/debug/ragents watch --session sess_01a13d8f-8fe9-7504-9e8b-1a344c074450
-
-# 3. 取消正在运行的 Activation（子进程将被立即硬终止并回收）
-./target/debug/ragents cancel act_01a13d8f-8fea-76c5-9f10-679fb69f27fb
-```
-
----
-
-## 5. Rust Client SDK 编程接入示例
-
-除了 CLI 之外，你可以直接在 Rust 项目中引入 `ragents-client` 与 `api-server` 交互：
-
-```rust
-use openresponses_rust::Item;
-use ragents_client::RagentsClient;
-use ragents_protocol::*;
-use std::collections::BTreeMap;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let client = RagentsClient::new("http://127.0.0.1:8080")
-        .with_auth_token(Some("your-bearer-token".to_string()));
-
-    let created = client
-        .create_session(CreateSessionRequest {
-            session_id: None,
-            labels: BTreeMap::new(),
-            spec: SessionSpec {
-                scheduling: SchedulingMode::Floating {
-                    node_selector: BTreeMap::new(),
-                },
-                sources: vec![],
-                producer: None,
-                desired_phase: DesiredSessionPhase::Open,
-                system_prompt: Some("You are a helpful assistant.".into()),
-                model: Some(ModelRequestSpec::new("gemini-3.8-flash")),
-                extensions: vec![],
-                permissions: PermissionPolicyLayer::default(),
-            },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("Hello from ragents SDK!")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
-        })
-        .await?;
-
-    println!("Created session: {}", created.session.metadata.id);
-    Ok(())
-}
-```
-
----
-
-## 6. 文档索引
-
-- **[配置详解指南 (CONFIGURATION_GUIDE.zh-CN.md)](./docs/CONFIGURATION_GUIDE.zh-CN.md)**：环境变量、`daemon.toml` 全字段说明、权限规则与扩展配置。
-- **[产品需求文档 (PRODUCT_REQUIREMENTS.zh-CN.md)](./docs/PRODUCT_REQUIREMENTS.zh-CN.md)**：核心业务场景、双模调度与安全边界定义。
-- **[技术方案设计 (TECHNICAL_DESIGN.zh-CN.md)](./docs/TECHNICAL_DESIGN.zh-CN.md)**：声明式资源模型、SQLite 表结构、状态机与协议规范。
-- **[扩展架构设计 (EXTENSION_ARCHITECTURE.zh-CN.md)](./docs/EXTENSION_ARCHITECTURE.zh-CN.md)**：`agent-daemon` 与 `api-server` 的 WASM / Webhook 扩展体系设计。
-- **[分阶段实施路线图 (IMPLEMENTATION_ROADMAP.zh-CN.md)](./docs/IMPLEMENTATION_ROADMAP.zh-CN.md)**：Stage 0 – Stage 7 工程演进拆解。
-- **[双消息队列与后台命令进程管理系统设计 (PROCESS_AND_QUEUE_DESIGN.zh-CN.md)](./docs/PROCESS_AND_QUEUE_DESIGN.zh-CN.md)**：`FollowUp` 等待队列与 `Realtime` 实时队列、后台进程生命周期（`activation` vs `session`）与三通道日志查询设计。
-- **[实施进度记录 (IMPLEMENTATION_PROGRESS.zh-CN.md)](./docs/IMPLEMENTATION_PROGRESS.zh-CN.md)**：各阶段完成状态、Commit 记录与测试验证矩阵。
+- **[开发规范与架构约束 (AGENTS.md)](./AGENTS.md)**：严禁向前兼容、SSOT 权限持久化、四段式 System Prompt 与扩展边界规范。
+- **[配置详解指南 (docs/CONFIGURATION_GUIDE.zh-CN.md)](./docs/CONFIGURATION_GUIDE.zh-CN.md)**：环境变量、`daemon.toml` 全字段说明、权限规则与扩展配置。
+- **[技术方案设计 (docs/TECHNICAL_DESIGN.zh-CN.md)](./docs/TECHNICAL_DESIGN.zh-CN.md)**：声明式资源模型、SQLite 表结构、状态机与协议规范。
+- **[双消息队列与后台命令进程管理系统设计 (docs/PROCESS_AND_QUEUE_DESIGN.zh-CN.md)](./docs/PROCESS_AND_QUEUE_DESIGN.zh-CN.md)**：`FollowUp` 等待队列与 `Realtime` 实时队列、后台进程生命周期管理设计。
