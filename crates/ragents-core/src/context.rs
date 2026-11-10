@@ -55,6 +55,7 @@ impl ContextProjection {
             }
 
             if let Item::FunctionCall { call_id, .. } = raw_item {
+                seen_output_call_ids.remove(call_id.as_str());
                 if !answered_call_ids.contains(call_id.as_str()) {
                     pending_unanswered_calls.push(call_id.clone());
                 }
