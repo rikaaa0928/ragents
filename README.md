@@ -8,6 +8,17 @@
 
 ## 1. 核心设计理念与架构边界（Design Philosophy）
 
+> **核心取舍：借鉴 Kubernetes 声明式调谐思想，但拒绝 CRD 大包大揽**
+> - **为什么放弃 CRD（CustomResourceDefinition）**：在 Kubernetes 中，CRD 本质上只是让第三方组件复用 `kube-apiserver + etcd` 存储与 Watch 总线的**便利机制**，而非架构必要条件，且会引入动态 Schema、Admission Webhook 链与复杂 RBAC 等沉重负担。更重要的是，即便在 K8s 生态中，超高频变动状态与大体积数据也绝不会放入 `apiserver / etcd`，而是交由独立的配置中心或数据面服务处理。
+> - **两层 SSOT 解耦模型**：`ragents-apiserver` **仅对固定、闭合的 5 个核心执行原语（`Node`、`Session`、`Activation`、`ItemBatch`、`Event`）做 SSOT**；上层业务系统（如 `ragents-chat`）自带独立的领域级 SSOT Server（管理房间、成员、消息、ACL 与文件暂存），高频业务交互与大体积数据传输由节点 WASM 插件直连上层业务 Server 旁路完成。
+
+| 维度 | `ragents-apiserver`（核心执行控制面） | 上层业务 Server（如 `ragents-chat`）+ `.wasm` 插件 |
+| :--- | :--- | :--- |
+| **定位** | 仅管理 **Agent 算力节点与会话执行生命周期** 的微内核控制面 | 独立的 **领域业务 SSOT Server** + 数据面中转网关 |
+| **资源模型** | **固定闭合模型**（`Node` / `Session` / `Activation`），不支持 CRD | **领域自治模型**（`Room` / `RoomAgent` / `RoomMessage` / `TokenAcl` / `FileStage`） |
+| **控制信令** | 节点注册、心跳租约、激活调度、5 级权限 SSOT、按需唤醒节点插件（`NodeExtensionCall`） | 房间编排、轮流窥屏/概率插嘴调度、群管家招募 |
+| **数据面与大文件** | **零参与**（不存储、不转发任何文件或业务回调） | 浏览器 $\leftrightarrow$ 业务 Server 暂存区 $\leftrightarrow$ 节点 `.wasm` 插件通过 `wasi:http` 直连流式传输 |
+
 后续所有架构演进与功能改动均严格遵循以下 6 条核心设计理念：
 
 ### 1.1 极简、业务无关的控制面（Lean & Business-Agnostic Control Plane）

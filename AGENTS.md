@@ -5,7 +5,8 @@
 - 数据表或协议结构变更时直接修改主 DDL 与结构体定义，测试库不兼容时直接清理重建。
 
 ## 2. 极简控制面与插件业务自治（Lean Control Plane & Plugin Autonomy）
-- **`ragents-apiserver` 保持纯粹精简**：仅负责 `Node`、`Session`、`Activation`、`ItemBatch`、`SessionEvent` 与 `RealtimeQueue` 的状态协调、双模调度、租约巡检与 SSE 广播；不依赖 `ragents-core`/`wasmtime`/`reqwest`，不承载或转发任何文件二进制/Base64 数据。
+- **收敛闭合原语，放弃 CRD 扩展**：`ragents-apiserver` 仅对固定闭合的核心执行原语（`Node`、`Session`、`Activation`、`ItemBatch`、`SessionEvent`、`RealtimeQueue`）做 SSOT，不引入 CRD/Admission 等重型机制；上层业务自建独立的领域 SSOT Server（如 `ragents-chat`）。
+- **`ragents-apiserver` 保持纯粹精简**：仅负责状态协调、双模调度、租约巡检与 SSE 广播；不依赖 `ragents-core`/`wasmtime`/`reqwest`，不承载或转发任何高频业务状态或文件二进制/Base64 数据。
 - **`ragents` 核心零业务耦合**：严禁在 `protocol`/`apiserver`/`daemon`/`core` 中硬编码聊天室、文件管理（`NodeFs*`）或特定内置工具名（如 `"web_search"`）等上层业务概念。
 - **插件直连上层服务**：上层业务（如 `ragents-chat` 的发言回调、节点目录浏览、文件上传/下载）统一由 `.wasm` 插件（通过 `tools.call` 或通用 `POST /api/v1/nodes/{node_id}/extensions/call` $\rightarrow$ `node.call`）闭环实现，插件内通过 `wasi:http` 直连上层服务传输数据，完全绕过 `api-server`。
 
