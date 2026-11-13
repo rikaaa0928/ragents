@@ -108,10 +108,13 @@ pub struct DaemonConfig {
     pub allowed_workspace_dirs: Vec<PathBuf>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    /// Automatically query provider `/v1/models` endpoint(s) to discover available models,
+    /// Automatically query local provider `/v1/models` endpoint(s) to discover node-local models,
     /// using explicitly configured `models` entries as supplements/overrides (default: `true`).
     #[serde(default = "default_auto_discover_models")]
     pub auto_discover_models: bool,
+    /// Inherit cluster-wide models and provider credentials from `api-server` (default: `true`).
+    #[serde(default = "default_use_cluster_models")]
+    pub use_cluster_models: bool,
     #[serde(default)]
     pub models: BTreeMap<String, LocalModelConfig>,
     #[serde(default)]
@@ -196,10 +199,21 @@ fn default_auto_discover_models() -> bool {
     true
 }
 
+fn default_use_cluster_models() -> bool {
+    true
+}
+
 impl DaemonConfig {
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, DaemonConfigError> {
         let content = std::fs::read_to_string(path)?;
         let mut cfg: Self = toml::from_str(&content)?;
+        if let Ok(raw_cluster) = std::env::var("RAGENTS_USE_CLUSTER_MODELS") {
+            match raw_cluster.trim().to_ascii_lowercase().as_str() {
+                "false" | "0" | "no" | "off" => cfg.use_cluster_models = false,
+                "true" | "1" | "yes" | "on" => cfg.use_cluster_models = true,
+                _ => {}
+            }
+        }
         if let Ok(env_base_url) = std::env::var("RAGENTS_BASE_URL") {
             if !env_base_url.trim().is_empty() {
                 for m in cfg.models.values_mut() {
@@ -207,37 +221,37 @@ impl DaemonConfig {
                         m.base_url = env_base_url.clone();
                     }
                 }
-                if let Ok(env_model) = std::env::var("RAGENTS_MODEL") {
-                    let trimmed = env_model.trim();
-                    if !trimmed.is_empty() {
-                        cfg.models
-                            .entry(trimmed.to_string())
-                            .or_insert_with(|| LocalModelConfig {
+                if !cfg.use_cluster_models {
+                    if let Ok(env_model) = std::env::var("RAGENTS_MODEL") {
+                        let trimmed = env_model.trim();
+                        if !trimmed.is_empty() {
+                            cfg.models
+                                .entry(trimmed.to_string())
+                                .or_insert_with(|| LocalModelConfig {
+                                    base_url: env_base_url.clone(),
+                                    api_key: None,
+                                    api_key_env: Some("RAGENTS_API_KEY".to_string()),
+                                    extra_headers: BTreeMap::new(),
+                                    default_temperature: None,
+                                    default_max_output_tokens: None,
+                                });
+                            if cfg.default_model.is_none() {
+                                cfg.default_model = Some(trimmed.to_string());
+                            }
+                        }
+                    } else if cfg.models.is_empty() {
+                        cfg.models.insert(
+                            "gpt-4.1".to_string(),
+                            LocalModelConfig {
                                 base_url: env_base_url.clone(),
                                 api_key: None,
                                 api_key_env: Some("RAGENTS_API_KEY".to_string()),
                                 extra_headers: BTreeMap::new(),
                                 default_temperature: None,
                                 default_max_output_tokens: None,
-                            });
-                        if cfg.default_model.is_none() {
-                            cfg.default_model = Some(trimmed.to_string());
-                        }
+                            },
+                        );
                     }
-                } else if cfg.models.is_empty() {
-                    // Seed a provider entry from RAGENTS_BASE_URL so `/v1/models` discovery can run
-                    // even when no explicit model name was specified in daemon.toml or RAGENTS_MODEL.
-                    cfg.models.insert(
-                        "gpt-4.1".to_string(),
-                        LocalModelConfig {
-                            base_url: env_base_url.clone(),
-                            api_key: None,
-                            api_key_env: Some("RAGENTS_API_KEY".to_string()),
-                            extra_headers: BTreeMap::new(),
-                            default_temperature: None,
-                            default_max_output_tokens: None,
-                        },
-                    );
                 }
             }
         }
@@ -261,6 +275,35 @@ impl DaemonConfig {
         }
         ensure_default_tmp_in_allowed_dirs(&mut cfg.allowed_workspace_dirs);
         Ok(cfg)
+    }
+
+    pub fn default_cluster(node_id: impl Into<NodeId>, server_url: impl Into<String>) -> Self {
+        let allowed_workspace_dirs = std::env::var("RAGENTS_ALLOWED_WORKSPACE_DIRS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| parse_workspace_dirs_csv(&s))
+            .unwrap_or_else(default_allowed_workspace_dirs);
+
+        Self {
+            node_id: node_id.into(),
+            server_url: server_url.into(),
+            auth_token: std::env::var("RAGENTS_AUTH_TOKEN").ok(),
+            executor_mode: ExecutorMode::Subprocess,
+            max_concurrent_runners: default_max_concurrent_runners(),
+            max_turns: None,
+            default_system_prompt: default_system_prompt(),
+            default_model: None,
+            temp_root_dir: default_temp_root(),
+            extensions_dir: default_extensions_dir(),
+            allowed_workspace_dirs,
+            labels: BTreeMap::new(),
+            auto_discover_models: default_auto_discover_models(),
+            use_cluster_models: true,
+            models: BTreeMap::new(),
+            extensions: Vec::new(),
+            interceptors: Vec::new(),
+            default_permissions: PermissionPolicyLayer::default(),
+        }
     }
 
     pub fn default_local(node_id: impl Into<NodeId>, server_url: impl Into<String>) -> Self {
@@ -303,6 +346,7 @@ impl DaemonConfig {
             allowed_workspace_dirs,
             labels: BTreeMap::new(),
             auto_discover_models: default_auto_discover_models(),
+            use_cluster_models: true,
             models,
             extensions: Vec::new(),
             interceptors: Vec::new(),
@@ -379,19 +423,21 @@ impl DaemonConfig {
                 });
         }
 
-        if let Ok(env_base_url) = std::env::var("RAGENTS_BASE_URL") {
-            let trimmed = env_base_url.trim().trim_end_matches('/').to_string();
-            if !trimmed.is_empty() && !trimmed.contains(".internal") {
-                providers
-                    .entry(trimmed)
-                    .or_insert_with(|| LocalModelConfig {
-                        base_url: env_base_url,
-                        api_key: None,
-                        api_key_env: Some("RAGENTS_API_KEY".to_string()),
-                        extra_headers: BTreeMap::new(),
-                        default_temperature: None,
-                        default_max_output_tokens: None,
-                    });
+        if !self.use_cluster_models {
+            if let Ok(env_base_url) = std::env::var("RAGENTS_BASE_URL") {
+                let trimmed = env_base_url.trim().trim_end_matches('/').to_string();
+                if !trimmed.is_empty() && !trimmed.contains(".internal") {
+                    providers
+                        .entry(trimmed)
+                        .or_insert_with(|| LocalModelConfig {
+                            base_url: env_base_url,
+                            api_key: None,
+                            api_key_env: Some("RAGENTS_API_KEY".to_string()),
+                            extra_headers: BTreeMap::new(),
+                            default_temperature: None,
+                            default_max_output_tokens: None,
+                        });
+                }
             }
         }
 
@@ -577,6 +623,28 @@ impl DaemonConfig {
         session: &Session,
         activation: &Activation,
     ) -> Result<(ConfigRevision, PermissionSnapshot, ModelEndpointConfig), DaemonConfigError> {
+        self.merge_for_activation_with_cluster_context(
+            discovered,
+            cluster_system_prompt,
+            node_spec,
+            None,
+            None,
+            session,
+            activation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_for_activation_with_cluster_context(
+        &self,
+        discovered: &BTreeMap<String, LocalModelConfig>,
+        cluster_system_prompt: &str,
+        node_spec: &NodeSpec,
+        cluster_default_model: Option<&str>,
+        cluster_model_provider: Option<&ResolvedModelProvider>,
+        session: &Session,
+        activation: &Activation,
+    ) -> Result<(ConfigRevision, PermissionSnapshot, ModelEndpointConfig), DaemonConfigError> {
         if let SchedulingMode::Pinned { workspace_path, .. } = &session.spec.scheduling {
             self.validate_workspace_path(workspace_path)?;
         }
@@ -588,27 +656,69 @@ impl DaemonConfig {
             .map(|m| m.name.clone())
             .or_else(|| session.spec.model.as_ref().map(|m| m.name.clone()))
             .or_else(|| self.default_model.clone())
+            .or_else(|| {
+                if self.use_cluster_models {
+                    cluster_default_model.map(str::to_string)
+                } else {
+                    None
+                }
+            })
             .or_else(|| self.models.keys().next().cloned())
             .or_else(|| discovered.keys().next().cloned())
+            .or_else(|| {
+                if self.use_cluster_models {
+                    cluster_model_provider.map(|p| p.model_id.clone())
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| DaemonConfigError::NoModelsConfigured(self.node_id.to_string()))?;
 
-        // Explicitly configured `self.models` takes priority over `/v1/models` discovered entries.
-        let local_model = self
-            .models
-            .get(&requested_model_name)
-            .or_else(|| discovered.get(&requested_model_name))
-            .ok_or_else(|| DaemonConfigError::UnsupportedModel {
-                node_id: self.node_id.to_string(),
-                model: requested_model_name.clone(),
-                supported: self.supported_models_with_discovered(discovered),
-            })?;
-
-        let api_key = local_model.resolve_api_key(&requested_model_name)?;
-        let endpoint = ModelEndpointConfig {
-            base_url: local_model.base_url.clone(),
-            api_key,
-            extra_headers: local_model.extra_headers.clone(),
-        };
+        // Explicitly configured local `self.models` takes priority over discovered local models,
+        // which take priority over cluster-provided OpenResponses settings from `api-server`.
+        let (endpoint, model_default_temperature, model_default_max_output_tokens) =
+            if let Some(local_model) = self
+                .models
+                .get(&requested_model_name)
+                .or_else(|| discovered.get(&requested_model_name))
+            {
+                let api_key = local_model.resolve_api_key(&requested_model_name)?;
+                (
+                    ModelEndpointConfig {
+                        base_url: local_model.base_url.clone(),
+                        api_key,
+                        extra_headers: local_model.extra_headers.clone(),
+                    },
+                    local_model.default_temperature,
+                    local_model.default_max_output_tokens,
+                )
+            } else if self.use_cluster_models {
+                if let Some(cluster_provider) =
+                    cluster_model_provider.filter(|p| p.model_id == requested_model_name)
+                {
+                    (
+                        ModelEndpointConfig {
+                            base_url: cluster_provider.base_url.clone(),
+                            api_key: cluster_provider.api_key.clone(),
+                            extra_headers: cluster_provider.extra_headers.clone(),
+                        },
+                        cluster_provider.default_temperature,
+                        cluster_provider.default_max_output_tokens,
+                    )
+                } else {
+                    return Err(DaemonConfigError::UnsupportedModel {
+                        node_id: self.node_id.to_string(),
+                        model: requested_model_name,
+                        supported: self.supported_models_with_discovered(discovered),
+                    });
+                }
+            } else {
+                return Err(DaemonConfigError::UnsupportedModel {
+                    node_id: self.node_id.to_string(),
+                    model: requested_model_name,
+                    supported: self.supported_models_with_discovered(discovered),
+                });
+            };
 
         let temperature = activation
             .spec
@@ -616,7 +726,7 @@ impl DaemonConfig {
             .as_ref()
             .and_then(|m| m.temperature)
             .or_else(|| session.spec.model.as_ref().and_then(|m| m.temperature))
-            .or(local_model.default_temperature);
+            .or(model_default_temperature);
 
         let max_output_tokens = activation
             .spec
@@ -630,7 +740,7 @@ impl DaemonConfig {
                     .as_ref()
                     .and_then(|m| m.max_output_tokens)
             })
-            .or(local_model.default_max_output_tokens);
+            .or(model_default_max_output_tokens);
 
         let reasoning = activation
             .spec

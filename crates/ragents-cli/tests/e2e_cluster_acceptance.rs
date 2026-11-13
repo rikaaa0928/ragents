@@ -147,6 +147,7 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
         allowed_workspace_dirs: vec![tmp.path().to_path_buf()],
         labels: BTreeMap::new(),
         auto_discover_models: false,
+        use_cluster_models: true,
         models,
         extensions: vec![ExtensionSpec {
             name: "file_editor".to_string(),

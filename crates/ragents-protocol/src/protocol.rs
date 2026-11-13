@@ -174,7 +174,9 @@ pub enum DaemonToServerMessage {
         #[serde(default)]
         labels: BTreeMap<String, String>,
         #[serde(default)]
-        supported_models: Vec<String>,
+        local_models: Vec<String>,
+        #[serde(default = "default_true_flag")]
+        use_cluster_models: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         default_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,6 +190,12 @@ pub enum DaemonToServerMessage {
         max_concurrent_runners: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         running_activation_ids: Option<Vec<ActivationId>>,
+    },
+    /// Daemon queries `api-server` for the OpenResponses provider credentials/defaults of a cluster model
+    ResolveModelProvider {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Heartbeat {
         request_id: String,
@@ -380,6 +388,16 @@ pub enum ServerToDaemonMessage {
         resource_version: ResourceVersion,
         #[serde(default)]
         node_spec: NodeSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster_default_model: Option<String>,
+    },
+    ModelProviderReply {
+        request_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<ResolvedModelProvider>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     Ack {
         request_id: String,
@@ -444,6 +462,10 @@ pub enum ServerToDaemonMessage {
         cluster_system_prompt: String,
         #[serde(default)]
         node_spec: Box<NodeSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster_default_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster_model_provider: Option<ResolvedModelProvider>,
     },
     /// Server pushes declarative spec updates (e.g. desired_phase=Cancelled or permission resolutions)
     ReconcileActivation {
@@ -463,4 +485,8 @@ pub enum ServerToDaemonMessage {
         request_id: String,
         request: NodeExtensionCallRequest,
     },
+}
+
+fn default_true_flag() -> bool {
+    true
 }

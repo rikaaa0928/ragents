@@ -76,6 +76,18 @@ impl RagentsClient {
         Self::parse_response(resp).await
     }
 
+    pub async fn list_models(&self) -> Result<ClusterModelsResponse, ClientError> {
+        let url = format!("{}/api/v1/models", self.base_url);
+        let resp = self.http.get(url).send().await?;
+        Self::parse_response(resp).await
+    }
+
+    pub async fn refresh_models(&self) -> Result<ClusterModelsResponse, ClientError> {
+        let url = format!("{}/api/v1/models/refresh", self.base_url);
+        let resp = self.http.post(url).send().await?;
+        Self::parse_response(resp).await
+    }
+
     pub async fn get_node(&self, node_id: &NodeId) -> Result<Option<Node>, ClientError> {
         let url = format!("{}/api/v1/nodes/{}", self.base_url, node_id);
         let resp = self.http.get(url).send().await?;

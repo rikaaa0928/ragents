@@ -1,4 +1,5 @@
-use super::{ObjectMeta, PermissionPolicyLayer};
+use super::{default_true, ObjectMeta, PermissionPolicyLayer};
+use crate::ids::NodeId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -55,16 +56,79 @@ pub enum NodePhase {
     NotReady,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterModelSource {
+    Cluster,
+    NodeLocal,
+    ClusterAndNodeLocal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClusterModelInfo {
+    pub id: String,
+    pub source: ClusterModelSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_on_nodes: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_output_tokens: Option<i32>,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClusterModelsResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ClusterModelInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Resolved OpenResponses provider credentials/settings sent by `api-server` to `agent-daemon`
+/// strictly over the authenticated `DaemonTunnel`. Never stored in `SessionSpec`, `ConfigRevision`,
+/// or returned to browser clients.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedModelProvider {
+    pub model_id: String,
+    pub base_url: String,
+    pub api_key: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_output_tokens: Option<i32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub phase: NodePhase,
     pub hostname: String,
     pub os: String,
     pub arch: String,
-    /// List of OpenResponses model names supported by this daemon's local config
+    /// Node-local OpenResponses model names configured/discovered on this daemon
+    #[serde(default)]
+    pub local_models: Vec<String>,
+    /// Optional node-local default model configured on this daemon
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_default_model: Option<String>,
+    /// Whether this node falls back to cluster models configured on `api-server`
+    #[serde(default = "default_true")]
+    pub use_cluster_models: bool,
+    /// Effective list of model names runnable on this node (`local_models` + cluster models if `use_cluster_models`)
     #[serde(default)]
     pub supported_models: Vec<String>,
-    /// Default model on this node when session/activation omits model name
+    /// Effective default model on this node (`local_default_model`, or inherited cluster default when `use_cluster_models` is true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(default)]

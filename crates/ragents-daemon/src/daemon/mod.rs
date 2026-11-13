@@ -169,14 +169,15 @@ impl AgentDaemon {
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
 
-        let (lease_ttl_ms, _rv, initial_node_spec) = tunnel
-            .register_node_with_running_activations(
+        let (lease_ttl_ms, _rv, initial_node_spec, _cluster_default) = tunnel
+            .register_node_with_models_and_running_activations(
                 self.config.node_id.clone(),
                 hostname,
                 os,
                 arch,
                 self.config.labels.clone(),
                 self.effective_supported_models(),
+                self.config.use_cluster_models,
                 self.effective_default_model(),
                 Some(self.config.default_system_prompt.clone()),
                 self.config.default_permissions.clone(),
@@ -242,6 +243,8 @@ impl AgentDaemon {
                                 lease_epoch,
                                 cluster_system_prompt,
                                 node_spec,
+                                cluster_default_model,
+                                cluster_model_provider,
                             }) => {
                                 daemon.handle_dispatch(
                                     *session,
@@ -249,6 +252,8 @@ impl AgentDaemon {
                                     lease_epoch,
                                     cluster_system_prompt,
                                     *node_spec,
+                                    cluster_default_model,
+                                    cluster_model_provider,
                                     tunnel.clone(),
                                     active_runners.clone(),
                                     active_tasks.clone(),
@@ -366,14 +371,15 @@ impl AgentDaemon {
                                 .keys()
                                 .cloned()
                                 .collect();
-                            if let Ok((_, _, reconnected_node_spec)) = new_tunnel
-                                .register_node_with_running_activations(
+                            if let Ok((_, _, reconnected_node_spec, _)) = new_tunnel
+                                .register_node_with_models_and_running_activations(
                                     daemon.config.node_id.clone(),
                                     hostname,
                                     os,
                                     arch,
                                     daemon.config.labels.clone(),
                                     daemon.effective_supported_models(),
+                                    daemon.config.use_cluster_models,
                                     daemon.effective_default_model(),
                                     Some(daemon.config.default_system_prompt.clone()),
                                     daemon.config.default_permissions.clone(),
@@ -415,6 +421,8 @@ impl AgentDaemon {
         lease_epoch: LeaseEpoch,
         cluster_system_prompt: String,
         node_spec: NodeSpec,
+        cluster_default_model: Option<String>,
+        cluster_model_provider: Option<ResolvedModelProvider>,
         tunnel: DaemonTunnelHandle,
         active_runners: Arc<AtomicU32>,
         active_tasks: Arc<Mutex<HashMap<ActivationId, ActiveActivationControl>>>,
@@ -435,10 +443,60 @@ impl AgentDaemon {
                     .lock()
                     .expect("discovered_models mutex poisoned")
                     .clone();
-                match daemon.config.merge_for_activation_with_context(
+                let explicit_model = activation
+                    .spec
+                    .model_override
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .or_else(|| session.spec.model.as_ref().map(|m| m.name.clone()))
+                    .or_else(|| daemon.config.default_model.clone());
+                let is_local_model = explicit_model
+                    .as_deref()
+                    .map(|m| daemon.config.models.contains_key(m) || disc.contains_key(m))
+                    .unwrap_or_else(|| {
+                        cluster_default_model.is_none()
+                            && (!daemon.config.models.is_empty() || !disc.is_empty())
+                    });
+
+                let resolved_provider = if daemon.config.use_cluster_models && !is_local_model {
+                    let target_for_rpc = explicit_model.clone().or_else(|| cluster_default_model.clone());
+                    let matches_pushed = cluster_model_provider.as_ref().is_some_and(|p| {
+                        target_for_rpc
+                            .as_deref()
+                            .map(|t| p.model_id == t)
+                            .unwrap_or(true)
+                    });
+                    if matches_pushed {
+                        cluster_model_provider.clone()
+                    } else {
+                        match tunnel.resolve_model_provider(target_for_rpc).await {
+                            Ok(p) => Some(p),
+                            Err(err) => {
+                                let _ = tunnel
+                                    .complete_activation(
+                                        sess_id,
+                                        act_id,
+                                        lease_epoch,
+                                        None,
+                                        ActivationTerminalOutcome::Failed {
+                                            error: err.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                match daemon.config.merge_for_activation_with_cluster_context(
                     &disc,
                     &cluster_system_prompt,
                     &node_spec,
+                    cluster_default_model.as_deref(),
+                    resolved_provider.as_ref(),
                     &session,
                     &activation,
                 ) {

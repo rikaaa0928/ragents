@@ -635,3 +635,195 @@ fn test_context_and_events_full_vs_view_mode_placeholders() {
     assert!(view_events_json.contains(&placeholder));
 }
 
+#[tokio::test]
+async fn test_cluster_model_catalog_discovery_node_merge_and_refresh() {
+    use crate::models::{ApiserverConfig, ApiserverProviderConfig, ClusterModelCatalog};
+    use crate::server::{serve_tcp, ApiServerState};
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let counter = call_count.clone();
+    let mock_router = Router::new().route(
+        "/v1/models",
+        get(move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match n {
+                    0 => Ok(Json(serde_json::json!({
+                        "data": [
+                            { "id": "cluster-alpha", "owned_by": "rosetta", "capabilities": ["reasoning"] },
+                            { "id": "cluster-beta", "owned_by": "rosetta" }
+                        ]
+                    }))),
+                    1 => Ok(Json(serde_json::json!({
+                        "data": [
+                            { "id": "cluster-alpha", "owned_by": "rosetta", "capabilities": ["reasoning"] },
+                            { "id": "cluster-beta", "owned_by": "rosetta" },
+                            { "id": "cluster-gamma", "owned_by": "rosetta" }
+                        ]
+                    }))),
+                    _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "upstream down")),
+                }
+            }
+        }),
+    );
+
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_router).await;
+    });
+
+    let apiserver_cfg = ApiserverConfig {
+        auto_discover_models: true,
+        default_model: Some("cluster-alpha".to_string()),
+        providers: vec![ApiserverProviderConfig {
+            name: Some("mock-rosetta".to_string()),
+            base_url: format!("http://{mock_addr}"),
+            api_key: Some("sk-cluster-secret".to_string()),
+            api_key_env: None,
+            extra_headers: BTreeMap::new(),
+            default_temperature: Some(0.2),
+            default_max_output_tokens: Some(4096),
+        }],
+        models: BTreeMap::new(),
+    };
+    let catalog = Arc::new(ClusterModelCatalog::from_config(apiserver_cfg));
+    let store = SqliteStore::open_in_memory().unwrap();
+    catalog.refresh(Some(&store)).await.expect("initial refresh");
+
+    // Node 1 inherits cluster models; Node 2 keeps only local models (plus overrides cluster-alpha? No, isolate Node 2).
+    store
+        .register_node_with_models_and_running_activations(
+            NodeId::new("node_cluster_inherit"),
+            "host1".to_string(),
+            "linux".to_string(),
+            "aarch64".to_string(),
+            BTreeMap::new(),
+            vec![],
+            true,
+            None,
+            None,
+            PermissionPolicyLayer::default(),
+            vec![],
+            vec!["/tmp".to_string()],
+            4,
+            10_000,
+            None,
+        )
+        .unwrap();
+
+    store
+        .register_node_with_models_and_running_activations(
+            NodeId::new("node_isolated_local"),
+            "host2".to_string(),
+            "linux".to_string(),
+            "x86_64".to_string(),
+            BTreeMap::new(),
+            vec!["local-rocm".to_string()],
+            false,
+            Some("local-rocm".to_string()),
+            None,
+            PermissionPolicyLayer::default(),
+            vec![],
+            vec!["/tmp".to_string()],
+            4,
+            10_000,
+            None,
+        )
+        .unwrap();
+
+    let node1 = store
+        .get_node(&NodeId::new("node_cluster_inherit"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        node1.status.supported_models,
+        vec!["cluster-alpha".to_string(), "cluster-beta".to_string()]
+    );
+    assert_eq!(node1.status.default_model.as_deref(), Some("cluster-alpha"));
+
+    let node2 = store
+        .get_node(&NodeId::new("node_isolated_local"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(node2.status.supported_models, vec!["local-rocm".to_string()]);
+    assert_eq!(node2.status.default_model.as_deref(), Some("local-rocm"));
+
+    let state = ApiServerState::new_with_catalog(store.clone(), 10_000, catalog.clone());
+    let server_cancel = CancellationToken::new();
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = serve_tcp(api_listener, state, server_cancel.clone())
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let initial: ClusterModelsResponse = http
+        .get(format!("http://{api_addr}/api/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial.default_model.as_deref(), Some("cluster-alpha"));
+    assert_eq!(initial.models.len(), 3);
+    let alpha = initial
+        .models
+        .iter()
+        .find(|m| m.id == "cluster-alpha")
+        .unwrap();
+    assert_eq!(alpha.source, ClusterModelSource::Cluster);
+    assert_eq!(alpha.available_on_nodes, vec![NodeId::new("node_cluster_inherit")]);
+    assert!(alpha.is_default);
+    let local_m = initial.models.iter().find(|m| m.id == "local-rocm").unwrap();
+    assert_eq!(local_m.source, ClusterModelSource::NodeLocal);
+    assert_eq!(local_m.available_on_nodes, vec![NodeId::new("node_isolated_local")]);
+
+    // Trigger refresh -> discovers cluster-gamma and propagates to node1!
+    let refreshed: ClusterModelsResponse = http
+        .post(format!("http://{api_addr}/api/v1/models/refresh"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(refreshed.models.iter().any(|m| m.id == "cluster-gamma"));
+    let node1_after = store
+        .get_node(&NodeId::new("node_cluster_inherit"))
+        .unwrap()
+        .unwrap();
+    assert!(node1_after
+        .status
+        .supported_models
+        .contains(&"cluster-gamma".to_string()));
+
+    // Refresh failure returns 502 while preserving cached catalog!
+    let fail_resp = http
+        .post(format!("http://{api_addr}/api/v1/models/refresh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fail_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    let after_fail: ClusterModelsResponse = http
+        .get(format!("http://{api_addr}/api/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(after_fail.last_error.is_some());
+    assert!(after_fail.models.iter().any(|m| m.id == "cluster-gamma"));
+
+    server_cancel.cancel();
+}
+

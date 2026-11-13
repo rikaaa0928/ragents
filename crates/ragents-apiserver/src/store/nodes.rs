@@ -1,8 +1,29 @@
-use super::{ReconcileNotice, ScheduledDispatch, SqliteStore, StoreError};
+use super::{ClusterModelSnapshot, ReconcileNotice, ScheduledDispatch, SqliteStore, StoreError};
 use chrono::{DateTime, Duration, Utc};
 use ragents_protocol::*;
 use rusqlite::{params, OptionalExtension};
 use std::collections::BTreeMap;
+
+pub(crate) fn merge_node_supported_models(
+    local_models: &[String],
+    use_cluster_models: bool,
+    cluster_models: &[String],
+) -> Vec<String> {
+    let mut merged = Vec::new();
+    for m in local_models {
+        if !m.trim().is_empty() && !merged.iter().any(|x| x == m) {
+            merged.push(m.clone());
+        }
+    }
+    if use_cluster_models {
+        for m in cluster_models {
+            if !m.trim().is_empty() && !merged.iter().any(|x| x == m) {
+                merged.push(m.clone());
+            }
+        }
+    }
+    merged
+}
 
 /// Grace period (5 minutes) after a node's heartbeat lease expires (`NodePhase::NotReady`)
 /// before already-running activations (`Running` / `WaitingForInteraction` / `Cancelling`)
@@ -120,8 +141,46 @@ impl SqliteStore {
         os: String,
         arch: String,
         labels: BTreeMap<String, String>,
-        supported_models: Vec<String>,
+        local_models: Vec<String>,
         default_model: Option<String>,
+        default_system_prompt: Option<String>,
+        default_permissions: PermissionPolicyLayer,
+        installed_extensions: Vec<String>,
+        allowed_workspace_dirs: Vec<String>,
+        max_concurrent_runners: u32,
+        lease_ttl_ms: u64,
+        running_activation_ids: Option<Vec<ActivationId>>,
+    ) -> Result<(Node, Vec<ScheduledDispatch>), StoreError> {
+        self.register_node_with_models_and_running_activations(
+            node_id,
+            hostname,
+            os,
+            arch,
+            labels,
+            local_models,
+            true,
+            default_model,
+            default_system_prompt,
+            default_permissions,
+            installed_extensions,
+            allowed_workspace_dirs,
+            max_concurrent_runners,
+            lease_ttl_ms,
+            running_activation_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_node_with_models_and_running_activations(
+        &self,
+        node_id: NodeId,
+        hostname: String,
+        os: String,
+        arch: String,
+        labels: BTreeMap<String, String>,
+        local_models: Vec<String>,
+        use_cluster_models: bool,
+        local_default_model: Option<String>,
         default_system_prompt: Option<String>,
         default_permissions: PermissionPolicyLayer,
         installed_extensions: Vec<String>,
@@ -135,6 +194,17 @@ impl SqliteStore {
                 ProtocolValidationError::InvalidIdentifier(node_id.to_string()),
             ));
         }
+
+        let cluster_snap = self.get_cluster_models_snapshot();
+        let supported_models =
+            merge_node_supported_models(&local_models, use_cluster_models, &cluster_snap.model_ids);
+        let effective_default_model = local_default_model.clone().or_else(|| {
+            if use_cluster_models {
+                cluster_snap.default_model.clone()
+            } else {
+                None
+            }
+        });
 
         let mut events_to_publish = Vec::new();
         let mut reconcile_notices = Vec::new();
@@ -202,8 +272,11 @@ impl SqliteStore {
                 hostname,
                 os,
                 arch,
+                local_models,
+                local_default_model,
+                use_cluster_models,
                 supported_models,
-                default_model,
+                default_model: effective_default_model,
                 installed_extensions,
                 allowed_workspace_dirs,
                 effective_node_prompt: effective_node_prompt.clone(),
@@ -516,6 +589,66 @@ impl SqliteStore {
         }
 
         Ok(())
+    }
+
+    pub fn refresh_nodes_with_cluster_models(
+        &self,
+        snap: &ClusterModelSnapshot,
+    ) -> Result<Vec<ScheduledDispatch>, StoreError> {
+        let mut events_to_publish = Vec::new();
+        let dispatches;
+        {
+            let mut conn = self.conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+
+            let rows: Vec<(String, String)> = {
+                let mut stmt = tx.prepare("SELECT node_id, status_json FROM nodes")?;
+                let mapped = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                let mut list = Vec::new();
+                for r in mapped {
+                    list.push(r?);
+                }
+                list
+            };
+
+            for (node_id_str, status_json) in rows {
+                let mut status: NodeStatus = serde_json::from_str(&status_json)?;
+                if !status.use_cluster_models {
+                    continue;
+                }
+                let next_supported = merge_node_supported_models(
+                    &status.local_models,
+                    status.use_cluster_models,
+                    &snap.model_ids,
+                );
+                let next_default = status
+                    .local_default_model
+                    .clone()
+                    .or_else(|| snap.default_model.clone());
+                if status.supported_models != next_supported || status.default_model != next_default {
+                    status.supported_models = next_supported;
+                    status.default_model = next_default;
+                    let rv = Self::next_resource_version(&tx)?;
+                    tx.execute(
+                        "UPDATE nodes SET resource_version = ?1, status_json = ?2 WHERE node_id = ?3",
+                        params![
+                            rv.value() as i64,
+                            serde_json::to_string(&status)?,
+                            node_id_str,
+                        ],
+                    )?;
+                }
+            }
+
+            dispatches = Self::schedule_pending_in_tx(&tx, &mut events_to_publish)?;
+            tx.commit()?;
+        }
+
+        self.publish_events(events_to_publish);
+        self.publish_dispatches(dispatches.clone());
+        Ok(dispatches)
     }
 
     pub fn list_nodes(&self) -> Result<Vec<Node>, StoreError> {

@@ -57,6 +57,9 @@ pub enum Commands {
         db: PathBuf,
         #[arg(long, default_value_t = DEFAULT_LEASE_TTL_MS)]
         lease_ttl_ms: u64,
+        /// Optional path to api-server TOML config (overrides RAGENTS_APISERVER_CONFIG)
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Run standalone node agent-daemon (kubelet)
     Daemon {
@@ -75,6 +78,11 @@ pub enum Commands {
     Node {
         #[command(subcommand)]
         cmd: NodeSubcommand,
+    },
+    /// Inspect or refresh cluster models managed by api-server
+    Model {
+        #[command(subcommand)]
+        cmd: ModelSubcommand,
     },
     /// Declarative session management (Pinned & Floating modes, lineage fork)
     Session {
@@ -150,6 +158,12 @@ pub enum Commands {
 pub enum NodeSubcommand {
     List,
     Get { node_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelSubcommand {
+    List,
+    Refresh,
 }
 
 #[derive(Debug, Subcommand)]

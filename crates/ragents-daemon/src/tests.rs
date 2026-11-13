@@ -82,6 +82,7 @@ fn make_daemon_cfg(
         },
         labels: BTreeMap::new(),
         auto_discover_models: false,
+        use_cluster_models: true,
         models: model_map,
         extensions: vec![],
         interceptors: vec![],
@@ -2362,6 +2363,245 @@ async fn test_session_history_extension_list_search_read_and_workspace_isolation
     );
 
     d_cancel.cancel();
+    server_cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_centralized_cluster_models_direct_invocation_and_local_override() {
+    use axum::{
+        http::HeaderMap,
+        routing::{get, post},
+        Json, Router,
+    };
+    use ragents_apiserver::{ApiserverConfig, ApiserverProviderConfig, ClusterModelCatalog};
+
+    let cluster_calls: Arc<Mutex<Vec<(String, String, Option<String>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let local_calls: Arc<Mutex<Vec<(String, String, Option<String>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    // 1. Mock Cluster OpenResponses Provider (`/v1/models` + `/v1/responses`)
+    let cluster_calls_ref = cluster_calls.clone();
+    let cluster_router = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "data": [
+                        { "id": "cluster-pro" },
+                        { "id": "cluster-fast" }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                let calls = cluster_calls_ref.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let extra = headers
+                        .get("x-cluster-provider")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    let model = body
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    calls.lock().unwrap().push((model.clone(), auth, extra));
+                    let resp = make_openresponses_resource(
+                        "resp_cluster_1",
+                        &model,
+                        vec![Item::assistant_message(format!("cluster handled {model}"))],
+                        None,
+                    );
+                    Json(resp)
+                }
+            }),
+        );
+    let cluster_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cluster_addr = cluster_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(cluster_listener, cluster_router).await;
+    });
+
+    // 2. Mock Node-Local Override OpenResponses Provider (`/v1/responses`)
+    let local_calls_ref = local_calls.clone();
+    let local_router = Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+            let calls = local_calls_ref.clone();
+            async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let model = body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                calls.lock().unwrap().push((model.clone(), auth, None));
+                let resp = make_openresponses_resource(
+                    "resp_local_1",
+                    &model,
+                    vec![Item::assistant_message(format!("local override handled {model}"))],
+                    None,
+                );
+                Json(resp)
+            }
+        }),
+    );
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(local_listener, local_router).await;
+    });
+
+    // 3. Start api-server with centralized ClusterModelCatalog
+    let mut extra_headers = BTreeMap::new();
+    extra_headers.insert("x-cluster-provider".to_string(), "rosetta-central".to_string());
+    let apiserver_cfg = ApiserverConfig {
+        auto_discover_models: true,
+        default_model: Some("cluster-pro".to_string()),
+        providers: vec![ApiserverProviderConfig {
+            name: Some("central".to_string()),
+            base_url: format!("http://{cluster_addr}"),
+            api_key: Some("sk-cluster-secret".to_string()),
+            api_key_env: None,
+            extra_headers,
+            default_temperature: Some(0.15),
+            default_max_output_tokens: Some(4096),
+        }],
+        models: BTreeMap::new(),
+    };
+    let catalog = Arc::new(ClusterModelCatalog::from_config(apiserver_cfg));
+    let store = SqliteStore::open_in_memory().unwrap();
+    catalog.refresh(Some(&store)).await.unwrap();
+
+    let state = ApiServerState::new_with_catalog(store, 10_000, catalog);
+    let server_cancel = CancellationToken::new();
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = serve_tcp(api_listener, state, server_cancel.clone())
+        .await
+        .unwrap();
+    let server_url = format!("http://{api_addr}");
+    let client = RagentsClient::new(&server_url);
+
+    // 4. Start daemon with ZERO local models (pure cluster-model mode) + 1 local override for `cluster-fast`
+    let tmp = tempfile::tempdir().unwrap();
+    let mut local_models = BTreeMap::new();
+    local_models.insert(
+        "cluster-fast".to_string(),
+        LocalModelConfig {
+            base_url: format!("http://{local_addr}"),
+            api_key: Some("sk-node-local-secret".to_string()),
+            api_key_env: None,
+            extra_headers: BTreeMap::new(),
+            default_temperature: None,
+            default_max_output_tokens: None,
+        },
+    );
+    let mut daemon_cfg = DaemonConfig::default_cluster("node_central_test", &server_url);
+    daemon_cfg.temp_root_dir = tmp.path().join("daemon_tmp");
+    daemon_cfg.auto_discover_models = false;
+    daemon_cfg.models = local_models;
+    daemon_cfg.allowed_workspace_dirs.push(tmp.path().to_path_buf());
+
+    let daemon_cancel = CancellationToken::new();
+    let daemon = AgentDaemon::new(daemon_cfg);
+    daemon.start(daemon_cancel.clone()).await.unwrap();
+
+    let mut events_rx = client.watch_events(None, 0).await.unwrap();
+
+    // 5a. Run session with omitted model -> inherits `cluster-pro` and calls cluster endpoint directly!
+    let created_default = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_cluster_default")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Floating {
+                    node_selector: BTreeMap::new(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: None,
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("hello cluster default")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+    let act1_id = ActivationId::new(created_default.initial_activation.unwrap().metadata.id);
+    while let Some(Ok(env)) = events_rx.next().await {
+        if env.activation_id.as_ref() == Some(&act1_id)
+            && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+        {
+            break;
+        }
+    }
+
+    // 5b. Run session with `cluster-fast` -> daemon must use its node-local override!
+    let created_local = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_local_override")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Floating {
+                    node_selector: BTreeMap::new(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("cluster-fast")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("hello local override")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+    let act2_id = ActivationId::new(created_local.initial_activation.unwrap().metadata.id);
+    while let Some(Ok(env)) = events_rx.next().await {
+        if env.activation_id.as_ref() == Some(&act2_id)
+            && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+        {
+            break;
+        }
+    }
+
+    let c_calls = cluster_calls.lock().unwrap();
+    assert_eq!(c_calls.len(), 1);
+    assert_eq!(c_calls[0].0, "cluster-pro");
+    assert_eq!(c_calls[0].1, "Bearer sk-cluster-secret");
+    assert_eq!(c_calls[0].2.as_deref(), Some("rosetta-central"));
+
+    let l_calls = local_calls.lock().unwrap();
+    assert_eq!(l_calls.len(), 1);
+    assert_eq!(l_calls[0].0, "cluster-fast");
+    assert_eq!(l_calls[0].1, "Bearer sk-node-local-secret");
+
+    daemon_cancel.cancel();
     server_cancel.cancel();
 }
 

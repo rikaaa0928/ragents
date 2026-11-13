@@ -26,3 +26,4 @@ base64.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 ragents-apiserver.workspace = true
+axum.workspace = true

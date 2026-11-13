@@ -16,6 +16,8 @@ pub enum DaemonPushEvent {
         lease_epoch: LeaseEpoch,
         cluster_system_prompt: String,
         node_spec: Box<NodeSpec>,
+        cluster_default_model: Option<String>,
+        cluster_model_provider: Option<ResolvedModelProvider>,
     },
     ReconcileActivation {
         session_id: SessionId,
@@ -253,7 +255,7 @@ impl DaemonTunnelHandle {
         os: String,
         arch: String,
         labels: BTreeMap<String, String>,
-        supported_models: Vec<String>,
+        local_models: Vec<String>,
         default_model: Option<String>,
         default_system_prompt: Option<String>,
         default_permissions: PermissionPolicyLayer,
@@ -262,6 +264,44 @@ impl DaemonTunnelHandle {
         max_concurrent_runners: u32,
         running_activation_ids: Option<Vec<ActivationId>>,
     ) -> Result<(u64, ResourceVersion, NodeSpec), ClientError> {
+        self.register_node_with_models_and_running_activations(
+            node_id,
+            hostname,
+            os,
+            arch,
+            labels,
+            local_models,
+            true,
+            default_model,
+            default_system_prompt,
+            default_permissions,
+            installed_extensions,
+            allowed_workspace_dirs,
+            max_concurrent_runners,
+            running_activation_ids,
+        )
+        .await
+        .map(|(ttl, rv, spec, _)| (ttl, rv, spec))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_node_with_models_and_running_activations(
+        &self,
+        node_id: NodeId,
+        hostname: String,
+        os: String,
+        arch: String,
+        labels: BTreeMap<String, String>,
+        local_models: Vec<String>,
+        use_cluster_models: bool,
+        default_model: Option<String>,
+        default_system_prompt: Option<String>,
+        default_permissions: PermissionPolicyLayer,
+        installed_extensions: Vec<String>,
+        allowed_workspace_dirs: Vec<String>,
+        max_concurrent_runners: u32,
+        running_activation_ids: Option<Vec<ActivationId>>,
+    ) -> Result<(u64, ResourceVersion, NodeSpec, Option<String>), ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::RegisterNode {
@@ -271,7 +311,8 @@ impl DaemonTunnelHandle {
                 os,
                 arch,
                 labels,
-                supported_models,
+                local_models,
+                use_cluster_models,
                 default_model,
                 default_system_prompt,
                 default_permissions,
@@ -287,8 +328,14 @@ impl DaemonTunnelHandle {
                 lease_ttl_ms,
                 resource_version,
                 node_spec,
+                cluster_default_model,
                 ..
-            } => Ok((lease_ttl_ms, resource_version, node_spec)),
+            } => Ok((
+                lease_ttl_ms,
+                resource_version,
+                node_spec,
+                cluster_default_model,
+            )),
             ServerToDaemonMessage::Ack {
                 ok: false, error, ..
             } => Err(ClientError::Tunnel(
@@ -296,6 +343,31 @@ impl DaemonTunnelHandle {
             )),
             other => Err(ClientError::Tunnel(format!(
                 "unexpected register response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn resolve_model_provider(
+        &self,
+        model: Option<String>,
+    ) -> Result<ResolvedModelProvider, ClientError> {
+        let request_id = format!("req_{}", Uuid::now_v7());
+        let resp = self
+            .call(DaemonToServerMessage::ResolveModelProvider { request_id, model })
+            .await?;
+        match resp {
+            ServerToDaemonMessage::ModelProviderReply {
+                ok: true,
+                provider: Some(provider),
+                ..
+            } => Ok(provider),
+            ServerToDaemonMessage::ModelProviderReply {
+                ok: false, error, ..
+            } => Err(ClientError::Tunnel(
+                error.unwrap_or_else(|| "resolve model provider failed".into()),
+            )),
+            other => Err(ClientError::Tunnel(format!(
+                "unexpected resolve model provider reply: {other:?}"
             ))),
         }
     }
@@ -682,6 +754,7 @@ impl DaemonTunnelHandle {
     fn extract_request_id(msg: &DaemonToServerMessage) -> &str {
         match msg {
             DaemonToServerMessage::RegisterNode { request_id, .. }
+            | DaemonToServerMessage::ResolveModelProvider { request_id, .. }
             | DaemonToServerMessage::Heartbeat { request_id, .. }
             | DaemonToServerMessage::AcceptActivation { request_id, .. }
             | DaemonToServerMessage::CommitBatch { request_id, .. }
@@ -759,6 +832,7 @@ pub async fn connect_daemon_tunnel_with_token(
 
             match incoming {
                 ServerToDaemonMessage::Registered { ref request_id, .. }
+                | ServerToDaemonMessage::ModelProviderReply { ref request_id, .. }
                 | ServerToDaemonMessage::Ack { ref request_id, .. }
                 | ServerToDaemonMessage::BeginTurnReply { ref request_id, .. }
                 | ServerToDaemonMessage::EffectiveContextReply { ref request_id, .. }
@@ -780,6 +854,8 @@ pub async fn connect_daemon_tunnel_with_token(
                     lease_epoch,
                     cluster_system_prompt,
                     node_spec,
+                    cluster_default_model,
+                    cluster_model_provider,
                 } => {
                     let _ = push_tx.send(DaemonPushEvent::DispatchActivation {
                         session,
@@ -787,6 +863,8 @@ pub async fn connect_daemon_tunnel_with_token(
                         lease_epoch,
                         cluster_system_prompt,
                         node_spec,
+                        cluster_default_model,
+                        cluster_model_provider,
                     });
                 }
                 ServerToDaemonMessage::ReconcileActivation {

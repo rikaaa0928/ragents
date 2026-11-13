@@ -23,6 +23,39 @@ pub(crate) async fn handle_list_nodes(
     Ok(Json(nodes))
 }
 
+pub(crate) async fn handle_list_models(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ClusterModelsResponse>, ApiError> {
+    state
+        .extensions
+        .authenticate(AuthScope::ClientHttp, "GET", "/api/v1/models", &headers)
+        .await?;
+    let catalog = state.model_catalog.list_models(&state.store)?;
+    Ok(Json(catalog))
+}
+
+pub(crate) async fn handle_refresh_models(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ClusterModelsResponse>, ApiError> {
+    state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "POST",
+            "/api/v1/models/refresh",
+            &headers,
+        )
+        .await?;
+    let catalog = state
+        .model_catalog
+        .refresh(Some(&state.store))
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(catalog))
+}
+
 pub(crate) async fn handle_get_node(
     State(state): State<ApiServerState>,
     headers: HeaderMap,

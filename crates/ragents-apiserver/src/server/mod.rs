@@ -2,6 +2,7 @@ pub mod http;
 pub mod tunnel;
 
 use crate::extensions::ApiServerExtensions;
+use crate::models::ClusterModelCatalog;
 use crate::store::{ReconcileNotice, ScheduledDispatch, SqliteStore, StoreError};
 use axum::{
     http::StatusCode,
@@ -29,6 +30,7 @@ pub struct ApiServerState {
     pub store: SqliteStore,
     pub lease_ttl_ms: u64,
     pub extensions: ApiServerExtensions,
+    pub model_catalog: Arc<ClusterModelCatalog>,
     pub(crate) daemon_peers:
         Arc<Mutex<HashMap<NodeId, mpsc::UnboundedSender<ServerToDaemonMessage>>>>,
     pub(crate) pending_node_ext:
@@ -38,10 +40,20 @@ pub struct ApiServerState {
 
 impl ApiServerState {
     pub fn new(store: SqliteStore, lease_ttl_ms: u64) -> Self {
+        Self::new_with_catalog(store, lease_ttl_ms, Arc::new(ClusterModelCatalog::from_env()))
+    }
+
+    pub fn new_with_catalog(
+        store: SqliteStore,
+        lease_ttl_ms: u64,
+        model_catalog: Arc<ClusterModelCatalog>,
+    ) -> Self {
+        model_catalog.sync_into_store(&store);
         let state = Self {
             store,
             lease_ttl_ms,
             extensions: ApiServerExtensions::default(),
+            model_catalog,
             daemon_peers: Arc::new(Mutex::new(HashMap::new())),
             pending_node_ext: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
@@ -55,9 +67,16 @@ impl ApiServerState {
         self
     }
 
+    pub fn with_model_catalog(mut self, model_catalog: Arc<ClusterModelCatalog>) -> Self {
+        model_catalog.sync_into_store(&self.store);
+        self.model_catalog = model_catalog;
+        self
+    }
+
     fn spawn_background_workers(&self) {
         let mut dispatch_rx = self.store.subscribe_dispatches();
         let peers_for_dispatch = self.daemon_peers.clone();
+        let catalog_for_dispatch = self.model_catalog.clone();
         tokio::spawn(async move {
             while let Ok(ScheduledDispatch {
                 node_id,
@@ -68,6 +87,14 @@ impl ApiServerState {
                 node_spec,
             }) = dispatch_rx.recv().await
             {
+                let target_model = activation
+                    .spec
+                    .model_override
+                    .as_ref()
+                    .map(|m| m.name.as_str())
+                    .or_else(|| session.spec.model.as_ref().map(|m| m.name.as_str()));
+                let cluster_default_model = catalog_for_dispatch.effective_default_model();
+                let cluster_model_provider = catalog_for_dispatch.resolve_provider(target_model);
                 let maybe_tx = peers_for_dispatch
                     .lock()
                     .expect("peers mutex poisoned")
@@ -80,6 +107,8 @@ impl ApiServerState {
                         lease_epoch,
                         cluster_system_prompt,
                         node_spec: Box::new(node_spec),
+                        cluster_default_model,
+                        cluster_model_provider,
                     });
                 }
             }
@@ -158,6 +187,8 @@ impl ApiServerState {
 pub fn build_router(state: ApiServerState) -> Router {
     Router::new()
         .route("/api/v1/nodes", get(http::handle_list_nodes))
+        .route("/api/v1/models", get(http::handle_list_models))
+        .route("/api/v1/models/refresh", post(http::handle_refresh_models))
         .route(
             "/api/v1/nodes/{node_id}",
             get(http::handle_get_node).patch(http::handle_patch_node),

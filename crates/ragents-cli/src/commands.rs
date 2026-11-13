@@ -1,4 +1,4 @@
-use crate::args::{Cli, Commands, NodeSubcommand, SessionSubcommand};
+use crate::args::{Cli, Commands, ModelSubcommand, NodeSubcommand, SessionSubcommand};
 use crate::helpers::{
     build_scheduling_mode, parse_extension_specs, parse_session_sources,
     watch_activation_to_completion,
@@ -7,8 +7,8 @@ use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use openresponses_rust::Item;
 use ragents_apiserver::{
-    serve_tcp, ApiServerExtensions, ApiServerState, SqliteStore, StaticTokenAuthnPlugin,
-    DEFAULT_LEASE_TTL_MS,
+    serve_tcp, ApiServerExtensions, ApiServerState, ApiserverConfig, ClusterModelCatalog,
+    SqliteStore, StaticTokenAuthnPlugin, DEFAULT_LEASE_TTL_MS,
 };
 use ragents_client::RagentsClient;
 use ragents_core::run_subprocess_worker;
@@ -55,7 +55,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
         } => {
             let store = SqliteStore::open(&db)?;
             let exts = build_apiserver_extensions(&auth_token);
-            let state = ApiServerState::new(store, DEFAULT_LEASE_TTL_MS).with_extensions(exts);
+            let catalog = Arc::new(ClusterModelCatalog::from_env());
+            if let Err(err) = catalog.refresh(Some(&store)).await {
+                eprintln!("[ragents up] initial cluster model discovery warning: {err}");
+            }
+            let state = ApiServerState::new_with_catalog(store, DEFAULT_LEASE_TTL_MS, catalog)
+                .with_extensions(exts);
             let cancel = CancellationToken::new();
             let listener = TcpListener::bind(&bind).await?;
             let addr = serve_tcp(listener, state, cancel.clone()).await?;
@@ -63,7 +68,17 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
 
             let mut d_cfg = match daemon_config {
                 Some(path) => DaemonConfig::load_from_file(path)?,
-                None => DaemonConfig::default_local(NodeId::new(&node_id), &local_server_url),
+                None => {
+                    if std::env::var("RAGENTS_BASE_URL")
+                        .ok()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        DaemonConfig::default_cluster(NodeId::new(&node_id), &local_server_url)
+                    } else {
+                        DaemonConfig::default_local(NodeId::new(&node_id), &local_server_url)
+                    }
+                }
             };
             d_cfg.server_url = local_server_url.clone();
             if d_cfg.auth_token.is_none() {
@@ -156,10 +171,20 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             bind,
             db,
             lease_ttl_ms,
+            config,
         } => {
             let store = SqliteStore::open(&db)?;
             let exts = build_apiserver_extensions(&auth_token);
-            let state = ApiServerState::new(store, lease_ttl_ms).with_extensions(exts);
+            let apiserver_cfg = match config {
+                Some(path) => ApiserverConfig::load_from_file(path)?,
+                None => ApiserverConfig::load_from_env(),
+            };
+            let catalog = Arc::new(ClusterModelCatalog::from_config(apiserver_cfg));
+            if let Err(err) = catalog.refresh(Some(&store)).await {
+                eprintln!("[ragents apiserver] initial cluster model discovery warning: {err}");
+            }
+            let state = ApiServerState::new_with_catalog(store, lease_ttl_ms, catalog)
+                .with_extensions(exts);
             let cancel = CancellationToken::new();
             let listener = TcpListener::bind(&bind).await?;
             let addr = serve_tcp(listener, state, cancel.clone()).await?;
@@ -176,7 +201,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
         } => {
             let mut d_cfg = match config {
                 Some(path) => DaemonConfig::load_from_file(path)?,
-                None => DaemonConfig::default_local(NodeId::new(&node_id), &server_url),
+                None => DaemonConfig::default_cluster(NodeId::new(&node_id), &server_url),
             };
             if let Some(ref exp_srv) = explicit_server {
                 d_cfg.server_url = exp_srv.clone();
@@ -223,6 +248,18 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     .await?
                     .ok_or_else(|| anyhow!("Node '{node_id}' not found"))?;
                 println!("{}", serde_json::to_string_pretty(&node)?);
+                Ok(())
+            }
+        },
+        Commands::Model { cmd } => match cmd {
+            ModelSubcommand::List => {
+                let catalog = client.list_models().await?;
+                println!("{}", serde_json::to_string_pretty(&catalog)?);
+                Ok(())
+            }
+            ModelSubcommand::Refresh => {
+                let catalog = client.refresh_models().await?;
+                println!("{}", serde_json::to_string_pretty(&catalog)?);
                 Ok(())
             }
         },

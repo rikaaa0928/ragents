@@ -97,7 +97,8 @@ fn handle_daemon_message(
             os,
             arch,
             labels,
-            supported_models,
+            local_models,
+            use_cluster_models,
             default_model,
             default_system_prompt,
             default_permissions,
@@ -124,13 +125,14 @@ fn handle_daemon_message(
                 allowed_workspace_dirs
             };
 
-            match state.store.register_node_with_running_activations(
+            match state.store.register_node_with_models_and_running_activations(
                 node_id.clone(),
                 hostname,
                 os,
                 arch,
                 labels,
-                supported_models,
+                local_models,
+                use_cluster_models,
                 default_model,
                 default_system_prompt,
                 default_permissions,
@@ -147,10 +149,34 @@ fn handle_daemon_message(
                         lease_ttl_ms: state.lease_ttl_ms,
                         resource_version: node.metadata.resource_version,
                         node_spec: node.spec,
+                        cluster_default_model: state.model_catalog.effective_default_model(),
                     });
                 }
                 Err(e) => {
                     send_ack_err(out_tx, request_id, e.to_string());
+                }
+            }
+        }
+        DaemonToServerMessage::ResolveModelProvider { request_id, model } => {
+            match state.model_catalog.resolve_provider(model.as_deref()) {
+                Some(provider) => {
+                    let _ = out_tx.send(ServerToDaemonMessage::ModelProviderReply {
+                        request_id,
+                        ok: true,
+                        provider: Some(provider),
+                        error: None,
+                    });
+                }
+                None => {
+                    let _ = out_tx.send(ServerToDaemonMessage::ModelProviderReply {
+                        request_id,
+                        ok: false,
+                        provider: None,
+                        error: Some(match model {
+                            Some(m) => format!("cluster model '{m}' is not configured or discovered on api-server"),
+                            None => "no default cluster model is configured on api-server".to_string(),
+                        }),
+                    });
                 }
             }
         }

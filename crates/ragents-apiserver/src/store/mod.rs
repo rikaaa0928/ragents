@@ -10,7 +10,7 @@ use ragents_protocol::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
@@ -67,9 +67,16 @@ pub struct PatchActivationOutcome {
     pub newly_scheduled: Vec<ScheduledDispatch>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ClusterModelSnapshot {
+    pub default_model: Option<String>,
+    pub model_ids: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct SqliteStore {
     pub(crate) conn: Arc<Mutex<Connection>>,
+    pub(crate) cluster_models: Arc<RwLock<ClusterModelSnapshot>>,
     pub(crate) event_tx: broadcast::Sender<SessionEventEnvelope>,
     pub(crate) dispatch_tx: broadcast::Sender<ScheduledDispatch>,
     pub(crate) reconcile_tx: broadcast::Sender<ReconcileNotice>,
@@ -126,10 +133,31 @@ impl SqliteStore {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            cluster_models: Arc::new(RwLock::new(ClusterModelSnapshot::default())),
             event_tx,
             dispatch_tx,
             reconcile_tx,
         })
+    }
+
+    pub fn get_cluster_models_snapshot(&self) -> ClusterModelSnapshot {
+        self.cluster_models
+            .read()
+            .expect("cluster_models rwlock poisoned")
+            .clone()
+    }
+
+    pub fn set_cluster_models(&self, default_model: Option<String>, model_ids: Vec<String>) {
+        let snap = ClusterModelSnapshot {
+            default_model,
+            model_ids,
+        };
+        *self
+            .cluster_models
+            .write()
+            .expect("cluster_models rwlock poisoned") = snap.clone();
+
+        let _ = self.refresh_nodes_with_cluster_models(&snap);
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<SessionEventEnvelope> {
