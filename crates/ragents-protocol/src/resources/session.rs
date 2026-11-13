@@ -312,3 +312,162 @@ impl SessionStatus {
         }
     }
 }
+
+fn default_history_list_limit() -> usize {
+    30
+}
+
+fn default_history_search_limit() -> usize {
+    20
+}
+
+fn default_history_context_window() -> usize {
+    5
+}
+
+fn default_history_read_limit() -> usize {
+    20
+}
+
+fn default_history_max_chars_per_item() -> usize {
+    2000
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum SessionHistoryQueryRequest {
+    List {
+        #[serde(default)]
+        include_current_session: bool,
+        #[serde(default)]
+        include_same_lineage_only: bool,
+        #[serde(default = "default_history_list_limit")]
+        limit: usize,
+    },
+    Search {
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        item_types: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default)]
+        include_current_session: bool,
+        #[serde(default = "default_history_search_limit")]
+        limit: usize,
+    },
+    Read {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        around_index: Option<usize>,
+        #[serde(default = "default_history_context_window")]
+        context_window: usize,
+        #[serde(default = "default_history_read_limit")]
+        limit: usize,
+        #[serde(default = "default_history_max_chars_per_item")]
+        max_chars_per_item: usize,
+        #[serde(default)]
+        include_reasoning: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSessionRelation {
+    SelfCurrent,
+    SelfHistory,
+    SiblingSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSessionSummary {
+    pub session_id: SessionId,
+    pub relation: WorkspaceSessionRelation,
+    pub phase: SessionPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub generation: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_from_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_in_session_id: Option<SessionId>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub effective_item_count: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_user_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_activity_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSessionSearchMatch {
+    pub session_id: SessionId,
+    pub relation: WorkspaceSessionRelation,
+    pub generation: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    pub item_index: usize,
+    pub item_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub snippet: String,
+    pub total_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSessionSliceItem {
+    pub item_index: usize,
+    pub item_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub content: String,
+    pub total_chars: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSessionSlice {
+    pub session_id: SessionId,
+    pub relation: WorkspaceSessionRelation,
+    pub phase: SessionPhase,
+    pub generation: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_from_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_in_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    pub total_items: usize,
+    pub start_index: usize,
+    pub end_index: usize,
+    pub items: Vec<WorkspaceSessionSliceItem>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHistoryQueryResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<WorkspaceSessionSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<WorkspaceSessionSearchMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice: Option<WorkspaceSessionSlice>,
+}

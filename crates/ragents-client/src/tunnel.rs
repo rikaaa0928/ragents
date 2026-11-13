@@ -615,6 +615,27 @@ impl DaemonTunnelHandle {
         }
     }
 
+    pub async fn query_session_history(
+        &self,
+        session_id: SessionId,
+        request: SessionHistoryQueryRequest,
+    ) -> Result<SessionHistoryQueryResponse, ClientError> {
+        let request_id = format!("req_{}", Uuid::now_v7());
+        let resp = self
+            .call(DaemonToServerMessage::QuerySessionHistory {
+                request_id,
+                session_id,
+                request: Box::new(request),
+            })
+            .await?;
+        match resp {
+            ServerToDaemonMessage::QuerySessionHistoryReply { response, .. } => Ok(*response),
+            other => Err(ClientError::Tunnel(format!(
+                "unexpected query session history reply: {other:?}"
+            ))),
+        }
+    }
+
     pub fn send_node_extension_reply(
         &self,
         request_id: String,
@@ -671,6 +692,7 @@ impl DaemonTunnelHandle {
             | DaemonToServerMessage::DrainRealtimeMessages { request_id, .. }
             | DaemonToServerMessage::CompleteActivation { request_id, .. }
             | DaemonToServerMessage::RolloverCompactedSession { request_id, .. }
+            | DaemonToServerMessage::QuerySessionHistory { request_id, .. }
             | DaemonToServerMessage::NodeExtensionReply { request_id, .. } => request_id,
         }
     }
@@ -741,7 +763,8 @@ pub async fn connect_daemon_tunnel_with_token(
                 | ServerToDaemonMessage::BeginTurnReply { ref request_id, .. }
                 | ServerToDaemonMessage::EffectiveContextReply { ref request_id, .. }
                 | ServerToDaemonMessage::RealtimeMessagesReply { ref request_id, .. }
-                | ServerToDaemonMessage::RolloverCompactedSessionReply { ref request_id, .. } => {
+                | ServerToDaemonMessage::RolloverCompactedSessionReply { ref request_id, .. }
+                | ServerToDaemonMessage::QuerySessionHistoryReply { ref request_id, .. } => {
                     let req_id = request_id.clone();
                     let tx = pending_reader
                         .lock()

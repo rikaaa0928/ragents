@@ -236,6 +236,10 @@ impl SqliteStore {
 
     pub fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
+        Self::list_sessions_from_conn(&conn)
+    }
+
+    pub(crate) fn list_sessions_from_conn(conn: &Connection) -> Result<Vec<Session>, StoreError> {
         let mut stmt = conn.prepare(
             "SELECT session_id, generation, resource_version, created_at, updated_at, labels_json, spec_json, status_json
              FROM sessions ORDER BY created_at DESC",
@@ -610,4 +614,734 @@ impl SqliteStore {
         }
         Ok(batches)
     }
+
+    pub fn query_workspace_session_history(
+        &self,
+        caller_session_id: &SessionId,
+        req: SessionHistoryQueryRequest,
+    ) -> Result<SessionHistoryQueryResponse, StoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let caller = Self::load_session_from_conn(&conn, caller_session_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("session {caller_session_id}")))?;
+        let all_sessions = Self::list_sessions_from_conn(&conn)?;
+
+        let (workspace_scope, scoped_sessions) =
+            compute_scoped_workspace_sessions(&caller, &all_sessions);
+
+        match req {
+            SessionHistoryQueryRequest::List {
+                include_current_session,
+                include_same_lineage_only,
+                limit,
+            } => {
+                let clamped_limit = limit.clamp(1, 100);
+                let mut summaries = Vec::new();
+                for (sess, relation) in scoped_sessions {
+                    if !include_current_session
+                        && relation == WorkspaceSessionRelation::SelfCurrent
+                    {
+                        continue;
+                    }
+                    if include_same_lineage_only
+                        && relation == WorkspaceSessionRelation::SiblingSession
+                    {
+                        continue;
+                    }
+                    let sid = SessionId::new(sess.metadata.id.clone());
+                    let items =
+                        Self::resolve_effective_items_with_mode(&conn, &sid, ContentFetchMode::View)
+                            .unwrap_or_default();
+                    let (first_user_preview, latest_activity_preview) =
+                        extract_session_previews(&items);
+                    summaries.push(WorkspaceSessionSummary {
+                        session_id: sid,
+                        relation,
+                        phase: sess.status.phase,
+                        model: sess.spec.model.as_ref().map(|m| m.name.clone()),
+                        generation: sess.status.compaction.generation,
+                        compacted_from_session_id: sess
+                            .status
+                            .compaction
+                            .compacted_from_session_id
+                            .clone(),
+                        continued_in_session_id: sess
+                            .status
+                            .compaction
+                            .continued_in_session_id
+                            .clone(),
+                        created_at: sess.metadata.created_at,
+                        updated_at: sess.metadata.updated_at,
+                        effective_item_count: items.len() as u64,
+                        labels: sess.metadata.labels.clone(),
+                        first_user_preview,
+                        latest_activity_preview,
+                    });
+                    if summaries.len() >= clamped_limit {
+                        break;
+                    }
+                }
+                Ok(SessionHistoryQueryResponse {
+                    ok: true,
+                    error: None,
+                    workspace_scope: Some(workspace_scope),
+                    sessions: summaries,
+                    matches: Vec::new(),
+                    slice: None,
+                })
+            }
+            SessionHistoryQueryRequest::Search {
+                query,
+                session_id,
+                item_types,
+                tool_name,
+                include_current_session,
+                limit,
+            } => {
+                let trimmed_query = query.trim();
+                if trimmed_query.is_empty() {
+                    return Ok(SessionHistoryQueryResponse {
+                        ok: false,
+                        error: Some("search query must not be empty".into()),
+                        workspace_scope: Some(workspace_scope),
+                        ..Default::default()
+                    });
+                }
+                let query_lower = trimmed_query.to_lowercase();
+                let tokens: Vec<String> = query_lower
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
+                let allowed_types: Vec<String> =
+                    item_types.iter().map(|t| t.trim().to_lowercase()).collect();
+                let filter_tool_lower = tool_name
+                    .as_ref()
+                    .map(|t| t.trim().to_lowercase())
+                    .filter(|t| !t.is_empty());
+                let clamped_limit = limit.clamp(1, 50);
+
+                if let Some(ref target_sid) = session_id {
+                    if !scoped_sessions
+                        .iter()
+                        .any(|(s, _)| s.metadata.id == target_sid.as_str())
+                    {
+                        return Ok(SessionHistoryQueryResponse {
+                            ok: false,
+                            error: Some(format!(
+                                "session {target_sid} does not exist or is outside the current workspace scope ({workspace_scope})"
+                            )),
+                            workspace_scope: Some(workspace_scope),
+                            ..Default::default()
+                        });
+                    }
+                }
+
+                let mut matches = Vec::new();
+                'sess_loop: for (sess, relation) in scoped_sessions {
+                    let sid = SessionId::new(sess.metadata.id.clone());
+                    if let Some(ref target_sid) = session_id {
+                        if &sid != target_sid {
+                            continue;
+                        }
+                    } else if !include_current_session
+                        && relation == WorkspaceSessionRelation::SelfCurrent
+                    {
+                        continue;
+                    }
+
+                    let items =
+                        Self::resolve_effective_items_with_mode(&conn, &sid, ContentFetchMode::View)
+                            .unwrap_or_default();
+                    let call_tools = build_call_id_tool_map(&items);
+
+                    for (idx, item) in items.iter().enumerate() {
+                        let parsed = inspect_item(item, &call_tools);
+                        if !allowed_types.is_empty()
+                            && !allowed_types.iter().any(|t| {
+                                t == &parsed.item_type
+                                    || parsed.role.as_ref().is_some_and(|r| t == r)
+                            })
+                        {
+                            continue;
+                        }
+                        if let Some(ref want_tool) = filter_tool_lower {
+                            let matches_tool = parsed
+                                .tool_name
+                                .as_ref()
+                                .is_some_and(|tn| tn.to_lowercase().contains(want_tool));
+                            if !matches_tool {
+                                continue;
+                            }
+                        }
+
+                        let combined_lower = match &parsed.tool_name {
+                            Some(tn) => format!(
+                                "{} {}",
+                                tn.to_lowercase(),
+                                parsed.content.to_lowercase()
+                            ),
+                            None => parsed.content.to_lowercase(),
+                        };
+
+                        if !tokens.iter().all(|tok| combined_lower.contains(tok)) {
+                            continue;
+                        }
+
+                        let total_chars = parsed.content.chars().count();
+                        let snippet = build_search_snippet(&parsed.content, &query_lower, &tokens, 240);
+                        matches.push(WorkspaceSessionSearchMatch {
+                            session_id: sid.clone(),
+                            relation,
+                            generation: sess.status.compaction.generation,
+                            labels: sess.metadata.labels.clone(),
+                            item_index: idx,
+                            item_type: parsed.item_type,
+                            role: parsed.role,
+                            tool_name: parsed.tool_name,
+                            call_id: parsed.call_id,
+                            snippet,
+                            total_chars,
+                        });
+                        if matches.len() >= clamped_limit {
+                            break 'sess_loop;
+                        }
+                    }
+                }
+
+                Ok(SessionHistoryQueryResponse {
+                    ok: true,
+                    error: None,
+                    workspace_scope: Some(workspace_scope),
+                    sessions: Vec::new(),
+                    matches,
+                    slice: None,
+                })
+            }
+            SessionHistoryQueryRequest::Read {
+                session_id,
+                from_index,
+                around_index,
+                context_window,
+                limit,
+                max_chars_per_item,
+                include_reasoning,
+            } => {
+                let Some((sess, relation)) = scoped_sessions
+                    .into_iter()
+                    .find(|(s, _)| s.metadata.id == session_id.as_str())
+                else {
+                    return Ok(SessionHistoryQueryResponse {
+                        ok: false,
+                        error: Some(format!(
+                            "session {session_id} does not exist or is outside the current workspace scope ({workspace_scope})"
+                        )),
+                        workspace_scope: Some(workspace_scope),
+                        ..Default::default()
+                    });
+                };
+
+                let items = Self::resolve_effective_items_with_mode(
+                    &conn,
+                    &session_id,
+                    ContentFetchMode::View,
+                )?;
+                let total_items = items.len();
+                let call_tools = build_call_id_tool_map(&items);
+                let clamped_limit = limit.clamp(1, 50);
+                let clamped_max_chars = max_chars_per_item.clamp(200, 30_000);
+
+                if total_items == 0 {
+                    return Ok(SessionHistoryQueryResponse {
+                        ok: true,
+                        error: None,
+                        workspace_scope: Some(workspace_scope),
+                        sessions: Vec::new(),
+                        matches: Vec::new(),
+                        slice: Some(WorkspaceSessionSlice {
+                            session_id,
+                            relation,
+                            phase: sess.status.phase,
+                            generation: sess.status.compaction.generation,
+                            compacted_from_session_id: sess
+                                .status
+                                .compaction
+                                .compacted_from_session_id,
+                            continued_in_session_id: sess
+                                .status
+                                .compaction
+                                .continued_in_session_id,
+                            labels: sess.metadata.labels,
+                            total_items: 0,
+                            start_index: 0,
+                            end_index: 0,
+                            items: Vec::new(),
+                        }),
+                    });
+                }
+
+                let (start_index, end_index) = if let Some(center) = around_index {
+                    let center = center.min(total_items - 1);
+                    let win = context_window.min(25);
+                    let start = center.saturating_sub(win);
+                    let end = (center + win).min(total_items - 1);
+                    (start, end)
+                } else if let Some(from) = from_index {
+                    let start = from.min(total_items - 1);
+                    let end = (start + clamped_limit - 1).min(total_items - 1);
+                    (start, end)
+                } else {
+                    let end = total_items - 1;
+                    let start = total_items.saturating_sub(clamped_limit);
+                    (start, end)
+                };
+
+                let mut slice_items = Vec::new();
+                for (idx, item) in items
+                    .iter()
+                    .enumerate()
+                    .take(end_index + 1)
+                    .skip(start_index)
+                {
+                    let parsed = inspect_item(item, &call_tools);
+                    if parsed.item_type == "reasoning"
+                        && !include_reasoning
+                        && around_index != Some(idx)
+                        && !(from_index == Some(idx) && clamped_limit == 1)
+                    {
+                        continue;
+                    }
+                    let total_chars = parsed.content.chars().count();
+                    let (content, truncated) = truncate_chars(&parsed.content, clamped_max_chars);
+                    slice_items.push(WorkspaceSessionSliceItem {
+                        item_index: idx,
+                        item_type: parsed.item_type,
+                        role: parsed.role,
+                        tool_name: parsed.tool_name,
+                        call_id: parsed.call_id,
+                        content,
+                        total_chars,
+                        truncated,
+                    });
+                }
+
+                Ok(SessionHistoryQueryResponse {
+                    ok: true,
+                    error: None,
+                    workspace_scope: Some(workspace_scope),
+                    sessions: Vec::new(),
+                    matches: Vec::new(),
+                    slice: Some(WorkspaceSessionSlice {
+                        session_id,
+                        relation,
+                        phase: sess.status.phase,
+                        generation: sess.status.compaction.generation,
+                        compacted_from_session_id: sess
+                            .status
+                            .compaction
+                            .compacted_from_session_id,
+                        continued_in_session_id: sess
+                            .status
+                            .compaction
+                            .continued_in_session_id,
+                        labels: sess.metadata.labels,
+                        total_items,
+                        start_index,
+                        end_index,
+                        items: slice_items,
+                    }),
+                })
+            }
+        }
+    }
+}
+
+fn normalize_path_key(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn compute_scoped_workspace_sessions(
+    caller: &Session,
+    all_sessions: &[Session],
+) -> (String, Vec<(Session, WorkspaceSessionRelation)>) {
+    use std::collections::{HashMap, HashSet};
+
+    let by_id: HashMap<&str, &Session> = all_sessions
+        .iter()
+        .map(|s| (s.metadata.id.as_str(), s))
+        .collect();
+
+    // 1. Transitive closure of compaction/source lineage from `caller`
+    let mut lineage_ids: HashSet<String> = HashSet::new();
+    let mut stack = vec![caller.metadata.id.clone()];
+    while let Some(curr_id) = stack.pop() {
+        if !lineage_ids.insert(curr_id.clone()) {
+            continue;
+        }
+        if let Some(curr) = by_id.get(curr_id.as_str()) {
+            if let Some(ref prev) = curr.status.compaction.compacted_from_session_id {
+                stack.push(prev.to_string());
+            }
+            if let Some(ref next) = curr.status.compaction.continued_in_session_id {
+                stack.push(next.to_string());
+            }
+            for src in &curr.spec.sources {
+                stack.push(src.session_id.to_string());
+            }
+        }
+        for s in all_sessions {
+            if s.status
+                .compaction
+                .compacted_from_session_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == curr_id)
+                || s.status
+                    .compaction
+                    .continued_in_session_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == curr_id)
+                || s.spec
+                    .sources
+                    .iter()
+                    .any(|src| src.session_id.as_str() == curr_id)
+            {
+                stack.push(s.metadata.id.clone());
+            }
+        }
+    }
+
+    let caller_agent_id = caller
+        .metadata
+        .labels
+        .get("ragents.chat.agent_id")
+        .filter(|v| !v.trim().is_empty());
+    let caller_room_id = caller
+        .metadata
+        .labels
+        .get("ragents.chat.room_id")
+        .filter(|v| !v.trim().is_empty());
+
+    let workspace_scope = match &caller.spec.scheduling {
+        SchedulingMode::Pinned {
+            node_id,
+            workspace_path,
+        } => format!("{}:{}", node_id, normalize_path_key(workspace_path)),
+        SchedulingMode::Floating { .. } => {
+            if let Some(first_dir) = caller.spec.extra_tmp_dirs.first() {
+                format!("floating:{}", normalize_path_key(first_dir))
+            } else if let Some(room_id) = caller_room_id {
+                format!("room:{room_id}")
+            } else {
+                format!("lineage:{}", caller.metadata.id)
+            }
+        }
+    };
+
+    let mut matched: Vec<(Session, WorkspaceSessionRelation)> = Vec::new();
+    for cand in all_sessions {
+        if cand.status.compaction.role == SessionRole::CompactionWorker {
+            continue;
+        }
+        let is_self_current = cand.metadata.id == caller.metadata.id;
+        let is_lineage = lineage_ids.contains(&cand.metadata.id);
+        let is_same_agent = caller_agent_id.is_some_and(|aid| {
+            cand.metadata
+                .labels
+                .get("ragents.chat.agent_id")
+                .is_some_and(|cid| cid == aid)
+        });
+        let is_same_room = caller_room_id.is_some_and(|rid| {
+            cand.metadata
+                .labels
+                .get("ragents.chat.room_id")
+                .is_some_and(|crid| crid == rid)
+        });
+
+        let is_same_workspace = match (&caller.spec.scheduling, &cand.spec.scheduling) {
+            (
+                SchedulingMode::Pinned {
+                    node_id: n1,
+                    workspace_path: p1,
+                },
+                SchedulingMode::Pinned {
+                    node_id: n2,
+                    workspace_path: p2,
+                },
+            ) => n1 == n2 && normalize_path_key(p1) == normalize_path_key(p2),
+            (SchedulingMode::Floating { .. }, SchedulingMode::Floating { .. }) => {
+                match (
+                    caller.spec.extra_tmp_dirs.first(),
+                    cand.spec.extra_tmp_dirs.first(),
+                ) {
+                    (Some(d1), Some(d2)) => normalize_path_key(d1) == normalize_path_key(d2),
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+
+        if !(is_self_current || is_lineage || is_same_workspace || is_same_room) {
+            continue;
+        }
+
+        let relation = if is_self_current {
+            WorkspaceSessionRelation::SelfCurrent
+        } else if is_lineage || is_same_agent {
+            WorkspaceSessionRelation::SelfHistory
+        } else {
+            WorkspaceSessionRelation::SiblingSession
+        };
+
+        matched.push((cand.clone(), relation));
+    }
+
+    matched.sort_by(|(a, _), (b, _)| {
+        b.metadata
+            .updated_at
+            .cmp(&a.metadata.updated_at)
+            .then_with(|| {
+                b.status
+                    .compaction
+                    .generation
+                    .cmp(&a.status.compaction.generation)
+            })
+            .then_with(|| b.metadata.created_at.cmp(&a.metadata.created_at))
+    });
+
+    (workspace_scope, matched)
+}
+
+struct InspectedItem {
+    item_type: String,
+    role: Option<String>,
+    tool_name: Option<String>,
+    call_id: Option<String>,
+    content: String,
+}
+
+fn build_call_id_tool_map(items: &[Item]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for item in items {
+        if let Item::FunctionCall { call_id, name, .. } = item {
+            map.insert(call_id.clone(), name.clone());
+        }
+    }
+    map
+}
+
+fn extract_message_contents(parts: &[openresponses_rust::MessageContent]) -> String {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            openresponses_rust::MessageContent::InputText { text }
+            | openresponses_rust::MessageContent::OutputText { text, .. }
+            | openresponses_rust::MessageContent::PlainText { text }
+            | openresponses_rust::MessageContent::SummaryText { text } => {
+                if !text.trim().is_empty() {
+                    out.push(text.as_str());
+                }
+            }
+            openresponses_rust::MessageContent::Refusal { refusal } => {
+                if !refusal.trim().is_empty() {
+                    out.push(refusal.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    out.join("\n")
+}
+
+fn inspect_item(
+    item: &Item,
+    call_tools: &std::collections::HashMap<String, String>,
+) -> InspectedItem {
+    match item {
+        Item::Message { role, content, .. } => {
+            let role_str = match role {
+                openresponses_rust::MessageRole::User => "user",
+                openresponses_rust::MessageRole::Assistant => "assistant",
+                openresponses_rust::MessageRole::System => "system",
+                openresponses_rust::MessageRole::Developer => "developer",
+            };
+            InspectedItem {
+                item_type: format!("{role_str}_message"),
+                role: Some(role_str.to_string()),
+                tool_name: None,
+                call_id: None,
+                content: extract_message_contents(content),
+            }
+        }
+        Item::Reasoning {
+            summary, content, ..
+        } => {
+            let mut text = extract_message_contents(summary);
+            if text.trim().is_empty() {
+                if let Some(c) = content {
+                    text = extract_message_contents(c);
+                }
+            }
+            InspectedItem {
+                item_type: "reasoning".to_string(),
+                role: Some("assistant".to_string()),
+                tool_name: None,
+                call_id: None,
+                content: text,
+            }
+        }
+        Item::FunctionCall {
+            call_id,
+            name,
+            arguments,
+            ..
+        } => InspectedItem {
+            item_type: "function_call".to_string(),
+            role: Some("assistant".to_string()),
+            tool_name: Some(name.clone()),
+            call_id: Some(call_id.clone()),
+            content: arguments.clone(),
+        },
+        Item::FunctionCallOutput {
+            call_id, output, ..
+        } => {
+            let text = match output {
+                openresponses_rust::FunctionOutput::Text(s) => s.clone(),
+                openresponses_rust::FunctionOutput::Content(parts) => {
+                    extract_message_contents(parts)
+                }
+            };
+            InspectedItem {
+                item_type: "function_call_output".to_string(),
+                role: Some("tool".to_string()),
+                tool_name: call_tools.get(call_id).cloned(),
+                call_id: Some(call_id.clone()),
+                content: text,
+            }
+        }
+        other => InspectedItem {
+            item_type: "extension_item".to_string(),
+            role: None,
+            tool_name: None,
+            call_id: None,
+            content: serde_json::to_string(other).unwrap_or_default(),
+        },
+    }
+}
+
+fn single_line_preview(text: &str, max_chars: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (s, truncated) = truncate_chars(&collapsed, max_chars);
+    if truncated {
+        format!("{s}...")
+    } else {
+        s
+    }
+}
+
+fn extract_session_previews(items: &[Item]) -> (Option<String>, Option<String>) {
+    let call_tools = build_call_id_tool_map(items);
+    let mut first_user = None;
+    let mut fallback_first_user = None;
+    for item in items {
+        let parsed = inspect_item(item, &call_tools);
+        if parsed.item_type == "user_message" && !parsed.content.trim().is_empty() {
+            let trimmed = parsed.content.trim();
+            if trimmed.starts_with("<context_compaction_summary>")
+                || trimmed.starts_with("[Context Compaction Summary]")
+            {
+                if fallback_first_user.is_none() {
+                    fallback_first_user = Some(single_line_preview(trimmed, 140));
+                }
+                continue;
+            }
+            first_user = Some(single_line_preview(trimmed, 140));
+            break;
+        }
+    }
+    let first_user = first_user.or(fallback_first_user);
+
+    let mut latest = None;
+    for item in items.iter().rev() {
+        let parsed = inspect_item(item, &call_tools);
+        if parsed.item_type == "reasoning" || parsed.content.trim().is_empty() {
+            continue;
+        }
+        let prefix = match parsed.item_type.as_str() {
+            "user_message" => "[user] ".to_string(),
+            "assistant_message" => "[assistant] ".to_string(),
+            "function_call" => format!(
+                "[call:{}] ",
+                parsed.tool_name.as_deref().unwrap_or("tool")
+            ),
+            "function_call_output" => format!(
+                "[out:{}] ",
+                parsed.tool_name.as_deref().unwrap_or("tool")
+            ),
+            _ => String::new(),
+        };
+        latest = Some(format!(
+            "{prefix}{}",
+            single_line_preview(parsed.content.trim(), 130)
+        ));
+        break;
+    }
+
+    (first_user, latest)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = text.chars();
+    let collected: String = chars.by_ref().take(max_chars).collect();
+    let has_more = chars.next().is_some();
+    (collected, has_more)
+}
+
+fn build_search_snippet(
+    content: &str,
+    query_lower: &str,
+    tokens: &[String],
+    window_chars: usize,
+) -> String {
+    let content_chars: Vec<char> = content.chars().collect();
+    if content_chars.len() <= window_chars {
+        return content.to_string();
+    }
+    let lower_chars: Vec<char> = content
+        .chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+
+    let find_subslice = |needle: &str| -> Option<usize> {
+        let n_chars: Vec<char> = needle.chars().collect();
+        if n_chars.is_empty() || n_chars.len() > lower_chars.len() {
+            return None;
+        }
+        lower_chars
+            .windows(n_chars.len())
+            .position(|w| w == n_chars.as_slice())
+    };
+
+    let match_pos = find_subslice(query_lower)
+        .or_else(|| tokens.iter().find_map(|t| find_subslice(t)))
+        .unwrap_or(0);
+
+    let half = window_chars / 2;
+    let start = match_pos.saturating_sub(half);
+    let end = (start + window_chars).min(content_chars.len());
+    let start = end.saturating_sub(window_chars);
+
+    let mut out = String::new();
+    if start > 0 {
+        out.push_str("...");
+    }
+    let slice: String = content_chars[start..end].iter().collect();
+    out.push_str(&slice);
+    if end < content_chars.len() {
+        out.push_str("...");
+    }
+    out
 }

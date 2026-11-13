@@ -576,6 +576,16 @@ impl CoreHost for DaemonCoreHost {
         Ok(Some(resp))
     }
 
+    async fn query_session_history(
+        &self,
+        request: SessionHistoryQueryRequest,
+    ) -> Result<SessionHistoryQueryResponse, CoreError> {
+        self.tunnel
+            .query_session_history(self.session_id.clone(), request)
+            .await
+            .map_err(|e| CoreError::HostError(e.to_string()))
+    }
+
     async fn rollover_compacted_session(
         &self,
         turn_id: Option<TurnId>,

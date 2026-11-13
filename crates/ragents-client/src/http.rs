@@ -158,6 +158,19 @@ impl RagentsClient {
         Self::parse_response(resp).await
     }
 
+    pub async fn query_workspace_session_history(
+        &self,
+        session_id: &SessionId,
+        req: SessionHistoryQueryRequest,
+    ) -> Result<SessionHistoryQueryResponse, ClientError> {
+        let url = format!(
+            "{}/api/v1/sessions/{}/workspace-history",
+            self.base_url, session_id
+        );
+        let resp = self.http.post(url).json(&req).send().await?;
+        Self::parse_response(resp).await
+    }
+
     pub async fn list_session_activations(
         &self,
         session_id: &SessionId,

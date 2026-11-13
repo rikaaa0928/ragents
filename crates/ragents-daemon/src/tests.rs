@@ -2053,3 +2053,316 @@ async fn test_four_segment_system_prompt_ssot_permissions_and_disabled_tools() {
     server_cancel.cancel();
 }
 
+#[tokio::test]
+async fn test_session_history_extension_list_search_read_and_workspace_isolation() {
+    use std::path::PathBuf;
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let session_history_wasm = manifest_dir.join(
+        "../../extensions/session_history/target/wasm32-wasip2/release/ragent_session_history_extension.wasm",
+    );
+    assert!(
+        session_history_wasm.exists(),
+        "ragent_session_history_extension.wasm must exist"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws_shared = tmp.path().join("ws_shared");
+    let ws_other = tmp.path().join("ws_other");
+    std::fs::create_dir_all(&ws_shared).unwrap();
+    std::fs::create_dir_all(&ws_other).unwrap();
+
+    let store = SqliteStore::open_in_memory().unwrap();
+    let state = ApiServerState::new(store, 5000);
+    let server_cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = serve_tcp(listener, state, server_cancel.clone())
+        .await
+        .unwrap();
+    let server_url = format!("http://{addr}");
+    let client = RagentsClient::new(&server_url);
+
+    let mut cfg = make_daemon_cfg(
+        "node_hist",
+        &server_url,
+        vec!["gpt-4.1"],
+        tmp.path().join("node_tmp"),
+    );
+    cfg.executor_mode = ExecutorMode::InProcess;
+    cfg.allowed_workspace_dirs.push(tmp.path().to_path_buf());
+
+    struct ScriptedModelBackend {
+        step: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ModelBackend for ScriptedModelBackend {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            req: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            let step = {
+                let mut g = self.step.lock().unwrap();
+                let cur = *g;
+                *g += 1;
+                cur
+            };
+
+            let items = match step {
+                // Step 0: Session A (Agent Alpha) produces an assistant message with a distinctive token
+                0 => vec![Item::assistant_message(
+                    "Alpha diagnosed CUDA_OUT_OF_MEMORY_SIG_7788 in train_model.py line 142.",
+                )],
+                // Step 1: Session Other (in `ws_other`) produces a secret token
+                1 => vec![Item::assistant_message(
+                    "Other workspace secret SECRET_OTHER_WS_9999.",
+                )],
+                // Step 2: Session B (Agent Beta in `ws_shared`) calls list + search + read (including cross-ws attempt)
+                2 => vec![
+                    Item::FunctionCall {
+                        id: Some("fc_list".into()),
+                        call_id: "call_hist_list".into(),
+                        name: "session_history_list".into(),
+                        arguments: serde_json::json!({}).to_string(),
+                        status: None,
+                    },
+                    Item::FunctionCall {
+                        id: Some("fc_search".into()),
+                        call_id: "call_hist_search".into(),
+                        name: "session_history_search".into(),
+                        arguments: serde_json::json!({
+                            "query": "CUDA_OUT_OF_MEMORY_SIG_7788"
+                        })
+                        .to_string(),
+                        status: None,
+                    },
+                    Item::FunctionCall {
+                        id: Some("fc_read_alpha".into()),
+                        call_id: "call_hist_read_alpha".into(),
+                        name: "session_history_read".into(),
+                        arguments: serde_json::json!({
+                            "session_id": "sess_alpha",
+                            "around_index": 1,
+                            "context_window": 2
+                        })
+                        .to_string(),
+                        status: None,
+                    },
+                    Item::FunctionCall {
+                        id: Some("fc_read_other".into()),
+                        call_id: "call_hist_read_other".into(),
+                        name: "session_history_read".into(),
+                        arguments: serde_json::json!({
+                            "session_id": "sess_other_ws"
+                        })
+                        .to_string(),
+                        status: None,
+                    },
+                ],
+                // Step 3: Session B completes turn after receiving tool outputs
+                _ => {
+                    let _ = req;
+                    vec![Item::assistant_message("Beta inspected Alpha's history.")]
+                }
+            };
+
+            Ok(make_openresponses_resource(
+                &format!("resp_{step}"),
+                "gpt-4.1",
+                items,
+                None,
+            ))
+        }
+    }
+
+    let d_cancel = CancellationToken::new();
+    let daemon =
+        AgentDaemon::new(cfg).with_model_backend(Arc::new(ScriptedModelBackend {
+            step: std::sync::Mutex::new(0),
+        }));
+    daemon.start(d_cancel.clone()).await.unwrap();
+
+    let mut events_rx = client.watch_events(None, 0).await.unwrap();
+    async fn wait_for_act(
+        act_id: ActivationId,
+        rx: &mut futures::stream::BoxStream<
+            'static,
+            Result<SessionEventEnvelope, ragents_client::ClientError>,
+        >,
+    ) {
+        while let Some(Ok(env)) = rx.next().await {
+            if env.activation_id.as_ref() == Some(&act_id)
+                && matches!(env.event, SessionEvent::ActivationCompleted { .. })
+            {
+                break;
+            }
+        }
+    }
+
+    // 1. Create and run `sess_alpha` in `ws_shared`
+    let mut alpha_labels = BTreeMap::new();
+    alpha_labels.insert("ragents.chat.agent_name".into(), "Alpha".into());
+    let created_alpha = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_alpha")),
+            labels: alpha_labels,
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_hist"),
+                    workspace_path: ws_shared.clone(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: Some("Alpha prompt".into()),
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("Investigate OOM in train_model.py")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+    wait_for_act(
+        ActivationId::new(created_alpha.initial_activation.unwrap().metadata.id),
+        &mut events_rx,
+    )
+    .await;
+
+    // 2. Create and run `sess_other_ws` in `ws_other`
+    let created_other = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_other_ws")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_hist"),
+                    workspace_path: ws_other.clone(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: Some("Other prompt".into()),
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("Secret task in other workspace")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+    wait_for_act(
+        ActivationId::new(created_other.initial_activation.unwrap().metadata.id),
+        &mut events_rx,
+    )
+    .await;
+
+    // 3. Create and run `sess_beta` in `ws_shared` with `session_history` extension
+    let mut beta_labels = BTreeMap::new();
+    beta_labels.insert("ragents.chat.agent_name".into(), "Beta".into());
+    let created_beta = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_beta")),
+            labels: beta_labels,
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_hist"),
+                    workspace_path: ws_shared.clone(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: Some("Beta prompt".into()),
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![ExtensionSpec {
+                    name: "session_history".into(),
+                    path: session_history_wasm.to_string_lossy().to_string(),
+                    enabled: true,
+                    config: serde_json::json!({}),
+                    allowed_dirs: vec![],
+                    filter_env: vec![],
+                }],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("Check what Alpha found")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+    wait_for_act(
+        ActivationId::new(created_beta.initial_activation.unwrap().metadata.id),
+        &mut events_rx,
+    )
+    .await;
+
+    // Inspect Beta's effective context to verify the outputs of all 4 tool calls!
+    let beta_ctx = client
+        .get_session_context(&SessionId::new("sess_beta"))
+        .await
+        .unwrap();
+    let extract_tool_out = |cid: &str| -> String {
+        beta_ctx
+            .effective_items
+            .iter()
+            .find_map(|it| match it {
+                Item::FunctionCallOutput {
+                    call_id,
+                    output: openresponses_rust::FunctionOutput::Text(t),
+                    ..
+                } if call_id == cid => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing tool output for {cid}"))
+    };
+
+    let list_out = extract_tool_out("call_hist_list");
+    assert!(
+        list_out.contains("sess_alpha") && list_out.contains("agent=Alpha"),
+        "list output must contain sess_alpha: {list_out}"
+    );
+    assert!(
+        !list_out.contains("sess_other_ws"),
+        "list output must NOT contain session from another workspace: {list_out}"
+    );
+
+    let search_out = extract_tool_out("call_hist_search");
+    assert!(
+        search_out.contains("sess_alpha")
+            && search_out.contains("item_index: 1")
+            && search_out.contains("CUDA_OUT_OF_MEMORY_SIG_7788"),
+        "search output must locate item_index 1 in sess_alpha: {search_out}"
+    );
+
+    let read_alpha_out = extract_tool_out("call_hist_read_alpha");
+    assert!(
+        read_alpha_out.contains("Investigate OOM in train_model.py")
+            && read_alpha_out.contains("CUDA_OUT_OF_MEMORY_SIG_7788"),
+        "read output must include Alpha's conversation items: {read_alpha_out}"
+    );
+
+    let read_other_out = extract_tool_out("call_hist_read_other");
+    assert!(
+        read_other_out.contains("outside the current workspace scope")
+            && !read_other_out.contains("SECRET_OTHER_WS_9999"),
+        "reading a session from another workspace must be rejected: {read_other_out}"
+    );
+
+    d_cancel.cancel();
+    server_cancel.cancel();
+}
+
+

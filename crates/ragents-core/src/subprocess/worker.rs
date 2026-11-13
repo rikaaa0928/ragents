@@ -358,6 +358,24 @@ impl CoreHost for IpcCoreHostProxy {
         }
     }
 
+    async fn query_session_history(
+        &self,
+        request: SessionHistoryQueryRequest,
+    ) -> Result<SessionHistoryQueryResponse, CoreError> {
+        let mut ch = self.channel.lock().await;
+        match ch
+            .call(&WorkerToParentMessage::QuerySessionHistory { request })
+            .await?
+        {
+            ParentToWorkerMessage::QuerySessionHistoryReply { result } => {
+                result.map_err(CoreError::HostError)
+            }
+            other => Err(CoreError::HostError(format!(
+                "unexpected reply to QuerySessionHistory: {other:?}"
+            ))),
+        }
+    }
+
     async fn rollover_compacted_session(
         &self,
         turn_id: Option<TurnId>,

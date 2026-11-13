@@ -7,7 +7,7 @@ use crate::process::ProcessManager;
 use crate::sandbox::{SandboxMode, SandboxState};
 use ragents_protocol::{
     ActivationId, CapabilityRequest, PermissionPolicyLayer, ProcessActionRequest,
-    ProcessActionResponse, SessionId,
+    ProcessActionResponse, SessionHistoryQueryRequest, SessionHistoryQueryResponse, SessionId,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -46,7 +46,7 @@ fn load_or_precompile_component(engine: &Engine, path: &Path) -> Result<Componen
     })?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"wasmtime-37-component:");
+    hasher.update(b"wasmtime-37-component-v2:");
     hasher.update(std::env::consts::OS.as_bytes());
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(&wasm_bytes);
@@ -168,6 +168,41 @@ impl ragent::extension::host::Host for HostState {
         };
 
         serde_json::to_string(&resp).unwrap_or_default()
+    }
+
+    async fn query_session_history(&mut self, request_json: String) -> String {
+        let req: SessionHistoryQueryRequest = match serde_json::from_str(&request_json) {
+            Ok(r) => r,
+            Err(err) => {
+                return serde_json::to_string(&SessionHistoryQueryResponse {
+                    ok: false,
+                    error: Some(format!("invalid session history query request: {err}")),
+                    ..Default::default()
+                })
+                .unwrap_or_default();
+            }
+        };
+
+        if let Some(ref host) = self.core_host {
+            match host.query_session_history(req).await {
+                Ok(resp) => return serde_json::to_string(&resp).unwrap_or_default(),
+                Err(err) => {
+                    return serde_json::to_string(&SessionHistoryQueryResponse {
+                        ok: false,
+                        error: Some(err.to_string()),
+                        ..Default::default()
+                    })
+                    .unwrap_or_default();
+                }
+            }
+        }
+
+        serde_json::to_string(&SessionHistoryQueryResponse {
+            ok: false,
+            error: Some("no CoreHost attached to query session history".into()),
+            ..Default::default()
+        })
+        .unwrap_or_default()
     }
 }
 

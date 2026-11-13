@@ -492,6 +492,17 @@ impl CoreExecutor for SubprocessExecutor {
                         )
                         .await?;
                     }
+                    WorkerToParentMessage::QuerySessionHistory { request } => {
+                        let res = tokio::select! {
+                            r = host.query_session_history(request) => r.map_err(|e| e.to_string()),
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        };
+                        send_jsonl(
+                            &mut writer,
+                            &ParentToWorkerMessage::QuerySessionHistoryReply { result: res },
+                        )
+                        .await?;
+                    }
                     WorkerToParentMessage::RolloverCompactedSession {
                         turn_id,
                         plan,

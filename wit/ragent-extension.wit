@@ -2,6 +2,7 @@ package ragent:extension@1.0.0;
 
 interface host {
     manage-process: func(request-json: string) -> string;
+    query-session-history: func(request-json: string) -> string;
 }
 
 interface lifecycle {

@@ -179,6 +179,10 @@ pub fn build_router(state: ApiServerState) -> Router {
             get(http::handle_get_session_context),
         )
         .route(
+            "/api/v1/sessions/{session_id}/workspace-history",
+            post(http::handle_query_workspace_session_history),
+        )
+        .route(
             "/api/v1/sessions/{session_id}/activations",
             get(http::handle_list_session_activations),
         )

@@ -398,6 +398,27 @@ fn handle_daemon_message(
                 });
             }
         },
+        DaemonToServerMessage::QuerySessionHistory {
+            request_id,
+            session_id,
+            request,
+        } => {
+            let response = match state
+                .store
+                .query_workspace_session_history(&session_id, *request)
+            {
+                Ok(resp) => resp,
+                Err(e) => SessionHistoryQueryResponse {
+                    ok: false,
+                    error: Some(e.to_string()),
+                    ..Default::default()
+                },
+            };
+            let _ = out_tx.send(ServerToDaemonMessage::QuerySessionHistoryReply {
+                request_id,
+                response: Box::new(response),
+            });
+        }
         DaemonToServerMessage::NodeExtensionReply {
             request_id,
             response,

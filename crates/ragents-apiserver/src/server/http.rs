@@ -244,6 +244,26 @@ pub(crate) async fn handle_get_session_context(
     Ok(Json(ctx))
 }
 
+pub(crate) async fn handle_query_workspace_session_history(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(req): Json<SessionHistoryQueryRequest>,
+) -> Result<Json<SessionHistoryQueryResponse>, ApiError> {
+    state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "POST",
+            &format!("/api/v1/sessions/{session_id}/workspace-history"),
+            &headers,
+        )
+        .await?;
+    let id = SessionId::new(session_id);
+    let resp = state.store.query_workspace_session_history(&id, req)?;
+    Ok(Json(resp))
+}
+
 pub(crate) async fn handle_list_session_activations(
     State(state): State<ApiServerState>,
     headers: HeaderMap,

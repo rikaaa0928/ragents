@@ -3,10 +3,10 @@ set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
-# 支持通过参数传入以逗号分隔的扩展名列表，如: ./scripts/build-extensions.sh shell,file_editor,image_viewer,agents_md,skills,compaction,authn
+# 支持通过参数传入以逗号分隔的扩展名列表，如: ./scripts/build-extensions.sh shell,file_editor,image_viewer,agents_md,skills,compaction,session_history,authn
 # 默认编译所有扩展
 if [ "$#" -gt 1 ]; then
-    echo "usage: $0 [shell,file_editor,image_viewer,agents_md,skills,compaction,authn]" >&2
+    echo "usage: $0 [shell,file_editor,image_viewer,agents_md,skills,compaction,session_history,authn]" >&2
     exit 2
 fi
 
@@ -16,7 +16,7 @@ if [ "$#" -eq 1 ] && [ -z "$filter" ]; then
     exit 2
 fi
 
-ALL_EXTENSIONS="shell,file_editor,image_viewer,agents_md,skills,compaction,authn"
+ALL_EXTENSIONS="shell,file_editor,image_viewer,agents_md,skills,compaction,session_history,authn"
 
 is_selected() {
     ext_name="$1"
@@ -90,6 +90,12 @@ if is_selected "compaction"; then
     build_extension \
         "$project_dir/extensions/compaction/Cargo.toml" \
         "$project_dir/extensions/compaction/target/wasm32-wasip2/release/ragent_compaction_extension.wasm"
+fi
+
+if is_selected "session_history"; then
+    build_extension \
+        "$project_dir/extensions/session_history/Cargo.toml" \
+        "$project_dir/extensions/session_history/target/wasm32-wasip2/release/ragent_session_history_extension.wasm"
 fi
 
 if is_selected "authn"; then

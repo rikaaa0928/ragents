@@ -15,6 +15,7 @@ exclude = [
     "extensions/skills",
     "extensions/agents_md",
     "extensions/compaction",
+    "extensions/session_history",
     "extensions/authn",
 ]
 

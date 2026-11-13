@@ -279,6 +279,12 @@ pub enum DaemonToServerMessage {
         request_id: String,
         request: Box<RolloverCompactedSessionRequest>,
     },
+    /// Daemon queries sibling/ancestor session history scoped to the caller session's workspace
+    QuerySessionHistory {
+        request_id: String,
+        session_id: SessionId,
+        request: Box<SessionHistoryQueryRequest>,
+    },
     /// Daemon replies to a `NodeExtensionCall` request from `api-server`
     NodeExtensionReply {
         request_id: String,
@@ -424,6 +430,10 @@ pub enum ServerToDaemonMessage {
         response: Option<Box<RolloverCompactedSessionResponse>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    QuerySessionHistoryReply {
+        request_id: String,
+        response: Box<SessionHistoryQueryResponse>,
     },
     /// Server pushes a newly scheduled activation to this daemon
     DispatchActivation {

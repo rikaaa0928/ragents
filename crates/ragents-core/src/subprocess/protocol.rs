@@ -65,6 +65,9 @@ pub enum WorkerToParentMessage {
         extension_id: Option<String>,
         request: ProcessActionRequest,
     },
+    QuerySessionHistory {
+        request: SessionHistoryQueryRequest,
+    },
     RolloverCompactedSession {
         turn_id: Option<TurnId>,
         plan: Box<CompactionPlan>,
@@ -112,6 +115,9 @@ pub enum ParentToWorkerMessage {
     },
     ManageProcessReply {
         result: Result<Option<ProcessActionResponse>, String>,
+    },
+    QuerySessionHistoryReply {
+        result: Result<SessionHistoryQueryResponse, String>,
     },
     RolloverCompactedSessionReply {
         result: Result<SessionId, String>,

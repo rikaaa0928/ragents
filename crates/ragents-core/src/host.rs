@@ -228,6 +228,18 @@ pub trait CoreHost: Send + Sync {
         Ok(None)
     }
 
+    /// Queries sibling/ancestor session history scoped to the current session's workspace.
+    async fn query_session_history(
+        &self,
+        _request: SessionHistoryQueryRequest,
+    ) -> Result<SessionHistoryQueryResponse, CoreError> {
+        Ok(SessionHistoryQueryResponse {
+            ok: false,
+            error: Some("query_session_history is not supported by this CoreHost".into()),
+            ..Default::default()
+        })
+    }
+
     /// Commits a 3-session context compaction rollover (`from_session -> compaction_session -> continued_session`)
     /// and returns the newly created `continued_session_id`.
     async fn rollover_compacted_session(
