@@ -487,11 +487,25 @@ impl SqliteStore {
         &self,
         session_id: &SessionId,
     ) -> Result<SessionContextResponse, StoreError> {
+        self.read_effective_context_with_options(session_id, ContentFetchMode::Full, true)
+    }
+
+    pub fn read_effective_context_with_options(
+        &self,
+        session_id: &SessionId,
+        mode: ContentFetchMode,
+        include_batches: bool,
+    ) -> Result<SessionContextResponse, StoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let session = Self::load_session_from_conn(&conn, session_id)?
             .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
-        let effective_items = Self::resolve_effective_items_from_conn(&conn, session_id)?;
-        let local_batches = Self::read_local_batches_from_conn(&conn, session_id)?;
+        let effective_items =
+            Self::resolve_effective_items_with_mode(&conn, session_id, mode)?;
+        let local_batches = if include_batches {
+            Self::read_local_batches_with_mode(&conn, session_id, mode)?
+        } else {
+            Vec::new()
+        };
         Ok(SessionContextResponse {
             session_id: session_id.clone(),
             resource_version: session.metadata.resource_version,
@@ -504,11 +518,19 @@ impl SqliteStore {
         conn: &Connection,
         session_id: &SessionId,
     ) -> Result<Vec<Item>, StoreError> {
+        Self::resolve_effective_items_with_mode(conn, session_id, ContentFetchMode::Full)
+    }
+
+    pub(crate) fn resolve_effective_items_with_mode(
+        conn: &Connection,
+        session_id: &SessionId,
+        mode: ContentFetchMode,
+    ) -> Result<Vec<Item>, StoreError> {
         let session = Self::load_session_from_conn(conn, session_id)?
             .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
         let mut effective = Vec::new();
         for src in &session.spec.sources {
-            let parent_items = Self::resolve_effective_items_from_conn(conn, &src.session_id)?;
+            let parent_items = Self::resolve_effective_items_with_mode(conn, &src.session_id, mode)?;
             let from = src.from_context_pos.value() as usize;
             let through = src.through_context_pos.value() as usize;
             if through >= parent_items.len() || from > through {
@@ -519,7 +541,7 @@ impl SqliteStore {
             }
             effective.extend_from_slice(&parent_items[from..=through]);
         }
-        let local_batches = Self::read_local_batches_from_conn(conn, session_id)?;
+        let local_batches = Self::read_local_batches_with_mode(conn, session_id, mode)?;
         for batch in local_batches {
             effective.extend(batch.items);
         }
@@ -565,6 +587,14 @@ impl SqliteStore {
         conn: &Connection,
         session_id: &SessionId,
     ) -> Result<Vec<ItemBatch>, StoreError> {
+        Self::read_local_batches_with_mode(conn, session_id, ContentFetchMode::Full)
+    }
+
+    pub(crate) fn read_local_batches_with_mode(
+        conn: &Connection,
+        session_id: &SessionId,
+        mode: ContentFetchMode,
+    ) -> Result<Vec<ItemBatch>, StoreError> {
         let mut stmt = conn.prepare(
             "SELECT payload_json FROM batches WHERE session_id = ?1 ORDER BY batch_seq ASC",
         )?;
@@ -572,7 +602,10 @@ impl SqliteStore {
         let mut batches = Vec::new();
         for r in rows {
             let payload_json = r?;
-            let batch: ItemBatch = serde_json::from_str(&payload_json)?;
+            let mut batch: ItemBatch = serde_json::from_str(&payload_json)?;
+            if mode == ContentFetchMode::View {
+                batch.apply_view_mode();
+            }
             batches.push(batch);
         }
         Ok(batches)

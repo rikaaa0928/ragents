@@ -306,6 +306,22 @@ impl CoreHost for DaemonCoreHost {
         duration_ms: u64,
         items: Vec<Item>,
     ) -> Result<BatchSeq, CoreError> {
+        self.commit_tool_output_with_placeholder(
+            turn_id, call_id, tool_name, success, duration_ms, None, items,
+        )
+        .await
+    }
+
+    async fn commit_tool_output_with_placeholder(
+        &self,
+        turn_id: &TurnId,
+        call_id: &str,
+        tool_name: &str,
+        success: bool,
+        duration_ms: u64,
+        view_mode_placeholder: Option<String>,
+        items: Vec<Item>,
+    ) -> Result<BatchSeq, CoreError> {
         self.tunnel
             .commit_batch(
                 self.session_id.clone(),
@@ -320,6 +336,7 @@ impl CoreHost for DaemonCoreHost {
                     name: tool_name.to_string(),
                     success,
                     duration_ms,
+                    view_mode_placeholder,
                 },
             )
             .await

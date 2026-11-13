@@ -93,6 +93,7 @@ fn test_openresponses_item_batch_roundtrip() {
         activation_id: ActivationId::generate(),
         turn_id: None,
         response_id: None,
+        view_mode_placeholder: None,
         created_at: chrono::Utc::now(),
         items: vec![item],
     };

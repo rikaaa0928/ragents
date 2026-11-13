@@ -521,3 +521,117 @@ fn test_running_activation_grace_period_and_reconnect_reconciliation() {
     );
 }
 
+#[test]
+fn test_context_and_events_full_vs_view_mode_placeholders() {
+    let store = SqliteStore::open_in_memory().expect("open store");
+    register_test_node(&store, "node_view", vec!["gpt-4.1"], 10_000);
+
+    let sess_id = SessionId::new("sess_view_1");
+    let (created, dispatches) = store
+        .create_session(CreateSessionRequest {
+            session_id: Some(sess_id.clone()),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_view"),
+                    workspace_path: PathBuf::from("/tmp/workspace/view"),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("inspect image")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .expect("create session");
+
+    let act_id = ActivationId::new(
+        created
+            .initial_activation
+            .as_ref()
+            .unwrap()
+            .metadata
+            .id
+            .clone(),
+    );
+    let epoch = dispatches[0].lease_epoch;
+    let cfg = ConfigRevision::new_merged(
+        "prompt".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![],
+    );
+    let perm = PermissionSnapshot::from_effective_policy(PermissionPolicyLayer::default());
+    store
+        .accept_activation(&sess_id, &act_id, epoch, cfg, perm)
+        .expect("accept activation");
+
+    let placeholder = "[图片数据已在视图模式中省略 (view_image)]".to_string();
+    let tool_output_item = Item::FunctionCallOutput {
+        id: None,
+        call_id: "call_img_1".to_string(),
+        output: openresponses_rust::FunctionOutput::Content(vec![
+            openresponses_rust::MessageContent::InputText {
+                text: "Image loaded: /tmp/test.png (1024x1024)".to_string(),
+            },
+            openresponses_rust::MessageContent::InputImage {
+                image_url: Some("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string()),
+                detail: openresponses_rust::ImageDetail::Auto,
+            },
+        ]),
+        status: None,
+    };
+
+    store
+        .commit_batch(
+            &sess_id,
+            &act_id,
+            epoch,
+            ItemBatchKind::ToolOutput,
+            Some(TurnId::new("turn_1")),
+            None,
+            vec![tool_output_item],
+            BatchCompanionEvent::ToolCallFinished {
+                call_id: "call_img_1".to_string(),
+                name: "view_image".to_string(),
+                success: true,
+                duration_ms: 12,
+                view_mode_placeholder: Some(placeholder.clone()),
+            },
+        )
+        .expect("commit tool output batch");
+
+    // 1. Full mode preserves the InputImage data URL and returns local_batches
+    let full_ctx = store
+        .read_effective_context_with_options(&sess_id, ContentFetchMode::Full, true)
+        .expect("read full context");
+    assert_eq!(full_ctx.local_batches.len(), 2);
+    let full_json = serde_json::to_string(&full_ctx).unwrap();
+    assert!(full_json.contains("data:image/png;base64,"));
+
+    // 2. View mode replaces InputImage with placeholder while preserving InputText metadata, and omits local_batches when requested
+    let view_ctx = store
+        .read_effective_context_with_options(&sess_id, ContentFetchMode::View, false)
+        .expect("read view context");
+    assert!(view_ctx.local_batches.is_empty());
+    let view_json = serde_json::to_string(&view_ctx).unwrap();
+    assert!(!view_json.contains("data:image/png;base64,"));
+    assert!(view_json.contains("Image loaded: /tmp/test.png (1024x1024)"));
+    assert!(view_json.contains(&placeholder));
+
+    // 3. Events in View mode also replace tool output with placeholder
+    let view_events = store
+        .read_events_after_with_mode(Some(&sess_id), 0, ContentFetchMode::View)
+        .expect("read view events");
+    let view_events_json = serde_json::to_string(&view_events).unwrap();
+    assert!(!view_events_json.contains("data:image/png;base64,"));
+    assert!(view_events_json.contains(&placeholder));
+}
+

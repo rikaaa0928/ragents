@@ -270,6 +270,15 @@ impl SqliteStore {
         session_id: Option<&SessionId>,
         after_rv: u64,
     ) -> Result<Vec<SessionEventEnvelope>, StoreError> {
+        self.read_events_after_with_mode(session_id, after_rv, ContentFetchMode::Full)
+    }
+
+    pub fn read_events_after_with_mode(
+        &self,
+        session_id: Option<&SessionId>,
+        after_rv: u64,
+        mode: ContentFetchMode,
+    ) -> Result<Vec<SessionEventEnvelope>, StoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut events = Vec::new();
         if let Some(sess_id) = session_id {
@@ -282,7 +291,11 @@ impl SqliteStore {
                 r.get::<_, String>(0)
             })?;
             for r in rows {
-                events.push(serde_json::from_str(&r?)?);
+                let mut env: SessionEventEnvelope = serde_json::from_str(&r?)?;
+                if mode == ContentFetchMode::View {
+                    env.apply_view_mode();
+                }
+                events.push(env);
             }
         } else {
             let mut stmt = conn.prepare(
@@ -292,7 +305,11 @@ impl SqliteStore {
             )?;
             let rows = stmt.query_map(params![after_rv as i64], |r| r.get::<_, String>(0))?;
             for r in rows {
-                events.push(serde_json::from_str(&r?)?);
+                let mut env: SessionEventEnvelope = serde_json::from_str(&r?)?;
+                if mode == ContentFetchMode::View {
+                    env.apply_view_mode();
+                }
+                events.push(env);
             }
         }
         Ok(events)

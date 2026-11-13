@@ -84,11 +84,28 @@ pub struct PatchActivationSpecRequest {
     pub interaction_responses: BTreeMap<PermissionRequestId, PermissionResolutionSpec>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentFetchMode {
+    #[default]
+    Full,
+    View,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextQuery {
+    #[serde(default)]
+    pub mode: ContentFetchMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_batches: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionContextResponse {
     pub session_id: SessionId,
     pub resource_version: ResourceVersion,
     pub effective_items: Vec<Item>,
+    #[serde(default)]
     pub local_batches: Vec<ItemBatch>,
 }
 
@@ -98,6 +115,8 @@ pub struct WatchQuery {
     pub session_id: Option<SessionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_rv: Option<u64>,
+    #[serde(default)]
+    pub mode: ContentFetchMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +346,8 @@ pub enum BatchCompanionEvent {
         name: String,
         success: bool,
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_mode_placeholder: Option<String>,
     },
 }
 

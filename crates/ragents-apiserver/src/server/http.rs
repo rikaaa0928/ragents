@@ -220,6 +220,7 @@ pub(crate) async fn handle_get_session_context(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
+    Query(query): Query<ContextQuery>,
 ) -> Result<Json<SessionContextResponse>, ApiError> {
     state
         .extensions
@@ -235,7 +236,11 @@ pub(crate) async fn handle_get_session_context(
         .store
         .get_session(&id)?
         .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
-    let ctx = state.store.read_effective_context(&id)?;
+    let ctx = state.store.read_effective_context_with_options(
+        &id,
+        query.mode,
+        query.include_batches.unwrap_or(true),
+    )?;
     Ok(Json(ctx))
 }
 
@@ -392,9 +397,11 @@ pub(crate) async fn handle_read_events(
         .extensions
         .authenticate(AuthScope::ClientHttp, "GET", "/api/v1/events", &headers)
         .await?;
-    let events = state
-        .store
-        .read_events_after(query.session_id.as_ref(), query.after_rv.unwrap_or(0))?;
+    let events = state.store.read_events_after_with_mode(
+        query.session_id.as_ref(),
+        query.after_rv.unwrap_or(0),
+        query.mode,
+    )?;
     Ok(Json(events))
 }
 
@@ -410,12 +417,15 @@ pub(crate) async fn handle_watch_events(
     let live_rx = state.store.subscribe_events();
     let after_rv = query.after_rv.unwrap_or(0);
     let filter_session = query.session_id.clone();
+    let mode = query.mode;
 
-    let historical = state
-        .store
-        .read_events_after(filter_session.as_ref(), after_rv)?;
+    let historical = state.store.read_events_after_with_mode(
+        filter_session.as_ref(),
+        after_rv,
+        mode,
+    )?;
 
-    let stream = async_stream_events(historical, live_rx, filter_session, after_rv);
+    let stream = async_stream_events(historical, live_rx, filter_session, after_rv, mode);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -424,6 +434,7 @@ fn async_stream_events(
     mut live_rx: tokio::sync::broadcast::Receiver<SessionEventEnvelope>,
     filter_session: Option<SessionId>,
     after_rv: u64,
+    mode: ContentFetchMode,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let (tx, rx) = mpsc::unbounded_channel::<Result<SseEvent, Infallible>>();
 
@@ -445,7 +456,7 @@ fn async_stream_events(
             }
         }
 
-        while let Ok(ev) = live_rx.recv().await {
+        while let Ok(mut ev) = live_rx.recv().await {
             let is_ephemeral = ev.event.is_ephemeral_stream_delta();
             let rv = ev.resource_version.value();
             if !is_ephemeral && rv <= highest_rv {
@@ -458,6 +469,9 @@ fn async_stream_events(
             }
             if !is_ephemeral {
                 highest_rv = rv;
+            }
+            if mode == ContentFetchMode::View {
+                ev.apply_view_mode();
             }
             if let Ok(json_str) = serde_json::to_string(&ev) {
                 let sse = SseEvent::default()

@@ -251,6 +251,7 @@ impl SqliteStore {
             activation_id: activation_id.clone(),
             turn_id: turn_id.clone(),
             response_id: None,
+            view_mode_placeholder: None,
             created_at: Utc::now(),
             items: items.clone(),
         };

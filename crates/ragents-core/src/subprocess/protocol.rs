@@ -43,6 +43,8 @@ pub enum WorkerToParentMessage {
         tool_name: String,
         success: bool,
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_mode_placeholder: Option<String>,
         items: Vec<Item>,
     },
     EmitEvent {

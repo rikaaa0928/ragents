@@ -136,7 +136,24 @@ impl RagentsClient {
         &self,
         session_id: &SessionId,
     ) -> Result<SessionContextResponse, ClientError> {
-        let url = format!("{}/api/v1/sessions/{}/context", self.base_url, session_id);
+        self.get_session_context_with_options(session_id, ContentFetchMode::Full, true)
+            .await
+    }
+
+    pub async fn get_session_context_with_options(
+        &self,
+        session_id: &SessionId,
+        mode: ContentFetchMode,
+        include_batches: bool,
+    ) -> Result<SessionContextResponse, ClientError> {
+        let mode_str = match mode {
+            ContentFetchMode::Full => "full",
+            ContentFetchMode::View => "view",
+        };
+        let url = format!(
+            "{}/api/v1/sessions/{}/context?mode={}&include_batches={}",
+            self.base_url, session_id, mode_str, include_batches
+        );
         let resp = self.http.get(url).send().await?;
         Self::parse_response(resp).await
     }
@@ -274,7 +291,24 @@ impl RagentsClient {
         session_id: Option<&SessionId>,
         after_rv: u64,
     ) -> Result<Vec<SessionEventEnvelope>, ClientError> {
-        let mut url = format!("{}/api/v1/events?after_rv={}", self.base_url, after_rv);
+        self.read_events_with_mode(session_id, after_rv, ContentFetchMode::Full)
+            .await
+    }
+
+    pub async fn read_events_with_mode(
+        &self,
+        session_id: Option<&SessionId>,
+        after_rv: u64,
+        mode: ContentFetchMode,
+    ) -> Result<Vec<SessionEventEnvelope>, ClientError> {
+        let mode_str = match mode {
+            ContentFetchMode::Full => "full",
+            ContentFetchMode::View => "view",
+        };
+        let mut url = format!(
+            "{}/api/v1/events?after_rv={}&mode={}",
+            self.base_url, after_rv, mode_str
+        );
         if let Some(sess_id) = session_id {
             url.push_str(&format!("&session_id={sess_id}"));
         }
@@ -290,7 +324,27 @@ impl RagentsClient {
         Pin<Box<dyn Stream<Item = Result<SessionEventEnvelope, ClientError>> + Send>>,
         ClientError,
     > {
-        let mut url = format!("{}/api/v1/watch?after_rv={}", self.base_url, after_rv);
+        self.watch_events_with_mode(session_id, after_rv, ContentFetchMode::Full)
+            .await
+    }
+
+    pub async fn watch_events_with_mode(
+        &self,
+        session_id: Option<&SessionId>,
+        after_rv: u64,
+        mode: ContentFetchMode,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<SessionEventEnvelope, ClientError>> + Send>>,
+        ClientError,
+    > {
+        let mode_str = match mode {
+            ContentFetchMode::Full => "full",
+            ContentFetchMode::View => "view",
+        };
+        let mut url = format!(
+            "{}/api/v1/watch?after_rv={}&mode={}",
+            self.base_url, after_rv, mode_str
+        );
         if let Some(sess_id) = session_id {
             url.push_str(&format!("&session_id={sess_id}"));
         }

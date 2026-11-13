@@ -171,6 +171,20 @@ pub trait CoreHost: Send + Sync {
         items: Vec<Item>,
     ) -> Result<BatchSeq, CoreError>;
 
+    async fn commit_tool_output_with_placeholder(
+        &self,
+        turn_id: &TurnId,
+        call_id: &str,
+        tool_name: &str,
+        success: bool,
+        duration_ms: u64,
+        _view_mode_placeholder: Option<String>,
+        items: Vec<Item>,
+    ) -> Result<BatchSeq, CoreError> {
+        self.commit_tool_output(turn_id, call_id, tool_name, success, duration_ms, items)
+            .await
+    }
+
     async fn emit_event(
         &self,
         turn_id: Option<TurnId>,

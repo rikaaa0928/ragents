@@ -1,8 +1,77 @@
 use crate::ids::*;
 use crate::resources::{ManagedProcessInfo, PermissionDecision, PermissionRequest};
 use chrono::{DateTime, Utc};
-use openresponses_rust::{Item, Usage};
+use openresponses_rust::{FunctionOutput, Item, MessageContent, Usage};
 use serde::{Deserialize, Serialize};
+
+pub const DEFAULT_IMAGE_VIEW_PLACEHOLDER: &str = "[图片数据已在视图模式中省略]";
+
+pub fn apply_view_mode_to_item(item: &mut Item, view_mode_placeholder: Option<&str>) {
+    match item {
+        Item::FunctionCallOutput { output, .. } => {
+            if let Some(ph) = view_mode_placeholder {
+                match output {
+                    FunctionOutput::Text(_) => {
+                        *output = FunctionOutput::Text(ph.to_string());
+                    }
+                    FunctionOutput::Content(parts) => {
+                        let mut replaced_non_text = false;
+                        for part in parts.iter_mut() {
+                            if !matches!(
+                                part,
+                                MessageContent::InputText { .. }
+                                    | MessageContent::PlainText { .. }
+                                    | MessageContent::OutputText { .. }
+                            ) {
+                                *part = MessageContent::InputText {
+                                    text: ph.to_string(),
+                                };
+                                replaced_non_text = true;
+                            }
+                        }
+                        if !replaced_non_text {
+                            *parts = vec![MessageContent::InputText {
+                                text: ph.to_string(),
+                            }];
+                        }
+                    }
+                }
+            } else if let FunctionOutput::Content(parts) = output {
+                for part in parts.iter_mut() {
+                    if let MessageContent::InputImage {
+                        image_url: Some(ref url),
+                        ..
+                    } = part
+                    {
+                        if url.starts_with("data:") {
+                            *part = MessageContent::InputText {
+                                text: DEFAULT_IMAGE_VIEW_PLACEHOLDER.to_string(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Item::Message { content, .. } => {
+            for part in content.iter_mut() {
+                if let MessageContent::InputImage {
+                    image_url: Some(ref url),
+                    ..
+                } = part
+                {
+                    if url.starts_with("data:") {
+                        *part = MessageContent::InputText {
+                            text: view_mode_placeholder
+                                .unwrap_or(DEFAULT_IMAGE_VIEW_PLACEHOLDER)
+                                .to_string(),
+                        };
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +92,8 @@ pub struct ItemBatch {
     pub turn_id: Option<TurnId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_mode_placeholder: Option<String>,
     pub created_at: DateTime<Utc>,
     pub items: Vec<Item>,
 }
@@ -34,6 +105,13 @@ impl ItemBatch {
             self.first_local_item_seq
         } else {
             LocalItemSeq::new(self.first_local_item_seq.value() + len - 1)
+        }
+    }
+
+    pub fn apply_view_mode(&mut self) {
+        let ph = self.view_mode_placeholder.as_deref();
+        for item in &mut self.items {
+            apply_view_mode_to_item(item, ph);
         }
     }
 }
@@ -124,6 +202,8 @@ pub enum SessionEvent {
         duration_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_batch_seq: Option<BatchSeq>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_mode_placeholder: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         items: Vec<Item>,
     },
@@ -206,5 +286,33 @@ impl SessionEvent {
             self,
             SessionEvent::ModelTextDelta { .. } | SessionEvent::ModelReasoningDelta { .. }
         )
+    }
+
+    pub fn apply_view_mode(&mut self) {
+        match self {
+            SessionEvent::ActivationSubmitted { items, .. }
+            | SessionEvent::TurnCompleted { items, .. } => {
+                for item in items.iter_mut() {
+                    apply_view_mode_to_item(item, None);
+                }
+            }
+            SessionEvent::ToolCallFinished {
+                items,
+                view_mode_placeholder,
+                ..
+            } => {
+                let ph = view_mode_placeholder.as_deref();
+                for item in items.iter_mut() {
+                    apply_view_mode_to_item(item, ph);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl SessionEventEnvelope {
+    pub fn apply_view_mode(&mut self) {
+        self.event.apply_view_mode();
     }
 }

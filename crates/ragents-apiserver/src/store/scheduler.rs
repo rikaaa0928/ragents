@@ -192,6 +192,7 @@ impl SqliteStore {
                         activation_id: prev_act_id.clone(),
                         turn_id: prev_turn_id.clone(),
                         response_id: None,
+                        view_mode_placeholder: None,
                         created_at: chrono::Utc::now(),
                         items: synth_items.clone(),
                     };
@@ -229,6 +230,7 @@ impl SqliteStore {
                             success: false,
                             duration_ms: 0,
                             output_batch_seq: Some(out_batch_seq),
+                            view_mode_placeholder: None,
                             items: synth_items,
                         },
                     )?;
@@ -249,6 +251,7 @@ impl SqliteStore {
                     activation_id: act_id.clone(),
                     turn_id: None,
                     response_id: None,
+                    view_mode_placeholder: None,
                     created_at: chrono::Utc::now(),
                     items: input_items.clone(),
                 };

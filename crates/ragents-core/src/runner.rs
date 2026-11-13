@@ -622,7 +622,7 @@ async fn run_react_loop(
                 .await?;
 
                 let started_at = Instant::now();
-                let (tool_output_item, success) = tokio::select! {
+                let (tool_output_item, success, view_mode_placeholder) = tokio::select! {
                     res = execute_tool_call(
                         call,
                         &active_tools,
@@ -634,12 +634,13 @@ async fn run_react_loop(
                 };
 
                 let duration_ms = started_at.elapsed().as_millis() as u64;
-                host.commit_tool_output(
+                host.commit_tool_output_with_placeholder(
                     &turn_id,
                     &call.call_id,
                     &call.name,
                     success,
                     duration_ms,
+                    view_mode_placeholder,
                     vec![tool_output_item.clone()],
                 )
                 .await?;
@@ -906,7 +907,7 @@ async fn execute_tool_call(
     hook_manager: &HookManager,
     host: &dyn CoreHost,
     iteration: usize,
-) -> Result<(Item, bool), CoreError> {
+) -> Result<(Item, bool, Option<String>), CoreError> {
     let tool = match active_tools.iter().find(|t| t.definition.name == call.name) {
         Some(t) => t,
         None => {
@@ -918,9 +919,11 @@ async fn execute_tool_call(
                     .to_function_output(),
                 status: None,
             };
-            return Ok((err_item, false));
+            return Ok((err_item, false, None));
         }
     };
+
+    let view_mode_placeholder = tool.definition.view_mode_placeholder.clone();
 
     let arguments_val: serde_json::Value = serde_json::from_str(&call.arguments)
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
@@ -981,7 +984,7 @@ async fn execute_tool_call(
                             .to_function_output(),
                         status: None,
                     };
-                    return Ok((err_item, false));
+                    return Ok((err_item, false, view_mode_placeholder));
                 }
             }
         }
@@ -1022,7 +1025,7 @@ async fn execute_tool_call(
         status: None,
     };
 
-    Ok((output_item, success))
+    Ok((output_item, success, view_mode_placeholder))
 }
 
 pub fn add_usage(a: &Usage, b: &Usage) -> Usage {

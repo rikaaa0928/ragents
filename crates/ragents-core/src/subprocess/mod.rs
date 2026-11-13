@@ -424,10 +424,11 @@ impl CoreExecutor for SubprocessExecutor {
                         tool_name,
                         success,
                         duration_ms,
+                        view_mode_placeholder,
                         items,
                     } => {
                         let res = tokio::select! {
-                            r = host.commit_tool_output(&turn_id, &call_id, &tool_name, success, duration_ms, items) => r.map_err(|e| e.to_string()),
+                            r = host.commit_tool_output_with_placeholder(&turn_id, &call_id, &tool_name, success, duration_ms, view_mode_placeholder, items) => r.map_err(|e| e.to_string()),
                             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
                         };
                         send_jsonl(

@@ -232,6 +232,14 @@ impl SqliteStore {
             let mut session = Self::load_session_in_tx(&tx, session_id)?
                 .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
 
+            let batch_view_placeholder = match &companion {
+                BatchCompanionEvent::ToolCallFinished {
+                    view_mode_placeholder,
+                    ..
+                } => view_mode_placeholder.clone(),
+                _ => None,
+            };
+
             let committed_items = items.clone();
             let appended_batch_seq = if !items.is_empty() {
                 let b_seq = BatchSeq::new(session.status.batch_count);
@@ -245,6 +253,7 @@ impl SqliteStore {
                     activation_id: activation_id.clone(),
                     turn_id: turn_id.clone(),
                     response_id: response_id.clone(),
+                    view_mode_placeholder: batch_view_placeholder,
                     created_at: Utc::now(),
                     items,
                 };
@@ -298,12 +307,14 @@ impl SqliteStore {
                     name,
                     success,
                     duration_ms,
+                    view_mode_placeholder,
                 } => SessionEvent::ToolCallFinished {
                     call_id,
                     name,
                     success,
                     duration_ms,
                     output_batch_seq: appended_batch_seq,
+                    view_mode_placeholder,
                     items: committed_items,
                 },
             };
@@ -716,6 +727,7 @@ impl SqliteStore {
                 activation_id: compact_act_id.clone(),
                 turn_id: None,
                 response_id: None,
+                view_mode_placeholder: None,
                 created_at: Utc::now(),
                 items: vec![Item::user_message(req.compaction_prompt)],
             };
@@ -727,6 +739,7 @@ impl SqliteStore {
                 activation_id: compact_act_id.clone(),
                 turn_id: None,
                 response_id: None,
+                view_mode_placeholder: None,
                 created_at: Utc::now(),
                 items: vec![Item::assistant_message(req.summary_text)],
             };

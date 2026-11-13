@@ -149,6 +149,8 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_mode_placeholder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

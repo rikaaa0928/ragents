@@ -133,6 +133,7 @@ impl exports::ragent::extension::lifecycle::Guest for ImageViewerExtension {
                     "enabled": true,
                     "name": "view_image",
                     "description": "查看本地图片信息并读取图片内容（支持符合 OpenAI Responses 规范的 PNG, JPEG 及 WEBP 格式）。",
+                    "view_mode_placeholder": "[图片数据已在视图模式中省略 (view_image)]",
                     "parameters": {
                         "type": "object",
                         "properties": {
