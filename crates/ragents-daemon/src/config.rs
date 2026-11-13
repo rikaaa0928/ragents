@@ -781,7 +781,11 @@ impl DaemonConfig {
                     merged.path = existing.path.clone();
                 }
             }
+            let had_explicit_path = !merged.path.trim().is_empty();
             merged.path = resolve_wasm_path(&merged);
+            if !had_explicit_path && !Path::new(&merged.path).exists() {
+                merged.enabled = false;
+            }
             ext_map.insert(merged.name.clone(), merged);
         }
         let effective_extensions: Vec<ExtensionSpec> = ext_map.into_values().collect();
