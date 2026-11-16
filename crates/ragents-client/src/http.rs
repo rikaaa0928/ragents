@@ -107,6 +107,12 @@ impl RagentsClient {
         Self::parse_response(resp).await
     }
 
+    pub async fn delete_node(&self, node_id: &NodeId) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/v1/nodes/{}", self.base_url, node_id);
+        let resp = self.http.delete(url).send().await?;
+        Self::parse_response(resp).await
+    }
+
     pub async fn create_session(
         &self,
         req: CreateSessionRequest,

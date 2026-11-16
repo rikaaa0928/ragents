@@ -827,3 +827,88 @@ async fn test_cluster_model_catalog_discovery_node_merge_and_refresh() {
     server_cancel.cancel();
 }
 
+#[tokio::test]
+async fn test_delete_disconnected_node_guards() {
+    use crate::server::{serve_tcp, ApiServerState};
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    let store = SqliteStore::open_in_memory().unwrap();
+    register_test_node(&store, "node_evict", vec!["gpt-4.1"], 5_000);
+
+    let state = ApiServerState::new(store.clone(), 5_000);
+    let cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = serve_tcp(listener, state, cancel.clone()).await.unwrap();
+    let http = reqwest::Client::new();
+
+    // 1. Ready node cannot be deleted (409 Conflict)
+    let ready_del = http
+        .delete(format!("http://{addr}/api/v1/nodes/node_evict"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready_del.status(), reqwest::StatusCode::CONFLICT);
+
+    // Create a Pinned session bound to node_evict
+    let sess_id = SessionId::new("sess_pinned_evict");
+    store
+        .create_session(CreateSessionRequest {
+            session_id: Some(sess_id.clone()),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_evict"),
+                    workspace_path: PathBuf::from("/tmp/ws_evict"),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: None,
+        })
+        .unwrap();
+
+    // Patrol lease expiration -> marks node_evict NotReady
+    store
+        .patrol_expired_leases(Utc::now() + chrono::Duration::seconds(30))
+        .unwrap();
+    let node_after_patrol = store.get_node(&NodeId::new("node_evict")).unwrap().unwrap();
+    assert_eq!(node_after_patrol.status.phase, NodePhase::NotReady);
+
+    // 2. NotReady node with open pinned session cannot be deleted (409 Conflict)
+    let pinned_del = http
+        .delete(format!("http://{addr}/api/v1/nodes/node_evict"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pinned_del.status(), reqwest::StatusCode::CONFLICT);
+
+    // Close the pinned session
+    store
+        .patch_session(
+            &sess_id,
+            PatchSessionSpecRequest {
+                desired_phase: Some(DesiredSessionPhase::Closed),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // 3. Now deleting the NotReady node succeeds!
+    let ok_del = http
+        .delete(format!("http://{addr}/api/v1/nodes/node_evict"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_del.status(), reqwest::StatusCode::OK);
+    assert!(store.get_node(&NodeId::new("node_evict")).unwrap().is_none());
+
+    cancel.cancel();
+}
+

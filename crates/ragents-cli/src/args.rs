@@ -158,6 +158,8 @@ pub enum Commands {
 pub enum NodeSubcommand {
     List,
     Get { node_id: String },
+    #[command(alias = "rm", alias = "remove")]
+    Delete { node_id: String },
 }
 
 #[derive(Debug, Subcommand)]

@@ -250,6 +250,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&node)?);
                 Ok(())
             }
+            NodeSubcommand::Delete { node_id } => {
+                let resp = client.delete_node(&NodeId::new(&node_id)).await?;
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+                Ok(())
+            }
         },
         Commands::Model { cmd } => match cmd {
             ModelSubcommand::List => {

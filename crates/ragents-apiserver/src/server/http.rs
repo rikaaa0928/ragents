@@ -98,6 +98,33 @@ pub(crate) async fn handle_patch_node(
     Ok(Json(updated))
 }
 
+pub(crate) async fn handle_delete_node(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "DELETE",
+            &format!("/api/v1/nodes/{node_id}"),
+            &headers,
+        )
+        .await?;
+    let id = NodeId::new(node_id);
+    let deleted = state.store.delete_node(&id)?;
+    state
+        .daemon_peers
+        .lock()
+        .expect("peers mutex poisoned")
+        .remove(&id);
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "deleted_node": deleted,
+    })))
+}
+
 pub(crate) async fn handle_node_extension_call(
     State(state): State<ApiServerState>,
     headers: HeaderMap,

@@ -191,7 +191,9 @@ pub fn build_router(state: ApiServerState) -> Router {
         .route("/api/v1/models/refresh", post(http::handle_refresh_models))
         .route(
             "/api/v1/nodes/{node_id}",
-            get(http::handle_get_node).patch(http::handle_patch_node),
+            get(http::handle_get_node)
+                .patch(http::handle_patch_node)
+                .delete(http::handle_delete_node),
         )
         .route(
             "/api/v1/nodes/{node_id}/extensions/call",

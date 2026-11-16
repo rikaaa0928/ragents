@@ -732,6 +732,82 @@ impl SqliteStore {
         Ok(node)
     }
 
+    pub fn delete_node(&self, node_id: &NodeId) -> Result<Node, StoreError> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+
+        let node = Self::load_node_in_tx(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if node.status.phase != NodePhase::NotReady {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is currently {:?}; only disconnected (not_ready) nodes can be removed",
+                node.status.phase
+            )));
+        }
+
+        let active_act: Option<String> = tx
+            .query_row(
+                "SELECT activation_id FROM activations
+                 WHERE assigned_node = ?1
+                   AND phase IN ('scheduled', 'running', 'waiting_for_interaction', 'cancelling')
+                 LIMIT 1",
+                params![node_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(act_id) = active_act {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} still has active activation {act_id}; wait for it to finish or cancel it before removing the node"
+            )));
+        }
+
+        let open_pinned_session: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM sessions
+                 WHERE scheduling_mode = 'pinned'
+                   AND bound_node_id = ?1
+                   AND json_extract(status_json, '$.phase') = 'open'
+                 LIMIT 1",
+                params![node_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(sess_id) = open_pinned_session {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} still has open pinned session {sess_id}; close or delete associated sessions first"
+            )));
+        }
+
+        // Clear sticky `bound_node_id` on any Floating sessions referencing the deleted node.
+        let floating_sess_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT session_id FROM sessions
+                 WHERE scheduling_mode = 'floating' AND bound_node_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![node_id.as_str()], |r| r.get::<_, String>(0))?;
+            let mut list = Vec::new();
+            for r in rows {
+                list.push(r?);
+            }
+            list
+        };
+        for sid_str in floating_sess_ids {
+            let sid = SessionId::new(sid_str);
+            if let Some(mut sess) = Self::load_session_in_tx(&tx, &sid)? {
+                sess.status.bound_node_id = None;
+                Self::save_session_in_tx(&tx, &mut sess)?;
+            }
+        }
+
+        tx.execute(
+            "DELETE FROM nodes WHERE node_id = ?1",
+            params![node_id.as_str()],
+        )?;
+        let _ = Self::next_resource_version(&tx)?;
+        tx.commit()?;
+        Ok(node)
+    }
+
     /// Two-stage lease patrol:
     /// 1. When `now > lease_expires_at` (e.g. 30s):
     ///    - Marks `Ready` nodes as `NotReady`.
