@@ -544,7 +544,15 @@ impl SandboxState {
             c.arg("-p").arg(profile).arg("sh").arg("-c").arg(command);
             c
         } else if cfg!(target_os = "linux") && is_linux_bwrap_usable() {
-            build_linux_bwrap_command(work_dir, command, &writable, &denied_write, &denied_read)
+            let mut c = build_linux_bwrap_command(
+                work_dir,
+                command,
+                &writable,
+                &denied_write,
+                &denied_read,
+            );
+            c.env("XDG_RUNTIME_DIR", hermetic_tmp);
+            c
         } else if self.mode == SandboxMode::Enforce {
             return Err(
                 "OS kernel sandbox is set to Enforce, but neither macOS sandbox-exec nor Linux bwrap is available"
