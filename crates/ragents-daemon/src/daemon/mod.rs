@@ -132,18 +132,14 @@ impl AgentDaemon {
 
     pub fn sync_session_grants(&self, session_id: &SessionId, policy: &PermissionPolicyLayer) {
         let grants = policy_layer_to_capability_grants(policy);
-        if grants.is_empty() {
-            return;
-        }
         let mut s_guard = self
             .session_grants
             .lock()
             .expect("session_grants mutex poisoned");
-        let entry = s_guard.entry(session_id.clone()).or_default();
-        for cap in grants {
-            if !entry.contains(&cap) {
-                entry.push(cap);
-            }
+        if grants.is_empty() {
+            s_guard.remove(session_id);
+        } else {
+            s_guard.insert(session_id.clone(), grants);
         }
     }
 

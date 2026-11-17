@@ -912,3 +912,224 @@ async fn test_delete_disconnected_node_guards() {
     cancel.cancel();
 }
 
+#[test]
+fn test_automatic_permission_pruning_across_scopes() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let node_id = NodeId::new("amd-fedora-01");
+    register_test_node(&store, node_id.as_str(), vec!["gpt-4.1"], 30_000);
+
+    // Session 1 in `/tmp/u/src/anima` with a narrower AllowSession grant
+    let mut anima_sess_perms = PermissionPolicyLayer::default();
+    anima_sess_perms.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/src/minimax/ComfyUI"),
+    });
+    anima_sess_perms.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/src/unrelated"),
+    });
+
+    let (anima_resp, dispatches) = store
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_anima")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: node_id.clone(),
+                    workspace_path: PathBuf::from("/tmp/u/src/anima"),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: anima_sess_perms,
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("run")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .unwrap();
+    let act_id = anima_resp.initial_activation.unwrap().metadata.id;
+    let lease_epoch = dispatches[0].lease_epoch;
+
+    // Session 2 in `/tmp/u/src/moss-image` (different workspace) with the same subpath grant
+    let mut moss_sess_perms = PermissionPolicyLayer::default();
+    moss_sess_perms.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/src/minimax/ComfyUI"),
+    });
+    store
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_moss")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: node_id.clone(),
+                    workspace_path: PathBuf::from("/tmp/u/src/moss-image"),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: moss_sess_perms,
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: None,
+        })
+        .unwrap();
+
+    // Floating session bound to the node must retain its AllowSession rules across AllowNode
+    let mut float_perms = PermissionPolicyLayer::default();
+    float_perms.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/models/anima"),
+    });
+    store
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_float")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Floating {
+                    node_selector: BTreeMap::new(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: float_perms,
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: None,
+        })
+        .unwrap();
+
+    // Request FileRead `/tmp/u/src/minimax` on `sess_anima` and approve as AllowWorkspace
+    let req_ws = PermissionRequestId::generate();
+    store
+        .emit_daemon_event(
+            &SessionId::new("sess_anima"),
+            &ActivationId::new(&act_id),
+            lease_epoch,
+            None,
+            SessionEvent::PermissionRequested {
+                request: PermissionRequest {
+                    id: req_ws.clone(),
+                    session_id: SessionId::new("sess_anima"),
+                    activation_id: ActivationId::new(&act_id),
+                    extension_id: Some("shell".to_string()),
+                    capability: CapabilityRequest::FileRead {
+                        path: PathBuf::from("/tmp/u/src/minimax"),
+                    },
+                    original_path: None,
+                    reason: None,
+                    created_at: Utc::now(),
+                },
+            },
+        )
+        .unwrap();
+    let mut res_map = BTreeMap::new();
+    res_map.insert(
+        req_ws,
+        PermissionResolutionSpec {
+            decision: PermissionDecision::AllowWorkspace,
+            override_path: None,
+            responded_at: Utc::now(),
+        },
+    );
+    store
+        .patch_activation(
+            &ActivationId::new(&act_id),
+            PatchActivationSpecRequest {
+                desired_phase: None,
+                interaction_responses: res_map,
+            },
+        )
+        .unwrap();
+
+    // `sess_anima` must have `/tmp/u/src/minimax/ComfyUI` pruned while keeping `/tmp/u/src/unrelated`
+    let anima_after_ws = store
+        .get_session(&SessionId::new("sess_anima"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        anima_after_ws
+            .spec
+            .permissions
+            .file_read
+            .as_ref()
+            .and_then(|r| r.allow.as_deref()),
+        Some(&["/tmp/u/src/unrelated".to_string()][..])
+    );
+
+    // `sess_moss` (different workspace) must NOT be pruned by anima's AllowWorkspace
+    let moss_after_ws = store
+        .get_session(&SessionId::new("sess_moss"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        moss_after_ws
+            .spec
+            .permissions
+            .file_read
+            .as_ref()
+            .and_then(|r| r.allow.as_deref()),
+        Some(&["/tmp/u/src/minimax/ComfyUI".to_string()][..])
+    );
+
+    // Now patch node `granted_permissions` (AllowNode) with FileRead `/tmp/u/src/minimax`
+    // and FileRead `/tmp/u/models`: both anima workspace grant & moss session grant for minimax
+    // must be pruned, while floating session keeps its rule.
+    let mut node_granted = PermissionPolicyLayer::default();
+    node_granted.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/src/minimax"),
+    });
+    node_granted.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/models"),
+    });
+    let node_after = store
+        .patch_node(
+            &node_id,
+            PatchNodeSpecRequest {
+                granted_permissions: Some(node_granted),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        !node_after
+            .spec
+            .workspace_permissions
+            .contains_key("/tmp/u/src/anima")
+            && !node_after
+                .spec
+                .workspace_permissions
+                .contains_key("/private/tmp/u/src/anima"),
+        "empty workspace_permissions map entry should be cleaned up"
+    );
+    let moss_after_node = store
+        .get_session(&SessionId::new("sess_moss"))
+        .unwrap()
+        .unwrap();
+    assert!(moss_after_node.spec.permissions.is_empty());
+
+    let float_after_node = store
+        .get_session(&SessionId::new("sess_float"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        float_after_node
+            .spec
+            .permissions
+            .file_read
+            .as_ref()
+            .and_then(|r| r.allow.as_deref()),
+        Some(&["/tmp/u/models/anima".to_string()][..])
+    );
+}
+
+

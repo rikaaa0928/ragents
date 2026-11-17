@@ -128,3 +128,136 @@ fn test_session_source_validation() {
         })
     ));
 }
+
+#[test]
+fn test_permission_policy_layer_prunes_redundant_and_subsumed_rules() {
+    // 1. Same-layer pruning: broader directory subsumes narrower subdirectory; sibling prefix preserved.
+    let mut layer = PermissionPolicyLayer::default();
+    layer.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/var/home/rikaaa0928/src/minimax/ComfyUI/"),
+    });
+    layer.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/var/home/rikaaa0928/src/minimax2"),
+    });
+    layer.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/var/home/rikaaa0928/src/minimax"),
+    });
+    assert_eq!(
+        layer.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(
+            &[
+                "/var/home/rikaaa0928/src/minimax2".to_string(),
+                "/var/home/rikaaa0928/src/minimax".to_string()
+            ][..]
+        )
+    );
+
+    // 2. Cross-layer pruning: AllowWorkspace subsumes AllowSession in matching category only.
+    let mut workspace = PermissionPolicyLayer::default();
+    workspace.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/var/home/rikaaa0928/models/anima"),
+    });
+    workspace.grant_capability(&CapabilityRequest::FileWrite {
+        path: PathBuf::from("/var/home/rikaaa0928/models/anima"),
+    });
+    workspace.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/var/home/rikaaa0928/src/minimax"),
+    });
+
+    let mut session = PermissionPolicyLayer {
+        file_read: Some(RuleSet {
+            allow: Some(vec![
+                "/var/home/rikaaa0928/src/minimax/ComfyUI".to_string(),
+                "/var/home/rikaaa0928/src/other".to_string(),
+            ]),
+            deny: Some(vec!["/var/home/rikaaa0928/src/minimax/secret".to_string()]),
+            default: None,
+        }),
+        file_write: Some(RuleSet {
+            allow: Some(vec!["/var/home/rikaaa0928/src/minimax/out".to_string()]),
+            deny: None,
+            default: None,
+        }),
+        ..Default::default()
+    };
+
+    assert!(session.prune_subsumed_by(&workspace));
+    // file_read minimax/ComfyUI is removed; other is kept; deny is never removed by allow!
+    assert_eq!(
+        session.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/var/home/rikaaa0928/src/other".to_string()][..])
+    );
+    assert_eq!(
+        session.file_read.as_ref().and_then(|r| r.deny.as_deref()),
+        Some(&["/var/home/rikaaa0928/src/minimax/secret".to_string()][..])
+    );
+    // workspace only granted FileRead on minimax, NOT FileWrite, so session file_write must remain!
+    assert_eq!(
+        session.file_write.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/var/home/rikaaa0928/src/minimax/out".to_string()][..])
+    );
+
+    // 3. AllowNode subsumes matching category in AllowWorkspace and preserves other categories.
+    let mut node_grant = PermissionPolicyLayer::default();
+    node_grant.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/var/home/rikaaa0928/models"),
+    });
+    assert!(workspace.prune_subsumed_by(&node_grant));
+    assert_eq!(
+        workspace.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/var/home/rikaaa0928/src/minimax".to_string()][..])
+    );
+    assert_eq!(
+        workspace.file_write.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/var/home/rikaaa0928/models/anima".to_string()][..])
+    );
+
+    // 4. System executable protection and HTTP wildcard subsumption.
+    let mut sess_bins = PermissionPolicyLayer::default();
+    sess_bins.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/usr/bin/sudo"),
+    });
+    sess_bins.grant_capability(&CapabilityRequest::Http {
+        scheme: "https".to_string(),
+        host: "api.sub.example.com".to_string(),
+        port: None,
+        method: "GET".to_string(),
+    });
+    sess_bins.grant_capability(&CapabilityRequest::Http {
+        scheme: "https".to_string(),
+        host: "other.org".to_string(),
+        port: None,
+        method: "GET".to_string(),
+    });
+
+    let mut parent_node = PermissionPolicyLayer::default();
+    parent_node.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/usr/bin"),
+    });
+    parent_node.grant_capability(&CapabilityRequest::Http {
+        scheme: "https".to_string(),
+        host: "*.example.com".to_string(),
+        port: None,
+        method: "GET".to_string(),
+    });
+
+    assert!(sess_bins.prune_subsumed_by(&parent_node));
+    // /usr/bin parent must NOT remove /usr/bin/sudo (requires exact setuid match)
+    assert_eq!(
+        sess_bins.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/usr/bin/sudo".to_string()][..])
+    );
+    // *.example.com subsumes api.sub.example.com but preserves other.org
+    assert_eq!(
+        sess_bins.http_hosts.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["other.org".to_string()][..])
+    );
+
+    // Exact /usr/bin/sudo at higher level DOES subsume /usr/bin/sudo at lower level.
+    parent_node.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/usr/bin/sudo"),
+    });
+    assert!(sess_bins.prune_subsumed_by(&parent_node));
+    assert!(sess_bins.file_read.is_none());
+}
+

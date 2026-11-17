@@ -98,6 +98,19 @@ pub struct PermissionPolicyLayer {
 }
 
 impl PermissionPolicyLayer {
+    pub fn is_empty(&self) -> bool {
+        fn rs_empty(rs: &Option<RuleSet<String>>) -> bool {
+            let Some(r) = rs else { return true };
+            r.allow.as_ref().is_none_or(|v| v.is_empty())
+                && r.deny.as_ref().is_none_or(|v| v.is_empty())
+                && r.default.is_none()
+        }
+        rs_empty(&self.file_read)
+            && rs_empty(&self.file_write)
+            && rs_empty(&self.http_hosts)
+            && rs_empty(&self.command_work_dir)
+    }
+
     pub fn grant_capability(&mut self, cap: &CapabilityRequest) {
         fn push_allow(slot: &mut Option<RuleSet<String>>, rule: String) {
             let rs = slot.get_or_insert_with(RuleSet::default);
@@ -124,6 +137,37 @@ impl PermissionPolicyLayer {
                 push_allow(&mut self.command_work_dir, s);
             }
         }
+        self.prune_redundant();
+    }
+
+    /// Removes redundant rules within this `PermissionPolicyLayer` (e.g. duplicates, trailing-slash
+    /// variants, or narrower subpaths/subdomains subsumed by a broader rule in the same category and list).
+    /// Returns `true` if any rule was modified or removed.
+    pub fn prune_redundant(&mut self) -> bool {
+        let mut changed = false;
+        changed |= prune_ruleset_internal(&mut self.file_read, PolicyRuleKind::Path);
+        changed |= prune_ruleset_internal(&mut self.file_write, PolicyRuleKind::Path);
+        changed |= prune_ruleset_internal(&mut self.command_work_dir, PolicyRuleKind::Path);
+        changed |= prune_ruleset_internal(&mut self.http_hosts, PolicyRuleKind::Host);
+        changed
+    }
+
+    /// Removes rules from `self` that are completely subsumed by rules in a strictly higher-precedence
+    /// `higher` layer (same category and same `allow`/`deny` list). Also normalizes/prunes `self`
+    /// internally. Returns `true` if any rule was modified or removed.
+    pub fn prune_subsumed_by(&mut self, higher: &PermissionPolicyLayer) -> bool {
+        let mut changed = self.prune_redundant();
+        changed |= prune_ruleset_against(&mut self.file_read, &higher.file_read, PolicyRuleKind::Path);
+        changed |=
+            prune_ruleset_against(&mut self.file_write, &higher.file_write, PolicyRuleKind::Path);
+        changed |= prune_ruleset_against(
+            &mut self.command_work_dir,
+            &higher.command_work_dir,
+            PolicyRuleKind::Path,
+        );
+        changed |=
+            prune_ruleset_against(&mut self.http_hosts, &higher.http_hosts, PolicyRuleKind::Host);
+        changed
     }
 
     pub fn merge_from(&mut self, other: &PermissionPolicyLayer) {
@@ -191,6 +235,237 @@ impl PermissionPolicyLayer {
         }
         removed
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyRuleKind {
+    Path,
+    Host,
+}
+
+fn normalize_lexical_rule_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed == "*" {
+        return "*".to_string();
+    }
+    if trimmed.is_empty() || trimmed == "." {
+        return ".".to_string();
+    }
+    use std::path::{Component, Path};
+    let p = Path::new(trimmed);
+    let mut is_root = false;
+    let mut prefix: Option<String> = None;
+    let mut parts: Vec<String> = Vec::new();
+    for comp in p.components() {
+        match comp {
+            Component::Prefix(pre) => {
+                prefix = Some(pre.as_os_str().to_string_lossy().into_owned());
+            }
+            Component::RootDir => {
+                is_root = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !parts.is_empty() && parts.last().map(|s| s.as_str()) != Some("..") {
+                    parts.pop();
+                } else if !is_root {
+                    parts.push("..".to_string());
+                }
+            }
+            Component::Normal(seg) => {
+                parts.push(seg.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(pre) = prefix {
+        out.push_str(&pre);
+    }
+    if is_root {
+        out.push('/');
+    }
+    out.push_str(&parts.join("/"));
+    if out.is_empty() {
+        if is_root {
+            "/".to_string()
+        } else {
+            ".".to_string()
+        }
+    } else {
+        out
+    }
+}
+
+fn is_protected_system_executable_rule(norm_path: &str) -> bool {
+    let Some(parent) = std::path::Path::new(norm_path).parent() else {
+        return false;
+    };
+    let parent_str = parent.to_string_lossy();
+    matches!(
+        parent_str.trim_end_matches('/'),
+        "/bin"
+            | "/sbin"
+            | "/usr/bin"
+            | "/usr/sbin"
+            | "/usr/local/bin"
+            | "/usr/local/sbin"
+            | "/System/Cryptexes/App/usr/bin"
+    )
+}
+
+fn path_rule_subsumes(broad: &str, narrow: &str) -> bool {
+    let b = normalize_lexical_rule_path(broad);
+    let n = normalize_lexical_rule_path(narrow);
+    if b == "*" {
+        return true;
+    }
+    if n == "*" {
+        return false;
+    }
+    if b == n {
+        return true;
+    }
+    if b == "." || n == "." {
+        return false;
+    }
+    let bp = std::path::Path::new(&b);
+    let np = std::path::Path::new(&n);
+    if bp.is_absolute() != np.is_absolute() {
+        return false;
+    }
+    if np.starts_with(bp) && !is_protected_system_executable_rule(&n) {
+        return true;
+    }
+    false
+}
+
+fn host_rule_subsumes(broad: &str, narrow: &str) -> bool {
+    let b = broad.trim();
+    let n = narrow.trim();
+    if b.is_empty() || n.is_empty() {
+        return false;
+    }
+    if b == "*" {
+        return true;
+    }
+    if n == "*" {
+        return false;
+    }
+    if b.eq_ignore_ascii_case(n) {
+        return true;
+    }
+    if let Some(b_suffix) = b.strip_prefix("*.") {
+        let b_low = b_suffix.to_ascii_lowercase();
+        let n_target = n.strip_prefix("*.").unwrap_or(n).to_ascii_lowercase();
+        return n_target == b_low || n_target.ends_with(&format!(".{b_low}"));
+    }
+    false
+}
+
+fn rule_subsumes(kind: PolicyRuleKind, broad: &str, narrow: &str) -> bool {
+    match kind {
+        PolicyRuleKind::Path => path_rule_subsumes(broad, narrow),
+        PolicyRuleKind::Host => host_rule_subsumes(broad, narrow),
+    }
+}
+
+fn normalize_rule(kind: PolicyRuleKind, raw: &str) -> String {
+    match kind {
+        PolicyRuleKind::Path => normalize_lexical_rule_path(raw),
+        PolicyRuleKind::Host => raw.trim().to_string(),
+    }
+}
+
+fn prune_rule_list_internal(list_opt: &mut Option<Vec<String>>, kind: PolicyRuleKind) -> bool {
+    let Some(list) = list_opt.as_mut() else {
+        return false;
+    };
+    let orig = list.clone();
+    let normalized: Vec<String> = list
+        .iter()
+        .map(|r| normalize_rule(kind, r))
+        .filter(|r| !r.is_empty())
+        .collect();
+
+    let mut deduped: Vec<String> = Vec::with_capacity(normalized.len());
+    for item in normalized {
+        let already_eq = deduped
+            .iter()
+            .any(|existing| rule_subsumes(kind, existing, &item) && rule_subsumes(kind, &item, existing));
+        if !already_eq {
+            deduped.push(item);
+        }
+    }
+
+    let kept: Vec<String> = deduped
+        .iter()
+        .enumerate()
+        .filter(|(idx, candidate)| {
+            !deduped.iter().enumerate().any(|(other_idx, other)| {
+                other_idx != *idx
+                    && rule_subsumes(kind, other, candidate)
+                    && !rule_subsumes(kind, candidate, other)
+            })
+        })
+        .map(|(_, item)| item.clone())
+        .collect();
+
+    let changed = kept != orig;
+    if kept.is_empty() {
+        *list_opt = None;
+    } else {
+        *list = kept;
+    }
+    changed
+}
+
+fn prune_ruleset_internal(slot: &mut Option<RuleSet<String>>, kind: PolicyRuleKind) -> bool {
+    let Some(rs) = slot.as_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    changed |= prune_rule_list_internal(&mut rs.allow, kind);
+    changed |= prune_rule_list_internal(&mut rs.deny, kind);
+    if rs.allow.is_none() && rs.deny.is_none() && rs.default.is_none() {
+        *slot = None;
+        changed = true;
+    }
+    changed
+}
+
+fn prune_rule_list_against(
+    low_opt: &mut Option<Vec<String>>,
+    high_opt: &Option<Vec<String>>,
+    kind: PolicyRuleKind,
+) -> bool {
+    let (Some(low), Some(high)) = (low_opt.as_mut(), high_opt.as_ref()) else {
+        return false;
+    };
+    let before = low.len();
+    low.retain(|r_low| !high.iter().any(|r_high| rule_subsumes(kind, r_high, r_low)));
+    let changed = low.len() < before;
+    if low.is_empty() {
+        *low_opt = None;
+    }
+    changed
+}
+
+fn prune_ruleset_against(
+    low_slot: &mut Option<RuleSet<String>>,
+    high_slot: &Option<RuleSet<String>>,
+    kind: PolicyRuleKind,
+) -> bool {
+    let (Some(low_rs), Some(high_rs)) = (low_slot.as_mut(), high_slot.as_ref()) else {
+        return false;
+    };
+    let mut changed = false;
+    changed |= prune_rule_list_against(&mut low_rs.allow, &high_rs.allow, kind);
+    changed |= prune_rule_list_against(&mut low_rs.deny, &high_rs.deny, kind);
+    if low_rs.allow.is_none() && low_rs.deny.is_none() && low_rs.default.is_none() {
+        *low_slot = None;
+        changed = true;
+    }
+    changed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

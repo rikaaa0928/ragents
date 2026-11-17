@@ -398,6 +398,113 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub(crate) fn prune_session_permissions_against_node(
+        session: &mut Session,
+        node: Option<&Node>,
+    ) -> bool {
+        let mut changed = session.spec.permissions.prune_redundant();
+        if let SchedulingMode::Pinned {
+            node_id,
+            workspace_path,
+        } = &session.spec.scheduling
+        {
+            if let Some(n) = node.filter(|n| n.metadata.id == node_id.as_str()) {
+                changed |= session
+                    .spec
+                    .permissions
+                    .prune_subsumed_by(&n.spec.granted_permissions);
+                let raw_ws = workspace_path.to_string_lossy().into_owned();
+                let norm_ws = normalize_and_resolve_workspace_path(workspace_path)
+                    .to_string_lossy()
+                    .into_owned();
+                if let Some(ws_pol) = n.spec.workspace_permissions.get(&norm_ws) {
+                    changed |= session.spec.permissions.prune_subsumed_by(ws_pol);
+                }
+                if raw_ws != norm_ws {
+                    if let Some(ws_pol) = n.spec.workspace_permissions.get(&raw_ws) {
+                        changed |= session.spec.permissions.prune_subsumed_by(ws_pol);
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn prune_session_permissions_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        session: &mut Session,
+        preloaded_node: Option<&Node>,
+    ) -> Result<bool, StoreError> {
+        if let SchedulingMode::Pinned { node_id, .. } = &session.spec.scheduling {
+            if let Some(n) = preloaded_node.filter(|n| n.metadata.id == node_id.as_str()) {
+                return Ok(Self::prune_session_permissions_against_node(
+                    session,
+                    Some(n),
+                ));
+            }
+            let loaded = Self::load_node_in_tx(tx, node_id)?;
+            return Ok(Self::prune_session_permissions_against_node(
+                session,
+                loaded.as_ref(),
+            ));
+        }
+        Ok(session.spec.permissions.prune_redundant())
+    }
+
+    pub(crate) fn prune_node_and_pinned_sessions_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        node: &mut Node,
+        mut current_session: Option<&mut Session>,
+        force_save_node: bool,
+    ) -> Result<(), StoreError> {
+        let mut node_changed = node.spec.granted_permissions.prune_redundant();
+        for ws_pol in node.spec.workspace_permissions.values_mut() {
+            node_changed |= ws_pol.prune_subsumed_by(&node.spec.granted_permissions);
+        }
+        let ws_before = node.spec.workspace_permissions.len();
+        node.spec
+            .workspace_permissions
+            .retain(|_, pol| !pol.is_empty());
+        if node.spec.workspace_permissions.len() != ws_before {
+            node_changed = true;
+        }
+
+        if force_save_node || node_changed {
+            Self::save_node_spec_in_tx(tx, node)?;
+        }
+
+        let open_pinned_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT session_id FROM sessions
+                 WHERE scheduling_mode = 'pinned'
+                   AND bound_node_id = ?1
+                   AND json_extract(status_json, '$.phase') = 'open'",
+            )?;
+            let rows = stmt.query_map(params![node.metadata.id.as_str()], |r| r.get(0))?;
+            let mut ids = Vec::new();
+            for r in rows {
+                ids.push(r?);
+            }
+            ids
+        };
+
+        for sid_str in open_pinned_ids {
+            if let Some(cur) = current_session.as_deref_mut() {
+                if cur.metadata.id == sid_str {
+                    Self::prune_session_permissions_against_node(cur, Some(node));
+                    continue;
+                }
+            }
+            let sid = SessionId::new(sid_str);
+            if let Some(mut sess) = Self::load_session_in_tx(tx, &sid)? {
+                if Self::prune_session_permissions_against_node(&mut sess, Some(node)) {
+                    Self::save_session_in_tx(tx, &mut sess)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn load_session_in_tx(
         tx: &rusqlite::Transaction<'_>,
         session_id: &SessionId,

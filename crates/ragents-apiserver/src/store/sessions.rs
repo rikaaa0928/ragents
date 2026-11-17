@@ -132,6 +132,7 @@ impl SqliteStore {
                 spec: req.spec,
                 status,
             };
+            Self::prune_session_permissions_in_tx(&tx, &mut session, None)?;
 
             tx.execute(
                 "INSERT INTO sessions (
@@ -354,6 +355,7 @@ impl SqliteStore {
             }
             if let Some(perms) = patch.permissions {
                 session.spec.permissions = perms;
+                Self::prune_session_permissions_in_tx(&tx, &mut session, None)?;
             }
             if let Some(extra_tmp) = patch.extra_tmp_dirs {
                 session.spec.extra_tmp_dirs = extra_tmp;

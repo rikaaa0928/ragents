@@ -824,6 +824,7 @@ impl SqliteStore {
                 spec: cont_spec,
                 status: cont_status,
             };
+            Self::prune_session_permissions_in_tx(&tx, &mut continued_session, None)?;
 
             tx.execute(
                 "INSERT INTO sessions (
@@ -1073,6 +1074,15 @@ impl SqliteStore {
                     match res_spec.decision {
                         PermissionDecision::AllowSession => {
                             session.spec.permissions.grant_capability(&effective_cap);
+                            let preloaded = match target_node_id.as_ref() {
+                                Some(nid) => Self::load_node_in_tx(&tx, nid)?,
+                                None => None,
+                            };
+                            Self::prune_session_permissions_in_tx(
+                                &tx,
+                                &mut session,
+                                preloaded.as_ref(),
+                            )?;
                         }
                         PermissionDecision::AllowWorkspace => {
                             match (
@@ -1094,10 +1104,20 @@ impl SqliteStore {
                                         .entry(ws_key)
                                         .or_default()
                                         .grant_capability(&effective_cap);
-                                    Self::save_node_spec_in_tx(&tx, &mut node)?;
+                                    Self::prune_node_and_pinned_sessions_in_tx(
+                                        &tx,
+                                        &mut node,
+                                        Some(&mut session),
+                                        true,
+                                    )?;
                                 }
                                 _ => {
                                     session.spec.permissions.grant_capability(&effective_cap);
+                                    Self::prune_session_permissions_in_tx(
+                                        &tx,
+                                        &mut session,
+                                        None,
+                                    )?;
                                 }
                             }
                         }
@@ -1107,7 +1127,12 @@ impl SqliteStore {
                                     node.spec
                                         .granted_permissions
                                         .grant_capability(&effective_cap);
-                                    Self::save_node_spec_in_tx(&tx, &mut node)?;
+                                    Self::prune_node_and_pinned_sessions_in_tx(
+                                        &tx,
+                                        &mut node,
+                                        Some(&mut session),
+                                        true,
+                                    )?;
                                 }
                             }
                         }

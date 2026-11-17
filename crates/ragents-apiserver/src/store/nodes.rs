@@ -721,13 +721,20 @@ impl SqliteStore {
         if let Some(prompt_override) = patch.node_prompt_override {
             node.spec.node_prompt_override = prompt_override;
         }
+        let mut perms_modified = false;
         if let Some(granted) = patch.granted_permissions {
             node.spec.granted_permissions = granted;
+            perms_modified = true;
         }
         if let Some(ws_perms) = patch.workspace_permissions {
             node.spec.workspace_permissions = ws_perms;
+            perms_modified = true;
         }
-        Self::save_node_spec_in_tx(&tx, &mut node)?;
+        if perms_modified {
+            Self::prune_node_and_pinned_sessions_in_tx(&tx, &mut node, None, true)?;
+        } else {
+            Self::save_node_spec_in_tx(&tx, &mut node)?;
+        }
         tx.commit()?;
         Ok(node)
     }
