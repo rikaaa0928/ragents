@@ -45,6 +45,7 @@ impl NodeSpec {
     pub fn effective_permissions(&self) -> PermissionPolicyLayer {
         let mut merged = self.base_permissions.clone();
         merged.merge_from(&self.granted_permissions);
+        merged.prune_redundant();
         merged
     }
 }

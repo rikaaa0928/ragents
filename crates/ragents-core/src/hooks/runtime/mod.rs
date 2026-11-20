@@ -204,7 +204,252 @@ impl ragent::extension::host::Host for HostState {
         })
         .unwrap_or_default()
     }
+
+    async fn request_permission(&mut self, request_json: String) -> String {
+        #[derive(serde::Deserialize)]
+        struct HostPermissionRequest {
+            capability: String,
+            target: String,
+            reason: String,
+            #[serde(default)]
+            method: Option<String>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct HostPermissionResponse {
+            ok: bool,
+            allowed: bool,
+            #[serde(default)]
+            denied: bool,
+            #[serde(default)]
+            persisted: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            granted_target: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reason: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<String>,
+        }
+
+        let err_resp = |msg: String| -> String {
+            serde_json::to_string(&HostPermissionResponse {
+                ok: false,
+                allowed: false,
+                denied: false,
+                persisted: false,
+                granted_target: None,
+                reason: None,
+                error: Some(msg),
+            })
+            .unwrap_or_default()
+        };
+
+        let req: HostPermissionRequest = match serde_json::from_str(&request_json) {
+            Ok(r) => r,
+            Err(err) => return err_resp(format!("invalid permission request: {err}")),
+        };
+
+        let target_raw = req.target.trim();
+        if target_raw.is_empty() {
+            return err_resp("target must not be empty".to_string());
+        }
+        let reason_raw = req.reason.trim();
+        if reason_raw.is_empty() {
+            return err_resp("reason must not be empty".to_string());
+        }
+
+        let cap_kind = req.capability.trim().to_ascii_lowercase();
+        let (cap, original_path) = match cap_kind.as_str() {
+            "http" | "http_hosts" | "network" => {
+                let (scheme, after_scheme) =
+                    if let Some((s, rest)) = target_raw.split_once("://") {
+                        (
+                            if s.trim().is_empty() {
+                                "https".to_string()
+                            } else {
+                                s.trim().to_ascii_lowercase()
+                            },
+                            rest,
+                        )
+                    } else {
+                        ("https".to_string(), target_raw)
+                    };
+                let authority = after_scheme
+                    .split(&['/', '?', '#'][..])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if authority.is_empty() {
+                    return err_resp(format!("invalid HTTP host/URL target: '{target_raw}'"));
+                }
+                let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+                    if let Some((ipv6, after_bracket)) = rest.split_once(']') {
+                        let parsed_port = after_bracket
+                            .strip_prefix(':')
+                            .and_then(|p| p.parse::<u16>().ok());
+                        (ipv6.to_ascii_lowercase(), parsed_port)
+                    } else {
+                        (authority.to_ascii_lowercase(), None)
+                    }
+                } else if let Some((h, p_str)) = authority.rsplit_once(':') {
+                    if let Ok(p_num) = p_str.parse::<u16>() {
+                        (h.to_ascii_lowercase(), Some(p_num))
+                    } else {
+                        (authority.to_ascii_lowercase(), None)
+                    }
+                } else {
+                    (authority.to_ascii_lowercase(), None)
+                };
+                if host.is_empty() {
+                    return err_resp(format!("invalid HTTP host target: '{target_raw}'"));
+                }
+                let method = req
+                    .method
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("GET")
+                    .to_ascii_uppercase();
+                (
+                    CapabilityRequest::Http {
+                        scheme,
+                        host,
+                        port,
+                        method,
+                    },
+                    None,
+                )
+            }
+            "file_read" | "file-read" | "read" | "file_write" | "file-write" | "write"
+            | "command_work_dir" | "command-work-dir" | "work_dir" => {
+                let expanded = if target_raw == "~" || target_raw.starts_with("~/") {
+                    if let Ok(home) =
+                        std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+                    {
+                        let tail = target_raw.strip_prefix("~/").unwrap_or("");
+                        if tail.is_empty() {
+                            PathBuf::from(home)
+                        } else {
+                            Path::new(&home).join(tail)
+                        }
+                    } else {
+                        PathBuf::from(target_raw)
+                    }
+                } else {
+                    PathBuf::from(target_raw)
+                };
+                let joined = if expanded.is_absolute() {
+                    expanded
+                } else {
+                    self.workspace_root.join(expanded)
+                };
+                let normalized = wasi_permissions::normalize_lexical_path(&joined);
+                let canon_path = crate::sandbox::canonicalize_or_normalize(&normalized);
+                let is_write_or_cwd = matches!(
+                    cap_kind.as_str(),
+                    "file_write"
+                        | "file-write"
+                        | "write"
+                        | "command_work_dir"
+                        | "command-work-dir"
+                        | "work_dir"
+                );
+                let cap_path = if is_write_or_cwd
+                    && !canon_path.exists()
+                    && !canon_path.parent().is_some_and(|p| p.exists())
+                {
+                    crate::sandbox::normalize_violation_to_request_dir(&canon_path)
+                } else {
+                    canon_path.clone()
+                };
+                let capability = match cap_kind.as_str() {
+                    "file_read" | "file-read" | "read" => {
+                        CapabilityRequest::FileRead { path: cap_path }
+                    }
+                    "file_write" | "file-write" | "write" => {
+                        CapabilityRequest::FileWrite { path: cap_path }
+                    }
+                    _ => CapabilityRequest::CommandWorkDir { work_dir: cap_path },
+                };
+                (capability, Some(canon_path))
+            }
+            other => {
+                return err_resp(format!(
+                    "unsupported capability '{other}'; expected one of: file_read, file_write, command_work_dir, http"
+                ));
+            }
+        };
+
+        let Some(ref host) = self.core_host else {
+            let already_allowed = match &cap {
+                CapabilityRequest::FileRead { path } => self.sandbox_state.is_path_readable(path),
+                CapabilityRequest::FileWrite { path }
+                | CapabilityRequest::CommandWorkDir { work_dir: path } => {
+                    self.sandbox_state.is_path_writable(path)
+                }
+                CapabilityRequest::Http { .. } => false,
+            };
+            if already_allowed {
+                return serde_json::to_string(&HostPermissionResponse {
+                    ok: true,
+                    allowed: true,
+                    denied: false,
+                    persisted: true,
+                    granted_target: cap.path().map(|p| p.display().to_string()),
+                    reason: None,
+                    error: None,
+                })
+                .unwrap_or_default();
+            }
+            return err_resp("no CoreHost attached to request permission".to_string());
+        };
+
+        match host
+            .check_permission_with_original_path(
+                Some(&self.plugin_name),
+                cap.clone(),
+                original_path,
+                Some(reason_raw.to_string()),
+            )
+            .await
+        {
+            Ok(PermissionOutcome::Allowed {
+                effective_capability,
+                persist_in_activation,
+            }) => {
+                let granted = effective_capability.unwrap_or(cap);
+                if persist_in_activation {
+                    self.sandbox_state.apply_capability_grant(&granted);
+                }
+                serde_json::to_string(&HostPermissionResponse {
+                    ok: true,
+                    allowed: true,
+                    denied: false,
+                    persisted: persist_in_activation,
+                    granted_target: granted.path().map(|p| p.display().to_string()),
+                    reason: None,
+                    error: None,
+                })
+                .unwrap_or_default()
+            }
+            Ok(PermissionOutcome::Denied { reason }) => {
+                serde_json::to_string(&HostPermissionResponse {
+                    ok: true,
+                    allowed: false,
+                    denied: true,
+                    persisted: false,
+                    granted_target: None,
+                    reason: Some(reason),
+                    error: None,
+                })
+                .unwrap_or_default()
+            }
+            Err(err) => err_resp(err.to_string()),
+        }
+    }
 }
+
+const MAX_POOLED_RUNTIMES: usize = 10;
 
 struct PluginRuntime {
     store: Store<HostState>,
@@ -214,7 +459,15 @@ struct PluginRuntime {
 pub struct WasmPlugin {
     pub name: String,
     metadata: ExtensionMetadata,
-    runtime: Mutex<PluginRuntime>,
+    component: Component,
+    linker: Arc<Linker<HostState>>,
+    workspace_root: PathBuf,
+    preopen_dirs: Vec<PathBuf>,
+    core_host: Option<Arc<dyn CoreHost>>,
+    sandbox_state: Arc<SandboxState>,
+    local_process_manager: ProcessManager,
+    init_config: Mutex<Option<String>>,
+    pool: Mutex<Vec<PluginRuntime>>,
 }
 
 impl WasmPlugin {
@@ -266,26 +519,67 @@ impl WasmPlugin {
 
         Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state).map_err(tool_error)?;
 
+        let mut plugin = Self {
+            name: plugin_name,
+            metadata: ExtensionMetadata {
+                id: String::new(),
+                version: String::new(),
+                subscriptions: Vec::new(),
+                filter_env: Vec::new(),
+            },
+            component,
+            linker: Arc::new(linker),
+            workspace_root: workspace_root.to_path_buf(),
+            preopen_dirs: preopen_dirs.to_vec(),
+            core_host,
+            sandbox_state,
+            local_process_manager: ProcessManager::new(None),
+            init_config: Mutex::new(None),
+            pool: Mutex::new(Vec::new()),
+        };
+
+        let mut runtime = plugin.instantiate_runtime().await?;
+        let metadata_json = runtime
+            .bindings
+            .ragent_extension_lifecycle()
+            .call_metadata(&mut runtime.store)
+            .await
+            .map_err(tool_error)?;
+        let metadata: ExtensionMetadata =
+            serde_json::from_str(&metadata_json).map_err(|error| {
+                CoreError::ToolError(format!("extension metadata is invalid: {error}"))
+            })?;
+
+        plugin.metadata = metadata;
+        plugin.pool.lock().await.push(runtime);
+        Ok(plugin)
+    }
+
+    fn build_host_state(&self) -> HostState {
         let mut wasi_builder = WasiCtxBuilder::new();
         wasi_builder.inherit_stdout().inherit_stderr();
 
-        let _ = wasi_builder.preopened_dir(workspace_root, ".", DirPerms::all(), FilePerms::all());
-        if let Some(ws_str) = workspace_root.to_str() {
+        let _ = wasi_builder.preopened_dir(
+            &self.workspace_root,
+            ".",
+            DirPerms::all(),
+            FilePerms::all(),
+        );
+        if let Some(ws_str) = self.workspace_root.to_str() {
             wasi_builder.env("PWD", ws_str);
             let _ = wasi_builder.preopened_dir(
-                workspace_root,
+                &self.workspace_root,
                 ws_str,
                 DirPerms::all(),
                 FilePerms::all(),
             );
         }
 
-        let effective_preopen_dirs = preopen_dirs.to_vec();
         if let Ok(home_str) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             wasi_builder.env("HOME", &home_str);
         }
 
-        for dir in &effective_preopen_dirs {
+        for dir in &self.preopen_dirs {
             if dir.exists() {
                 if let Some(dir_str) = dir.to_str() {
                     let _ =
@@ -306,13 +600,13 @@ impl WasmPlugin {
             }
         }
         #[cfg(unix)]
-        if core_host.is_some() {
+        if self.core_host.is_some() {
             let _ = wasi_builder.preopened_dir("/", "/", DirPerms::all(), FilePerms::all());
         }
 
         wasi_builder.allow_ip_name_lookup(true);
-        let core_host_for_sock = core_host.clone();
-        let plugin_for_sock = plugin_name.clone();
+        let core_host_for_sock = self.core_host.clone();
+        let plugin_for_sock = self.name.clone();
         wasi_builder.socket_addr_check(move |addr, addr_use| {
             let core_host = core_host_for_sock.clone();
             let plugin_name = plugin_for_sock.clone();
@@ -371,42 +665,58 @@ impl WasmPlugin {
             })
         });
 
-        let host_state = HostState {
+        HostState {
             wasi_ctx: wasi_builder.build(),
             http_ctx: WasiHttpCtx::new(),
             table: ResourceTable::new(),
-            plugin_name: plugin_name.clone(),
-            workspace_root: workspace_root.to_path_buf(),
-            preopen_dirs: effective_preopen_dirs,
-            core_host,
-            sandbox_state,
-            local_process_manager: ProcessManager::new(None),
+            plugin_name: self.name.clone(),
+            workspace_root: self.workspace_root.clone(),
+            preopen_dirs: self.preopen_dirs.clone(),
+            core_host: self.core_host.clone(),
+            sandbox_state: self.sandbox_state.clone(),
+            local_process_manager: self.local_process_manager.clone(),
             dir_paths: HashMap::new(),
             ws_fd_rep: None,
             root_fd_rep: None,
             invoke_approved_writes: Vec::new(),
             invoke_approved_reads: Vec::new(),
-        };
+        }
+    }
 
+    async fn instantiate_runtime(&self) -> Result<PluginRuntime, CoreError> {
+        let engine = global_engine()?;
+        let host_state = self.build_host_state();
         let mut store = Store::new(engine, host_state);
-        let bindings = Plugin::instantiate_async(&mut store, &component, &linker)
+        let bindings = Plugin::instantiate_async(&mut store, &self.component, &self.linker)
             .await
             .map_err(tool_error)?;
-        let metadata_json = bindings
-            .ragent_extension_lifecycle()
-            .call_metadata(&mut store)
-            .await
-            .map_err(tool_error)?;
-        let metadata: ExtensionMetadata =
-            serde_json::from_str(&metadata_json).map_err(|error| {
-                CoreError::ToolError(format!("extension metadata is invalid: {error}"))
-            })?;
+        Ok(PluginRuntime { store, bindings })
+    }
 
-        Ok(Self {
-            name: plugin_name,
-            metadata,
-            runtime: Mutex::new(PluginRuntime { store, bindings }),
-        })
+    async fn acquire_runtime(&self) -> Result<PluginRuntime, CoreError> {
+        if let Some(rt) = self.pool.lock().await.pop() {
+            return Ok(rt);
+        }
+        let mut rt = self.instantiate_runtime().await?;
+        let maybe_cfg = self.init_config.lock().await.clone();
+        if let Some(cfg) = maybe_cfg {
+            rt.bindings
+                .ragent_extension_lifecycle()
+                .call_initialize(&mut rt.store, &cfg)
+                .await
+                .map_err(tool_error)?
+                .map_err(|error| CoreError::ToolError(format!("{}: {error}", self.name)))?;
+        }
+        Ok(rt)
+    }
+
+    async fn release_runtime(&self, mut rt: PluginRuntime) {
+        rt.store.data_mut().invoke_approved_writes.clear();
+        rt.store.data_mut().invoke_approved_reads.clear();
+        let mut pool = self.pool.lock().await;
+        if pool.len() < MAX_POOLED_RUNTIMES {
+            pool.push(rt);
+        }
     }
 
     pub fn metadata(&self) -> &ExtensionMetadata {
@@ -415,41 +725,89 @@ impl WasmPlugin {
 
     pub async fn initialize(&self, config: &serde_json::Value) -> Result<(), CoreError> {
         let config = serde_json::to_string(config)?;
-        let mut runtime = self.runtime.lock().await;
-        let PluginRuntime { store, bindings } = &mut *runtime;
-        bindings
-            .ragent_extension_lifecycle()
-            .call_initialize(store, &config)
-            .await
-            .map_err(tool_error)?
-            .map_err(|error| CoreError::ToolError(format!("{}: {error}", self.name)))
+        *self.init_config.lock().await = Some(config.clone());
+        let mut runtimes: Vec<PluginRuntime> = {
+            let mut pool = self.pool.lock().await;
+            pool.drain(..).collect()
+        };
+        if runtimes.is_empty() {
+            runtimes.push(self.instantiate_runtime().await?);
+        }
+        let mut res = Ok(());
+        for rt in &mut runtimes {
+            match rt
+                .bindings
+                .ragent_extension_lifecycle()
+                .call_initialize(&mut rt.store, &config)
+                .await
+                .map_err(tool_error)
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    res = Err(CoreError::ToolError(format!("{}: {error}", self.name)));
+                    break;
+                }
+                Err(err) => {
+                    res = Err(err);
+                    break;
+                }
+            }
+        }
+        let mut pool = self.pool.lock().await;
+        for rt in runtimes {
+            if pool.len() < MAX_POOLED_RUNTIMES {
+                pool.push(rt);
+            }
+        }
+        res
     }
 
     pub async fn invoke(&self, request: &HookRequest) -> Result<serde_json::Value, CoreError> {
         let request = serde_json::to_string(request)?;
-        let mut runtime = self.runtime.lock().await;
-        let PluginRuntime { store, bindings } = &mut *runtime;
-        store.data_mut().invoke_approved_writes.clear();
-        store.data_mut().invoke_approved_reads.clear();
-        let response = bindings
+        let mut runtime = self.acquire_runtime().await?;
+        runtime.store.data_mut().invoke_approved_writes.clear();
+        runtime.store.data_mut().invoke_approved_reads.clear();
+        let call_res = runtime
+            .bindings
             .ragent_extension_lifecycle()
-            .call_invoke(&mut *store, &request)
-            .await
-            .map_err(tool_error)?
-            .map_err(|error| CoreError::ToolError(format!("{}: {error}", self.name)))?;
-        store.data_mut().invoke_approved_writes.clear();
-        store.data_mut().invoke_approved_reads.clear();
-        serde_json::from_str(&response).map_err(CoreError::Json)
+            .call_invoke(&mut runtime.store, &request)
+            .await;
+        match call_res {
+            Ok(Ok(response)) => {
+                self.release_runtime(runtime).await;
+                serde_json::from_str(&response).map_err(CoreError::Json)
+            }
+            Ok(Err(error)) => {
+                self.release_runtime(runtime).await;
+                Err(CoreError::ToolError(format!("{}: {error}", self.name)))
+            }
+            Err(trap) => Err(tool_error(trap)),
+        }
     }
 
     pub async fn shutdown(&self) -> Result<(), CoreError> {
-        let mut runtime = self.runtime.lock().await;
-        let PluginRuntime { store, bindings } = &mut *runtime;
-        bindings
-            .ragent_extension_lifecycle()
-            .call_shutdown(store)
-            .await
-            .map_err(tool_error)
+        let runtimes: Vec<PluginRuntime> = {
+            let mut pool = self.pool.lock().await;
+            pool.drain(..).collect()
+        };
+        let mut first_error = None;
+        for mut runtime in runtimes {
+            if let Err(err) = runtime
+                .bindings
+                .ragent_extension_lifecycle()
+                .call_shutdown(&mut runtime.store)
+                .await
+                .map_err(tool_error)
+            {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     pub async fn invoke_wasi_http_for_test(
@@ -458,7 +816,7 @@ impl WasmPlugin {
         url: &str,
     ) -> Result<(u16, String), CoreError> {
         use http_body_util::{BodyExt, Empty};
-        let mut runtime = self.runtime.lock().await;
+        let mut runtime = self.acquire_runtime().await?;
         let parsed: hyper::Uri = url.parse().map_err(tool_error)?;
         let use_tls = parsed.scheme_str() == Some("https");
         let empty_body = Empty::<bytes::Bytes>::new()
@@ -491,6 +849,7 @@ impl WasmPlugin {
             .map_err(tool_error)?
             .to_bytes();
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+        self.release_runtime(runtime).await;
         Ok((status, body_str))
     }
 }

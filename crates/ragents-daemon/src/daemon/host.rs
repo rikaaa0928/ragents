@@ -1,6 +1,7 @@
 use crate::interceptors::DaemonInterceptorChain;
 use crate::permission::{
-    capability_covered_by, evaluate_capability_policy_with_extra_tmp, PolicyEvalResult,
+    capability_covered_by, evaluate_capability_policy_with_extra_tmp,
+    is_capability_explicitly_denied, is_path_explicitly_denied, PolicyEvalResult,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -103,17 +104,44 @@ pub(crate) struct DaemonCoreHost {
     pub(crate) tunnel: DaemonTunnelHandle,
     pub(crate) permission_waiters:
         Arc<Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionResolutionSpec>>>>,
+    pub(crate) permission_ask_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) cancellation: CancellationToken,
 }
 
 impl DaemonCoreHost {
+    fn grant_covers_capability(
+        &self,
+        granted: &CapabilityRequest,
+        requested: &CapabilityRequest,
+    ) -> bool {
+        if !capability_covered_by(granted, requested, &self.workspace_root) {
+            return false;
+        }
+        // A runtime FileWrite grant must not implicitly authorize FileRead inside a subtree
+        // explicitly blocked by effective_policy.file_write.deny.
+        if let (
+            CapabilityRequest::FileWrite { .. },
+            CapabilityRequest::FileRead { path: req_path },
+        ) = (granted, requested)
+        {
+            if is_path_explicitly_denied(
+                self.effective_policy.file_write.as_ref(),
+                req_path,
+                &self.workspace_root,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn is_covered_by_grants(&self, capability: &CapabilityRequest) -> bool {
         if self
             .activation_grants
             .lock()
             .expect("activation_grants mutex poisoned")
             .iter()
-            .any(|g| capability_covered_by(g, capability, &self.workspace_root))
+            .any(|g| self.grant_covers_capability(g, capability))
         {
             return true;
         }
@@ -125,7 +153,7 @@ impl DaemonCoreHost {
             .map(|grants| {
                 grants
                     .iter()
-                    .any(|g| capability_covered_by(g, capability, &self.workspace_root))
+                    .any(|g| self.grant_covers_capability(g, capability))
             })
             .unwrap_or(false)
         {
@@ -139,7 +167,7 @@ impl DaemonCoreHost {
             .map(|grants| {
                 grants
                     .iter()
-                    .any(|g| capability_covered_by(g, capability, &self.workspace_root))
+                    .any(|g| self.grant_covers_capability(g, capability))
             })
             .unwrap_or(false)
         {
@@ -150,7 +178,7 @@ impl DaemonCoreHost {
             .lock()
             .expect("node_grants mutex poisoned")
             .iter()
-            .any(|g| capability_covered_by(g, capability, &self.workspace_root))
+            .any(|g| self.grant_covers_capability(g, capability))
         {
             return true;
         }
@@ -378,6 +406,19 @@ impl CoreHost for DaemonCoreHost {
         original_path: Option<PathBuf>,
         reason: Option<String>,
     ) -> Result<PermissionOutcome, CoreError> {
+        if is_capability_explicitly_denied(
+            &self.effective_policy,
+            &self.workspace_root,
+            &capability,
+        ) || original_path.as_ref().is_some_and(|orig| {
+            let exact_cap = capability.with_override_path(Some(orig.as_path()));
+            is_capability_explicitly_denied(&self.effective_policy, &self.workspace_root, &exact_cap)
+        }) {
+            return Ok(PermissionOutcome::Denied {
+                reason: format!("Denied by permission policy for {capability:?}"),
+            });
+        }
+
         if self.is_covered_by_grants(&capability) {
             return Ok(PermissionOutcome::allowed());
         }
@@ -454,6 +495,21 @@ impl CoreHost for DaemonCoreHost {
                 reason: format!("Denied by permission policy for {capability:?}"),
             }),
             PolicyEvalResult::Ask => {
+                let _ask_guard = tokio::select! {
+                    guard = self.permission_ask_lock.lock() => guard,
+                    _ = self.cancellation.cancelled() => return Err(CoreError::Cancelled),
+                };
+
+                if self.is_covered_by_grants(&capability) {
+                    return Ok(PermissionOutcome::allowed());
+                }
+                if let Some(ref orig) = original_path {
+                    let exact_cap = capability.with_override_path(Some(orig.as_path()));
+                    if self.is_covered_by_grants(&exact_cap) {
+                        return Ok(PermissionOutcome::allowed_with(exact_cap, true));
+                    }
+                }
+
                 let req_id = PermissionRequestId::generate();
                 let (tx, rx) = oneshot::channel();
                 self.permission_waiters
@@ -496,7 +552,13 @@ impl CoreHost for DaemonCoreHost {
                         reason: "Denied by user interaction".to_string(),
                     }),
                     PermissionDecision::AllowOnce => {
-                        Ok(PermissionOutcome::allowed_with(effective_cap, false))
+                        if extension_id == Some("permissions") {
+                            Ok(PermissionOutcome::Denied {
+                                reason: "allow_once is only allowed for passively triggered operations; choose allow_activation or broader, or deny".to_string(),
+                            })
+                        } else {
+                            Ok(PermissionOutcome::allowed_with(effective_cap, false))
+                        }
                     }
                     PermissionDecision::AllowActivation => {
                         self.sandbox_state.apply_capability_grant(&effective_cap);

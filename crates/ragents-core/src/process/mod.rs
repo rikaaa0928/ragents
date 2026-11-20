@@ -5,8 +5,8 @@ pub(crate) use entry::kill_process_group;
 use crate::error::CoreError;
 use crate::host::{CoreHost, PermissionOutcome};
 use crate::sandbox::{
-    extract_eperm_paths_from_text, is_setuid_or_setgid_binary, normalize_violation_to_request_dir,
-    query_macos_sandbox_violations, SandboxMode, SandboxState, SandboxViolation,
+    is_setuid_or_setgid_binary, normalize_violation_to_request_dir, query_macos_sandbox_violations,
+    SandboxMode, SandboxState, SandboxViolation,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -376,49 +376,7 @@ impl ProcessManager {
                         .expect("process entry poisoned")
                         .combined_buf
                         .clone();
-                    let mut violations = Vec::new();
-                    let extracted = extract_eperm_paths_from_text(&combined);
-                    let has_unreadable = extracted
-                        .iter()
-                        .any(|p| !sandbox_state.is_path_readable(p) && p.exists());
-                    for raw_path in extracted {
-                        let is_setuid = is_setuid_or_setgid_binary(&raw_path);
-                        let is_read_violation =
-                            !sandbox_state.is_path_readable(&raw_path) && raw_path.exists();
-                        if is_setuid && !is_read_violation {
-                            continue;
-                        }
-                        if has_unreadable && !is_read_violation && raw_path.exists() {
-                            continue;
-                        }
-                        let req_dir = normalize_violation_to_request_dir(&raw_path);
-                        let (cap, op) = if is_setuid && is_read_violation {
-                            (
-                                CapabilityRequest::FileRead { path: req_dir },
-                                "file-read-data + setuid/setgid exec".to_string(),
-                            )
-                        } else if is_read_violation {
-                            (
-                                CapabilityRequest::FileRead { path: req_dir },
-                                "file-read-data".to_string(),
-                            )
-                        } else {
-                            (
-                                CapabilityRequest::FileWrite { path: req_dir },
-                                "file-write".to_string(),
-                            )
-                        };
-                        if !violations
-                            .iter()
-                            .any(|v: &SandboxViolation| v.capability == cap)
-                        {
-                            violations.push(SandboxViolation {
-                                capability: cap,
-                                raw_path,
-                                operation: op,
-                            });
-                        }
-                    }
+                    let mut violations = sandbox_state.extract_violations_from_output(&combined);
                     if cfg!(target_os = "macos") {
                         for (op, raw_path_str) in query_macos_sandbox_violations(&trace_tag).await {
                             let raw_path = PathBuf::from(&raw_path_str);

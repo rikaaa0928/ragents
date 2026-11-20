@@ -159,6 +159,7 @@ fn handle_agent_prepare() -> Result<String, String> {
 
     let tools = vec![serde_json::json!({
         "enabled": true,
+        "concurrency_safe": true,
         "name": "load_skill",
         "description": "Load the full instructions (SKILL.md) or a supporting file from an installed agent skill listed in <available_skills>.",
         "parameters": {

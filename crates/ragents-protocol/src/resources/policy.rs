@@ -124,39 +124,72 @@ impl PermissionPolicyLayer {
                 push_allow(&mut self.file_read, path.to_string_lossy().into_owned());
             }
             CapabilityRequest::FileWrite { path } => {
-                let s = path.to_string_lossy().into_owned();
-                push_allow(&mut self.file_read, s.clone());
-                push_allow(&mut self.file_write, s);
+                push_allow(&mut self.file_write, path.to_string_lossy().into_owned());
             }
             CapabilityRequest::Http { host, .. } => {
                 push_allow(&mut self.http_hosts, host.clone());
             }
             CapabilityRequest::CommandWorkDir { work_dir } => {
-                let s = work_dir.to_string_lossy().into_owned();
-                push_allow(&mut self.file_read, s.clone());
-                push_allow(&mut self.command_work_dir, s);
+                push_allow(
+                    &mut self.command_work_dir,
+                    work_dir.to_string_lossy().into_owned(),
+                );
             }
         }
         self.prune_redundant();
     }
 
     /// Removes redundant rules within this `PermissionPolicyLayer` (e.g. duplicates, trailing-slash
-    /// variants, or narrower subpaths/subdomains subsumed by a broader rule in the same category and list).
+    /// variants, narrower subpaths/subdomains subsumed by a broader rule in the same category and list,
+    /// and `file_read.allow` rules already covered by `file_write.allow`).
     /// Returns `true` if any rule was modified or removed.
     pub fn prune_redundant(&mut self) -> bool {
+        self.prune_redundant_with_write_denies(&[])
+    }
+
+    /// Variant of [`Self::prune_redundant`] that also prevents `file_write.allow` from pruning
+    /// `file_read.allow` entries overlapping any external `file_write.deny` rule (e.g. from higher layers).
+    pub fn prune_redundant_with_write_denies(&mut self, extra_write_denies: &[String]) -> bool {
         let mut changed = false;
         changed |= prune_ruleset_internal(&mut self.file_read, PolicyRuleKind::Path);
         changed |= prune_ruleset_internal(&mut self.file_write, PolicyRuleKind::Path);
         changed |= prune_ruleset_internal(&mut self.command_work_dir, PolicyRuleKind::Path);
         changed |= prune_ruleset_internal(&mut self.http_hosts, PolicyRuleKind::Host);
+        changed |= prune_read_allows_covered_by_write(
+            &mut self.file_read,
+            self.file_write.as_ref(),
+            extra_write_denies,
+        );
         changed
     }
 
     /// Removes rules from `self` that are completely subsumed by rules in a strictly higher-precedence
-    /// `higher` layer (same category and same `allow`/`deny` list). Also normalizes/prunes `self`
-    /// internally. Returns `true` if any rule was modified or removed.
+    /// `higher` layer (same category and same `allow`/`deny` list, plus `self.file_read.allow` covered
+    /// by `higher.file_write.allow`). Also normalizes/prunes `self` internally.
+    /// Returns `true` if any rule was modified or removed.
     pub fn prune_subsumed_by(&mut self, higher: &PermissionPolicyLayer) -> bool {
-        let mut changed = self.prune_redundant();
+        self.prune_subsumed_by_with_write_denies(higher, &[])
+    }
+
+    /// Variant of [`Self::prune_subsumed_by`] that accepts additional `file_write.deny` rules from
+    /// sibling/ancestor layers so write-implied read pruning never strips explicit `file_read.allow`
+    /// grants in write-denied subtrees.
+    pub fn prune_subsumed_by_with_write_denies(
+        &mut self,
+        higher: &PermissionPolicyLayer,
+        extra_write_denies: &[String],
+    ) -> bool {
+        let mut combined_write_denies: Vec<String> = extra_write_denies.to_vec();
+        for src in [self.file_write.as_ref(), higher.file_write.as_ref()] {
+            if let Some(denies) = src.and_then(|r| r.deny.as_ref()) {
+                for d in denies {
+                    if !combined_write_denies.contains(d) {
+                        combined_write_denies.push(d.clone());
+                    }
+                }
+            }
+        }
+        let mut changed = self.prune_redundant_with_write_denies(&combined_write_denies);
         changed |= prune_ruleset_against(&mut self.file_read, &higher.file_read, PolicyRuleKind::Path);
         changed |=
             prune_ruleset_against(&mut self.file_write, &higher.file_write, PolicyRuleKind::Path);
@@ -167,6 +200,11 @@ impl PermissionPolicyLayer {
         );
         changed |=
             prune_ruleset_against(&mut self.http_hosts, &higher.http_hosts, PolicyRuleKind::Host);
+        changed |= prune_read_allows_covered_by_write(
+            &mut self.file_read,
+            higher.file_write.as_ref(),
+            &combined_write_denies,
+        );
         changed
     }
 
@@ -464,6 +502,47 @@ fn prune_ruleset_against(
     if low_rs.allow.is_none() && low_rs.deny.is_none() && low_rs.default.is_none() {
         *low_slot = None;
         changed = true;
+    }
+    changed
+}
+
+fn prune_read_allows_covered_by_write(
+    read_slot: &mut Option<RuleSet<String>>,
+    write_rs: Option<&RuleSet<String>>,
+    extra_write_denies: &[String],
+) -> bool {
+    let (Some(read_rs), Some(w_rs)) = (read_slot.as_mut(), write_rs) else {
+        return false;
+    };
+    let Some(ref w_allow) = w_rs.allow else {
+        return false;
+    };
+    let Some(ref mut r_allow) = read_rs.allow else {
+        return false;
+    };
+    let w_deny = w_rs.deny.as_deref().unwrap_or(&[]);
+    let has_wildcard_write = w_allow.iter().any(|w| w.trim() == "*");
+    let before = r_allow.len();
+    r_allow.retain(|r| {
+        if r.trim() == "." && !has_wildcard_write {
+            return true;
+        }
+        let write_deny_interferes = w_deny
+            .iter()
+            .chain(extra_write_denies.iter())
+            .any(|d| path_rule_subsumes(d, r) || path_rule_subsumes(r, d));
+        if write_deny_interferes {
+            return true;
+        }
+        !w_allow.iter().any(|w| path_rule_subsumes(w, r))
+    });
+    let changed = r_allow.len() < before;
+    if r_allow.is_empty() {
+        read_rs.allow = None;
+    }
+    if read_rs.allow.is_none() && read_rs.deny.is_none() && read_rs.default.is_none() {
+        *read_slot = None;
+        return true;
     }
     changed
 }

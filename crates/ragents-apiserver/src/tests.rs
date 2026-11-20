@@ -1132,4 +1132,112 @@ fn test_automatic_permission_pruning_across_scopes() {
     );
 }
 
+#[test]
+fn test_write_grant_prunes_lower_read_respecting_write_deny() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let node_id = NodeId::new("node_write_prune");
+    let mut base_perms = PermissionPolicyLayer::default();
+    base_perms.file_write = Some(RuleSet {
+        allow: Some(vec![".".to_string()]),
+        deny: Some(vec!["/tmp/u/data/locked".to_string()]),
+        default: Some(DefaultPermissionDecision::Ask),
+    });
+    store
+        .register_node_with_seed(
+            node_id.clone(),
+            "node_write_prune.local".into(),
+            "linux".into(),
+            "x86_64".into(),
+            BTreeMap::new(),
+            vec!["gpt-4.1".into()],
+            Some("gpt-4.1".into()),
+            None,
+            base_perms,
+            vec!["shell".into(), "file_editor".into()],
+            vec!["/tmp".into()],
+            4,
+            30_000,
+        )
+        .unwrap();
+
+    // Workspace already has FileRead on /tmp/u/data/normal and /tmp/u/data/locked/readme
+    let mut ws_layer = PermissionPolicyLayer::default();
+    ws_layer.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/data/normal"),
+    });
+    ws_layer.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/data/locked/readme"),
+    });
+    let mut ws_map = BTreeMap::new();
+    ws_map.insert("/tmp/u/ws".to_string(), ws_layer);
+    store
+        .patch_node(
+            &node_id,
+            PatchNodeSpecRequest {
+                workspace_permissions: Some(ws_map),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Create pinned session with redundant FileRead under /tmp/u/data/other
+    let mut sess_perms = PermissionPolicyLayer::default();
+    sess_perms.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/tmp/u/data/other/file.txt"),
+    });
+    let (created, _) = store
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_write_prune")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: node_id.clone(),
+                    workspace_path: PathBuf::from("/tmp/u/ws"),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: sess_perms,
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: None,
+        })
+        .unwrap();
+    assert_eq!(created.session.metadata.id, "sess_write_prune");
+
+    // Grant AllowNode FileWrite on /tmp/u/data -> must prune /tmp/u/data/normal (ws) and /tmp/u/data/other/file.txt (sess),
+    // while preserving /tmp/u/data/locked/readme because base_permissions has file_write.deny on /tmp/u/data/locked!
+    let mut node_grant = PermissionPolicyLayer::default();
+    node_grant.grant_capability(&CapabilityRequest::FileWrite {
+        path: PathBuf::from("/tmp/u/data"),
+    });
+    let node_after = store
+        .patch_node(
+            &node_id,
+            PatchNodeSpecRequest {
+                granted_permissions: Some(node_grant),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ws_after = node_after
+        .spec
+        .workspace_permissions
+        .get("/tmp/u/ws")
+        .expect("workspace entry should keep /tmp/u/data/locked/readme");
+    assert_eq!(
+        ws_after.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/tmp/u/data/locked/readme".to_string()][..])
+    );
+
+    let sess_after = store
+        .get_session(&SessionId::new("sess_write_prune"))
+        .unwrap()
+        .unwrap();
+    assert!(sess_after.spec.permissions.is_empty());
+}
+
 

@@ -1057,6 +1057,15 @@ impl SqliteStore {
                     .find(|p| p.id == req_id)
                     .cloned()
                 {
+                    if pending_req.extension_id.as_deref() == Some("permissions")
+                        && res_spec.decision == PermissionDecision::AllowOnce
+                    {
+                        return Err(StoreError::Validation(
+                            ProtocolValidationError::DisallowedPermissionDecision(
+                                "allow_once is only allowed for passively triggered operations, not explicit request_permission".to_string(),
+                            ),
+                        ));
+                    }
                     act.status.pending_interactions.retain(|p| p.id != req_id);
                     act.spec
                         .interaction_responses
@@ -1158,6 +1167,7 @@ impl SqliteStore {
                         }
                     }
                     combined_policy.merge_from(&session.spec.permissions);
+                    combined_policy.prune_redundant();
                     let snap = PermissionSnapshot::from_effective_policy(combined_policy);
                     act.status.effective_permission_ref =
                         Some(snap.permission_snapshot_ref.clone());

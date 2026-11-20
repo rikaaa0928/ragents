@@ -111,6 +111,7 @@ impl exports::ragent::extension::lifecycle::Guest for FileEditorExtension {
 
                 tools.push(serde_json::json!({
                     "enabled": true,
+                    "concurrency_safe": true,
                     "name": "read_file",
                     "description": "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
                     "parameters": {
@@ -137,6 +138,7 @@ impl exports::ragent::extension::lifecycle::Guest for FileEditorExtension {
 
                 tools.push(serde_json::json!({
                     "enabled": true,
+                    "concurrency_safe": false,
                     "name": "write_file",
                     "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
                     "parameters": {
@@ -157,6 +159,7 @@ impl exports::ragent::extension::lifecycle::Guest for FileEditorExtension {
 
                 tools.push(serde_json::json!({
                     "enabled": true,
+                    "concurrency_safe": false,
                     "name": "replace_in_file",
                     "description": "Edit a single file using exact text replacement. Every edits[].old_text must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
                     "parameters": {

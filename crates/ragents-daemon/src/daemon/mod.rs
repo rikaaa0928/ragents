@@ -39,7 +39,7 @@ pub struct AgentDaemon {
     /// Session-scoped permission grants (`AllowSession`)
     session_grants: Arc<Mutex<HashMap<SessionId, Vec<CapabilityRequest>>>>,
     /// Workspace-scoped permission grants (`AllowWorkspace`, keyed by canonicalized `workspace_root`)
-    workspace_grants: Arc<Mutex<HashMap<PathBuf, Vec<CapabilityRequest>>>>,
+    pub(crate) workspace_grants: Arc<Mutex<HashMap<PathBuf, Vec<CapabilityRequest>>>>,
     /// Node/Daemon-scoped permission grants (`AllowNode`)
     node_grants: Arc<Mutex<Vec<CapabilityRequest>>>,
 }
@@ -112,6 +112,7 @@ impl AgentDaemon {
                 .workspace_grants
                 .lock()
                 .expect("workspace_grants mutex poisoned");
+            w_guard.clear();
             for (ws_str, pol) in &node_spec.workspace_permissions {
                 let raw_path = PathBuf::from(ws_str);
                 let canon_path = raw_path
@@ -614,35 +615,42 @@ impl AgentDaemon {
             for g in &prior_grants {
                 match g {
                     CapabilityRequest::FileWrite { path } => {
-                        let rule_set = runtime_permissions
+                        let s = path.to_string_lossy().to_string();
+                        let allow = runtime_permissions
                             .file_write
-                            .get_or_insert_with(Default::default);
-                        rule_set
+                            .get_or_insert_with(Default::default)
                             .allow
-                            .get_or_insert_with(Vec::new)
-                            .push(path.to_string_lossy().to_string());
+                            .get_or_insert_with(Vec::new);
+                        if !allow.contains(&s) {
+                            allow.push(s);
+                        }
                     }
                     CapabilityRequest::FileRead { path } => {
-                        let rule_set = runtime_permissions
+                        let s = path.to_string_lossy().to_string();
+                        let allow = runtime_permissions
                             .file_read
-                            .get_or_insert_with(Default::default);
-                        rule_set
+                            .get_or_insert_with(Default::default)
                             .allow
-                            .get_or_insert_with(Vec::new)
-                            .push(path.to_string_lossy().to_string());
+                            .get_or_insert_with(Vec::new);
+                        if !allow.contains(&s) {
+                            allow.push(s);
+                        }
                     }
                     CapabilityRequest::CommandWorkDir { work_dir } => {
-                        let rule_set = runtime_permissions
+                        let s = work_dir.to_string_lossy().to_string();
+                        let allow = runtime_permissions
                             .command_work_dir
-                            .get_or_insert_with(Default::default);
-                        rule_set
+                            .get_or_insert_with(Default::default)
                             .allow
-                            .get_or_insert_with(Vec::new)
-                            .push(work_dir.to_string_lossy().to_string());
+                            .get_or_insert_with(Vec::new);
+                        if !allow.contains(&s) {
+                            allow.push(s);
+                        }
                     }
                     CapabilityRequest::Http { .. } => {}
                 }
             }
+            runtime_permissions.prune_redundant();
 
             let sandbox_state = Arc::new(SandboxState::from_policy_with_extra_tmp(
                 SandboxMode::Auto,
@@ -673,6 +681,7 @@ impl AgentDaemon {
                 process_manager: process_manager.clone(),
                 tunnel: tunnel.clone(),
                 permission_waiters,
+                permission_ask_lock: Arc::new(tokio::sync::Mutex::new(())),
                 cancellation: task_cancel.clone(),
             });
 

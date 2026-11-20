@@ -343,6 +343,7 @@ impl exports::ragent::extension::lifecycle::Guest for SessionHistoryExtension {
                 let tools = vec![
                     serde_json::json!({
                         "enabled": true,
+                        "concurrency_safe": true,
                         "name": "session_history_list",
                         "description": "List other sessions in the same workspace directory, including your own historical/compacted ancestor sessions (`self_history`) and other agents' sessions (`sibling_session`). Returns session IDs, agent/room labels, compaction lineage, item counts, and activity previews.",
                         "parameters": {
@@ -369,6 +370,7 @@ impl exports::ragent::extension::lifecycle::Guest for SessionHistoryExtension {
                     }),
                     serde_json::json!({
                         "enabled": true,
+                        "concurrency_safe": true,
                         "name": "session_history_search",
                         "description": "Search conversation messages, tool calls, and tool outputs across sessions in the same workspace directory (or within a specific `session_id`). Returns matching `session_id`, 0-based `item_index`, and text snippets.",
                         "parameters": {
@@ -411,6 +413,7 @@ impl exports::ragent::extension::lifecycle::Guest for SessionHistoryExtension {
                     }),
                     serde_json::json!({
                         "enabled": true,
+                        "concurrency_safe": true,
                         "name": "session_history_read",
                         "description": "Read a slice of conversation/tool history items from a target session in the same workspace. Supports reading around a specific `around_index` (from search results), reading forward from `from_index`, or reading the latest tail items when neither index is specified.",
                         "parameters": {

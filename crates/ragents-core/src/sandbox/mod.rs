@@ -5,7 +5,8 @@ pub use violation::{
     normalize_violation_to_request_dir,
 };
 pub(crate) use violation::{
-    closest_existing_dir, escape_sbpl, expand_canonical_paths, extract_eperm_paths_from_text,
+    closest_existing_dir, escape_sbpl, expand_canonical_paths,
+    extract_sandbox_error_paths_from_text, is_broad_top_or_home_dir,
     query_macos_sandbox_violations,
 };
 
@@ -155,6 +156,12 @@ impl SandboxState {
             }
         }
 
+        let has_wildcard_write = policy
+            .file_write
+            .as_ref()
+            .and_then(|fw| fw.allow.as_ref())
+            .is_some_and(|a| a.iter().any(|p| p == "*"));
+
         let mut restrict_reads = false;
         if let Some(ref fr) = policy.file_read {
             if let Some(ref denies) = fr.deny {
@@ -177,6 +184,7 @@ impl SandboxState {
                 }
             }
             if !has_wildcard
+                && !has_wildcard_write
                 && matches!(
                     fr.default,
                     Some(DefaultPermissionDecision::Ask | DefaultPermissionDecision::Deny)
@@ -219,7 +227,7 @@ impl SandboxState {
         } else {
             if let Some(parent) = p.parent() {
                 let parent_buf = parent.to_path_buf();
-                if !guard.contains(&parent_buf) {
+                if !is_broad_top_or_home_dir(&parent_buf) && !guard.contains(&parent_buf) {
                     guard.push(parent_buf);
                 }
             }
@@ -276,23 +284,14 @@ impl SandboxState {
 
     pub fn is_read_denied(&self, path: &Path) -> bool {
         let norm_target = canonicalize_or_normalize(path);
-        let allowed = self
-            .allowed_read_paths
-            .lock()
-            .expect("allowed_read_paths poisoned");
-        if allowed
-            .iter()
-            .any(|p| path.starts_with(p) || norm_target.starts_with(p))
-        {
-            return false;
-        }
         let denied = self
             .denied_read_paths
             .lock()
             .expect("denied_read_paths poisoned");
-        denied
-            .iter()
-            .any(|p| path.starts_with(p) || norm_target.starts_with(p))
+        denied.iter().any(|p| {
+            let norm_p = canonicalize_or_normalize(p);
+            path.starts_with(p) || norm_target.starts_with(&norm_p)
+        })
     }
 
     pub async fn execute_command(
@@ -422,48 +421,7 @@ impl SandboxState {
 
                 if exit_code != 0 && self.mode != SandboxMode::Disabled {
                     let combined = format!("{stderr}\n{stdout}");
-                    let extracted = extract_eperm_paths_from_text(&combined);
-                    let has_unreadable = extracted
-                        .iter()
-                        .any(|p| !self.is_path_readable(p) && p.exists());
-                    for raw_path in extracted {
-                        let is_setuid = is_setuid_or_setgid_binary(&raw_path);
-                        let is_read_violation =
-                            !self.is_path_readable(&raw_path) && raw_path.exists();
-                        if is_setuid && !is_read_violation {
-                            continue;
-                        }
-                        if has_unreadable && !is_read_violation && raw_path.exists() {
-                            continue;
-                        }
-                        let req_dir = normalize_violation_to_request_dir(&raw_path);
-                        let (cap, op) = if is_setuid && is_read_violation {
-                            (
-                                CapabilityRequest::FileRead { path: req_dir },
-                                "file-read-data + setuid/setgid exec".to_string(),
-                            )
-                        } else if is_read_violation {
-                            (
-                                CapabilityRequest::FileRead { path: req_dir },
-                                "file-read-data".to_string(),
-                            )
-                        } else {
-                            (
-                                CapabilityRequest::FileWrite { path: req_dir },
-                                "file-write".to_string(),
-                            )
-                        };
-                        if !violations
-                            .iter()
-                            .any(|v: &SandboxViolation| v.capability == cap)
-                        {
-                            violations.push(SandboxViolation {
-                                capability: cap,
-                                raw_path,
-                                operation: op,
-                            });
-                        }
-                    }
+                    violations = self.extract_violations_from_output(&combined);
 
                     if violations.is_empty() && cfg!(target_os = "macos") {
                         for (op, raw_path_str) in query_macos_sandbox_violations(&trace_tag).await {
@@ -590,6 +548,77 @@ impl SandboxState {
         self.mode
     }
 
+    pub fn extract_violations_from_output(&self, text: &str) -> Vec<SandboxViolation> {
+        let mut violations = Vec::new();
+        let extracted = extract_sandbox_error_paths_from_text(text);
+        let has_unreadable = extracted
+            .iter()
+            .any(|item| !item.is_read_only_fs && !self.is_path_readable(&item.path) && item.path.exists());
+
+        for item in extracted {
+            let raw_path = item.path;
+            let is_setuid = is_setuid_or_setgid_binary(&raw_path);
+
+            if item.is_read_only_fs {
+                if self.is_path_writable(&raw_path) {
+                    continue;
+                }
+                let req_dir = normalize_violation_to_request_dir(&raw_path);
+                let cap = CapabilityRequest::FileWrite { path: req_dir };
+                if !violations
+                    .iter()
+                    .any(|v: &SandboxViolation| v.capability == cap)
+                {
+                    violations.push(SandboxViolation {
+                        capability: cap,
+                        raw_path,
+                        operation: "file-write".to_string(),
+                    });
+                }
+                continue;
+            }
+
+            let is_read_violation = !self.is_path_readable(&raw_path) && raw_path.exists();
+            if is_setuid && !is_read_violation {
+                continue;
+            }
+            if has_unreadable && !is_read_violation && raw_path.exists() {
+                continue;
+            }
+            if !is_read_violation && self.is_path_writable(&raw_path) {
+                continue;
+            }
+            let req_dir = normalize_violation_to_request_dir(&raw_path);
+            let (cap, op) = if is_setuid && is_read_violation {
+                (
+                    CapabilityRequest::FileRead { path: req_dir },
+                    "file-read-data + setuid/setgid exec".to_string(),
+                )
+            } else if is_read_violation {
+                (
+                    CapabilityRequest::FileRead { path: req_dir },
+                    "file-read-data".to_string(),
+                )
+            } else {
+                (
+                    CapabilityRequest::FileWrite { path: req_dir },
+                    "file-write".to_string(),
+                )
+            };
+            if !violations
+                .iter()
+                .any(|v: &SandboxViolation| v.capability == cap)
+            {
+                violations.push(SandboxViolation {
+                    capability: cap,
+                    raw_path,
+                    operation: op,
+                });
+            }
+        }
+        violations
+    }
+
     pub fn build_sandboxed_command_for_process(
         &self,
         work_dir: &Path,
@@ -632,6 +661,17 @@ impl SandboxState {
         let norm_target = canonicalize_or_normalize(target);
         let require_exact =
             is_setuid_or_setgid_binary(&norm_target) || is_setuid_or_setgid_binary(target);
+        let denied_read = self
+            .denied_read_paths
+            .lock()
+            .expect("denied_read_paths poisoned")
+            .clone();
+        for d in &denied_read {
+            let norm_d = canonicalize_or_normalize(d);
+            if norm_target.starts_with(&norm_d) {
+                return false;
+            }
+        }
         let allowed_read = self
             .allowed_read_paths
             .lock()
@@ -647,12 +687,12 @@ impl SandboxState {
                 return true;
             }
         }
-        let denied_read = self
-            .denied_read_paths
+        let denied_write = self
+            .denied_write_paths
             .lock()
-            .expect("denied_read_paths poisoned")
+            .expect("denied_write_paths poisoned")
             .clone();
-        for d in &denied_read {
+        for d in &denied_write {
             let norm_d = canonicalize_or_normalize(d);
             if norm_target.starts_with(&norm_d) {
                 return false;
@@ -785,20 +825,20 @@ pub fn build_macos_seatbelt_profile(
         }
     }
 
-    let expanded_denied_read = expand_canonical_paths(denied_read_paths);
-    if !expanded_denied_read.is_empty() {
-        profile.push_str(&format!("(deny file-read-data (with message \"{tag}\")\n"));
-        for p in expanded_denied_read {
-            profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(&p)));
-        }
-        profile.push_str(")\n");
-    }
-
     let expanded_allowed_read = expand_canonical_paths(allowed_read_paths);
     if !expanded_allowed_read.is_empty() {
         profile.push_str("(allow file-read-data\n");
         for p in &expanded_allowed_read {
             profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(p)));
+        }
+        profile.push_str(")\n");
+    }
+
+    let expanded_denied_read = expand_canonical_paths(denied_read_paths);
+    if !expanded_denied_read.is_empty() {
+        profile.push_str(&format!("(deny file-read-data (with message \"{tag}\")\n"));
+        for p in expanded_denied_read {
+            profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl(&p)));
         }
         profile.push_str(")\n");
     }

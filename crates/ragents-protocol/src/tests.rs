@@ -155,7 +155,7 @@ fn test_permission_policy_layer_prunes_redundant_and_subsumed_rules() {
     // 2. Cross-layer pruning: AllowWorkspace subsumes AllowSession in matching category only.
     let mut workspace = PermissionPolicyLayer::default();
     workspace.grant_capability(&CapabilityRequest::FileRead {
-        path: PathBuf::from("/var/home/rikaaa0928/models/anima"),
+        path: PathBuf::from("/var/home/rikaaa0928/models/readonly_sub"),
     });
     workspace.grant_capability(&CapabilityRequest::FileWrite {
         path: PathBuf::from("/var/home/rikaaa0928/models/anima"),
@@ -259,5 +259,139 @@ fn test_permission_policy_layer_prunes_redundant_and_subsumed_rules() {
     });
     assert!(sess_bins.prune_subsumed_by(&parent_node));
     assert!(sess_bins.file_read.is_none());
+}
+
+#[test]
+fn test_write_subsumes_read_and_respects_write_deny_on_merge_and_prune() {
+    // 1. grant_capability(FileWrite) does NOT duplicate into file_read and prunes narrower file_read.
+    let mut layer = PermissionPolicyLayer::default();
+    layer.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/data/models/sub"),
+    });
+    layer.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/data/other"),
+    });
+    layer.grant_capability(&CapabilityRequest::FileWrite {
+        path: PathBuf::from("/data/models"),
+    });
+    assert_eq!(
+        layer.file_write.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/data/models".to_string()][..])
+    );
+    assert_eq!(
+        layer.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/data/other".to_string()][..])
+    );
+
+    // 2. Higher FileWrite prunes lower FileRead, while higher FileRead NEVER prunes lower FileWrite.
+    let mut higher = PermissionPolicyLayer::default();
+    higher.grant_capability(&CapabilityRequest::FileWrite {
+        path: PathBuf::from("/srv/shared"),
+    });
+    higher.grant_capability(&CapabilityRequest::FileRead {
+        path: PathBuf::from("/srv/readonly"),
+    });
+
+    let mut lower = PermissionPolicyLayer {
+        file_read: Some(RuleSet {
+            allow: Some(vec![
+                "/srv/shared/logs".to_string(),
+                "/srv/locked/readme.txt".to_string(),
+            ]),
+            deny: None,
+            default: None,
+        }),
+        file_write: Some(RuleSet {
+            allow: Some(vec!["/srv/readonly/out".to_string()]),
+            deny: None,
+            default: None,
+        }),
+        ..Default::default()
+    };
+    assert!(lower.prune_subsumed_by(&higher));
+    assert_eq!(
+        lower.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/srv/locked/readme.txt".to_string()][..])
+    );
+    assert_eq!(
+        lower.file_write.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/srv/readonly/out".to_string()][..])
+    );
+
+    // 3. Multi-layer merge with file_write.deny on a later layer must NOT lose lower file_read inside write-denied subtree!
+    let mut node_layer = PermissionPolicyLayer::default();
+    node_layer.grant_capability(&CapabilityRequest::FileWrite {
+        path: PathBuf::from("/data"),
+    });
+    let mut ws_layer = PermissionPolicyLayer {
+        file_read: Some(RuleSet {
+            allow: Some(vec![
+                "/data/normal/file".to_string(),
+                "/data/locked/readme".to_string(),
+            ]),
+            deny: None,
+            default: None,
+        }),
+        ..Default::default()
+    };
+    let session_layer = PermissionPolicyLayer {
+        file_write: Some(RuleSet {
+            allow: None,
+            deny: Some(vec!["/data/locked".to_string()]),
+            default: None,
+        }),
+        ..Default::default()
+    };
+
+    // Merging across layers preserves ws_layer's read until final prune sees session's write deny.
+    let mut merged = node_layer.clone();
+    merged.merge_from(&ws_layer);
+    merged.merge_from(&session_layer);
+    merged.prune_redundant();
+    assert_eq!(
+        merged.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/data/locked/readme".to_string()][..])
+    );
+
+    // And pruning ws_layer with extra_write_denies from session/node preserves /data/locked/readme!
+    assert!(ws_layer.prune_subsumed_by_with_write_denies(&node_layer, &["/data/locked".to_string()]));
+    assert_eq!(
+        ws_layer.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&["/data/locked/readme".to_string()][..])
+    );
+
+    // 4. NodeSpec::effective_permissions merges base + granted and prunes redundant file_read under file_write.
+    let node_spec = NodeSpec {
+        base_permissions: PermissionPolicyLayer {
+            file_read: Some(RuleSet {
+                allow: Some(vec![".".to_string(), "/models/sub".to_string()]),
+                deny: None,
+                default: Some(DefaultPermissionDecision::Ask),
+            }),
+            file_write: Some(RuleSet {
+                allow: Some(vec![".".to_string()]),
+                deny: None,
+                default: Some(DefaultPermissionDecision::Ask),
+            }),
+            ..Default::default()
+        },
+        granted_permissions: {
+            let mut g = PermissionPolicyLayer::default();
+            g.grant_capability(&CapabilityRequest::FileWrite {
+                path: PathBuf::from("/models"),
+            });
+            g
+        },
+        ..Default::default()
+    };
+    let eff = node_spec.effective_permissions();
+    assert_eq!(
+        eff.file_read.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&[".".to_string()][..])
+    );
+    assert_eq!(
+        eff.file_write.as_ref().and_then(|r| r.allow.as_deref()),
+        Some(&[".".to_string(), "/models".to_string()][..])
+    );
 }
 

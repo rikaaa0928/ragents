@@ -159,10 +159,10 @@ impl HostState {
             return Err(wasi_fs_types::ErrorCode::NotPermitted.into());
         };
 
-        if !is_write
-            && (in_preopen_dirs || self.sandbox_state.is_path_readable(full_path))
-            && !self.sandbox_state.is_read_denied(full_path)
-        {
+        if !is_write && self.sandbox_state.is_read_denied(full_path) {
+            return Err(wasi_fs_types::ErrorCode::NotPermitted.into());
+        }
+        if !is_write && (in_preopen_dirs || self.sandbox_state.is_path_readable(full_path)) {
             return Ok(());
         }
         if is_write && self.sandbox_state.is_path_writable(full_path) {
@@ -180,6 +180,7 @@ impl HostState {
         } else if self
             .invoke_approved_reads
             .iter()
+            .chain(self.invoke_approved_writes.iter())
             .any(|p| norm_target.starts_with(p) || full_path.starts_with(p))
         {
             return Ok(());

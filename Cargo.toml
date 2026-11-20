@@ -16,6 +16,7 @@ exclude = [
     "extensions/agents_md",
     "extensions/compaction",
     "extensions/session_history",
+    "extensions/permissions",
     "extensions/authn",
 ]
 
@@ -58,3 +59,4 @@ bytes = "1.0"
 url = "2.5"
 base64 = "0.22"
 tempfile = "3.27.0"
+mimalloc = "0.1"

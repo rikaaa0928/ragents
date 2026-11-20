@@ -71,14 +71,16 @@ ragents/
 ├── Cargo.toml                        # Workspace 根配置
 ├── AGENTS.md                         # 开发规范与架构约束
 ├── scripts/build-extensions.sh       # 构建内置 wasm32-wasip2 工具扩展脚本
-├── wit/ragent-extension.wit          # WASM 扩展 WIT 接口契约 (host.manage-process + lifecycle)
+├── wit/ragent-extension.wit          # WASM 扩展 WIT 接口契约 (host.manage-process / query-session-history / request-permission + lifecycle)
 ├── extensions/                       # 内置通用 WASM 工具扩展源码 (wasm32-wasip2)
 │   ├── shell/                        # 宿主前后台命令执行与进程管理扩展（含 duration_ms 与尾部截断落盘）
 │   ├── file_editor/                  # 文件分页读取 (offset/limit)、写入与非重叠精确替换扩展
 │   ├── image_viewer/                 # 多模态图像读取扩展（历史轮次自动剥离 Base64 节省跨网带宽）
 │   ├── agents_md/                    # 工作区 AGENTS.md / CLAUDE.md 自动发现与指令注入扩展
 │   ├── skills/                       # Agent Skills (.agents/skills) 自动发现与按需加载扩展
-│   └── compaction/                   # 三会话自动上下文压缩与多代接力摘要扩展 (sess_1 -> sess_compact -> sess_2)
+│   ├── compaction/                   # 三会话自动上下文压缩与多代接力摘要扩展 (sess_1 -> sess_compact -> sess_2)
+│   ├── session_history/              # 工作区跨会话历史检索与上下文读取扩展 (list / search / read)
+│   └── permissions/                  # 显式交互式权限申请工具 (`request_permission`) 与沙箱授权指引扩展
 ├── crates/
 │   ├── ragents-protocol/             # 核心声明式资源、事件、REST/SSE/WS 协议与 NodeExtensionCall 契约
 │   ├── ragents-apiserver/            # 极简控制面服务：SQLite WAL 存储、双模调度器、REST/SSE/WS 隧道与静态 Token 鉴权
@@ -96,7 +98,7 @@ ragents/
 ### 3.1 编译主程序与内置 WASM 扩展
 
 ```bash
-# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, agents_md, skills, compaction)
+# 1. 构建内置 WASM 扩展组件 (shell, file_editor, image_viewer, agents_md, skills, compaction, session_history, permissions)
 ./scripts/build-extensions.sh
 
 # 2. 编译 ragents 工作区所有二进制 (ragents, ragents-core-worker)

@@ -607,46 +607,175 @@ async fn run_react_loop(
         }
 
         if !step.function_calls.is_empty() {
+            let mut prepared_calls = Vec::with_capacity(step.function_calls.len());
             for call in &step.function_calls {
                 if cancellation.is_cancelled() {
                     return Err(CoreError::Cancelled);
                 }
-
-                host.emit_event(
-                    Some(turn_id.clone()),
-                    SessionEvent::ToolCallStarted {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                    },
-                )
-                .await?;
-
-                let started_at = Instant::now();
-                let (tool_output_item, success, view_mode_placeholder) = tokio::select! {
-                    res = execute_tool_call(
+                let prepared = tokio::select! {
+                    res = prepare_tool_call(
                         call,
                         &active_tools,
                         hook_manager,
-                        host,
                         iteration,
                     ) => res?,
                     _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
                 };
+                prepared_calls.push(prepared);
+            }
 
-                let duration_ms = started_at.elapsed().as_millis() as u64;
-                host.commit_tool_output_with_placeholder(
-                    &turn_id,
-                    &call.call_id,
-                    &call.name,
-                    success,
-                    duration_ms,
-                    view_mode_placeholder,
-                    vec![tool_output_item.clone()],
-                )
-                .await?;
+            let safety_flags: Vec<bool> =
+                prepared_calls.iter().map(|p| p.concurrency_safe).collect();
+            let batches = partition_tool_call_batches(&safety_flags, MAX_CONCURRENT_TOOL_CALLS);
 
-                if let Some(ref mut cached) = cached_effective_items {
-                    cached.push(tool_output_item);
+            for batch in batches {
+                if cancellation.is_cancelled() {
+                    return Err(CoreError::Cancelled);
+                }
+
+                match batch {
+                    ToolCallBatch::Sequential(idx) => {
+                        let prepared = &prepared_calls[idx];
+                        host.emit_event(
+                            Some(turn_id.clone()),
+                            SessionEvent::ToolCallStarted {
+                                call_id: prepared.call.call_id.clone(),
+                                name: prepared.call.name.clone(),
+                            },
+                        )
+                        .await?;
+
+                        let started_at = Instant::now();
+                        let (tool_output_item, success, view_mode_placeholder) = tokio::select! {
+                            res = execute_prepared_tool_call(
+                                prepared,
+                                hook_manager,
+                                host,
+                                iteration,
+                            ) => res?,
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        };
+
+                        let duration_ms = started_at.elapsed().as_millis() as u64;
+                        host.commit_tool_output_with_placeholder(
+                            &turn_id,
+                            &prepared.call.call_id,
+                            &prepared.call.name,
+                            success,
+                            duration_ms,
+                            view_mode_placeholder,
+                            vec![tool_output_item.clone()],
+                        )
+                        .await?;
+
+                        if let Some(ref mut cached) = cached_effective_items {
+                            cached.push(tool_output_item);
+                        }
+                    }
+                    ToolCallBatch::Concurrent(indices) if indices.len() == 1 => {
+                        let prepared = &prepared_calls[indices[0]];
+                        host.emit_event(
+                            Some(turn_id.clone()),
+                            SessionEvent::ToolCallStarted {
+                                call_id: prepared.call.call_id.clone(),
+                                name: prepared.call.name.clone(),
+                            },
+                        )
+                        .await?;
+
+                        let started_at = Instant::now();
+                        let (tool_output_item, success, view_mode_placeholder) = tokio::select! {
+                            res = execute_prepared_tool_call(
+                                prepared,
+                                hook_manager,
+                                host,
+                                iteration,
+                            ) => res?,
+                            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                        };
+
+                        let duration_ms = started_at.elapsed().as_millis() as u64;
+                        host.commit_tool_output_with_placeholder(
+                            &turn_id,
+                            &prepared.call.call_id,
+                            &prepared.call.name,
+                            success,
+                            duration_ms,
+                            view_mode_placeholder,
+                            vec![tool_output_item.clone()],
+                        )
+                        .await?;
+
+                        if let Some(ref mut cached) = cached_effective_items {
+                            cached.push(tool_output_item);
+                        }
+                    }
+                    ToolCallBatch::Concurrent(indices) => {
+                        for &idx in &indices {
+                            let prepared = &prepared_calls[idx];
+                            host.emit_event(
+                                Some(turn_id.clone()),
+                                SessionEvent::ToolCallStarted {
+                                    call_id: prepared.call.call_id.clone(),
+                                    name: prepared.call.name.clone(),
+                                },
+                            )
+                            .await?;
+                        }
+
+                        let futs = indices.iter().map(|&idx| {
+                            let prepared = &prepared_calls[idx];
+                            async move {
+                                let started_at = Instant::now();
+                                let (tool_output_item, success, view_mode_placeholder) = tokio::select! {
+                                    res = execute_prepared_tool_call(
+                                        prepared,
+                                        hook_manager,
+                                        host,
+                                        iteration,
+                                    ) => res?,
+                                    _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                                };
+                                let duration_ms = started_at.elapsed().as_millis() as u64;
+                                Ok::<_, CoreError>((
+                                    tool_output_item,
+                                    success,
+                                    duration_ms,
+                                    view_mode_placeholder,
+                                ))
+                            }
+                        });
+                        let batch_results = futures::future::join_all(futs).await;
+
+                        if cancellation.is_cancelled() {
+                            return Err(CoreError::Cancelled);
+                        }
+
+                        let mut completed = Vec::with_capacity(batch_results.len());
+                        for res in batch_results {
+                            completed.push(res?);
+                        }
+
+                        for (idx, (tool_output_item, success, duration_ms, view_mode_placeholder)) in
+                            indices.into_iter().zip(completed)
+                        {
+                            let prepared = &prepared_calls[idx];
+                            host.commit_tool_output_with_placeholder(
+                                &turn_id,
+                                &prepared.call.call_id,
+                                &prepared.call.name,
+                                success,
+                                duration_ms,
+                                view_mode_placeholder,
+                                vec![tool_output_item.clone()],
+                            )
+                            .await?;
+
+                            if let Some(ref mut cached) = cached_effective_items {
+                                cached.push(tool_output_item);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -901,29 +1030,80 @@ async fn execute_compaction_plan(
     Ok((combined_prompt, formatted, total_usage))
 }
 
-async fn execute_tool_call(
-    call: &AgentFunctionCall,
+pub(crate) const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolCallBatch {
+    Concurrent(Vec<usize>),
+    Sequential(usize),
+}
+
+pub(crate) fn partition_tool_call_batches(
+    concurrency_safe_flags: &[bool],
+    max_concurrent: usize,
+) -> Vec<ToolCallBatch> {
+    let cap = max_concurrent.max(1);
+    let mut batches = Vec::new();
+    let mut current_concurrent: Vec<usize> = Vec::new();
+
+    for (idx, &is_safe) in concurrency_safe_flags.iter().enumerate() {
+        if is_safe {
+            current_concurrent.push(idx);
+            if current_concurrent.len() >= cap {
+                batches.push(ToolCallBatch::Concurrent(std::mem::take(
+                    &mut current_concurrent,
+                )));
+            }
+        } else {
+            if !current_concurrent.is_empty() {
+                batches.push(ToolCallBatch::Concurrent(std::mem::take(
+                    &mut current_concurrent,
+                )));
+            }
+            batches.push(ToolCallBatch::Sequential(idx));
+        }
+    }
+
+    if !current_concurrent.is_empty() {
+        batches.push(ToolCallBatch::Concurrent(current_concurrent));
+    }
+    batches
+}
+
+enum PreparedToolCallKind {
+    MissingTool,
+    Ready {
+        owner: String,
+        call_req: ToolCallRequest,
+        view_mode_placeholder: Option<String>,
+    },
+}
+
+struct PreparedToolCall<'a> {
+    call: &'a AgentFunctionCall,
+    concurrency_safe: bool,
+    kind: PreparedToolCallKind,
+}
+
+async fn prepare_tool_call<'a>(
+    call: &'a AgentFunctionCall,
     active_tools: &[ToolEntry],
     hook_manager: &HookManager,
-    host: &dyn CoreHost,
     iteration: usize,
-) -> Result<(Item, bool, Option<String>), CoreError> {
-    let tool = match active_tools.iter().find(|t| t.definition.name == call.name) {
-        Some(t) => t,
-        None => {
-            let err_item = Item::FunctionCallOutput {
-                id: None,
-                call_id: call.call_id.clone(),
-                output: ToolResult::err(format!("Tool not found: {}", call.name))
-                    .output
-                    .to_function_output(),
-                status: None,
-            };
-            return Ok((err_item, false, None));
-        }
+) -> Result<PreparedToolCall<'a>, CoreError> {
+    let Some(tool) = active_tools.iter().find(|t| t.definition.name == call.name) else {
+        return Ok(PreparedToolCall {
+            call,
+            concurrency_safe: false,
+            kind: PreparedToolCallKind::MissingTool,
+        });
     };
 
     let view_mode_placeholder = tool.definition.view_mode_placeholder.clone();
+    let owner = tool
+        .owner
+        .clone()
+        .ok_or_else(|| CoreError::ToolError("Tool has no owner".into()))?;
 
     let arguments_val: serde_json::Value = serde_json::from_str(&call.arguments)
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
@@ -933,6 +1113,7 @@ async fn execute_tool_call(
         tool_id: tool.id.clone().unwrap_or_default(),
         name: call.name.clone(),
         arguments: arguments_val,
+        concurrency_safe: Some(tool.definition.concurrency_safe),
     };
 
     let transformed = hook_manager
@@ -946,11 +1127,46 @@ async fn execute_tool_call(
 
     let call_req: ToolCallRequest =
         serde_json::from_value(transformed.payload).unwrap_or(initial_req);
+    let concurrency_safe = call_req
+        .concurrency_safe
+        .unwrap_or(tool.definition.concurrency_safe);
 
-    let owner = tool
-        .owner
-        .as_deref()
-        .ok_or_else(|| CoreError::ToolError("Tool has no owner".into()))?;
+    Ok(PreparedToolCall {
+        call,
+        concurrency_safe,
+        kind: PreparedToolCallKind::Ready {
+            owner,
+            call_req,
+            view_mode_placeholder,
+        },
+    })
+}
+
+async fn execute_prepared_tool_call(
+    prepared: &PreparedToolCall<'_>,
+    hook_manager: &HookManager,
+    host: &dyn CoreHost,
+    iteration: usize,
+) -> Result<(Item, bool, Option<String>), CoreError> {
+    let call = prepared.call;
+    let (owner, call_req, view_mode_placeholder) = match &prepared.kind {
+        PreparedToolCallKind::MissingTool => {
+            let err_item = Item::FunctionCallOutput {
+                id: None,
+                call_id: call.call_id.clone(),
+                output: ToolResult::err(format!("Tool not found: {}", call.name))
+                    .output
+                    .to_function_output(),
+                status: None,
+            };
+            return Ok((err_item, false, None));
+        }
+        PreparedToolCallKind::Ready {
+            owner,
+            call_req,
+            view_mode_placeholder,
+        } => (owner.as_str(), call_req.clone(), view_mode_placeholder.clone()),
+    };
 
     let perm_req_transformed = hook_manager
         .transform_validated(

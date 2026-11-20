@@ -2605,4 +2605,967 @@ async fn test_centralized_cluster_models_direct_invocation_and_local_override() 
     server_cancel.cancel();
 }
 
+#[tokio::test]
+async fn test_permissions_extension_disallows_allow_once_and_passive_allow_once_works() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let perms_wasm = manifest_dir.join(
+        "../../extensions/permissions/target/wasm32-wasip2/release/ragent_permissions_extension.wasm",
+    );
+    let file_editor_wasm = manifest_dir.join(
+        "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+    );
+    if !perms_wasm.exists() || !file_editor_wasm.exists() {
+        return;
+    }
+
+    struct ScriptedBackend {
+        script: Arc<Mutex<Vec<ResponseResource>>>,
+    }
+    #[async_trait]
+    impl ModelBackend for ScriptedBackend {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            _request: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            let mut guard = self.script.lock().unwrap();
+            if guard.is_empty() {
+                return Err(CoreError::ResponseFailed("no more scripted responses".into()));
+            }
+            Ok(guard.remove(0))
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws_root = tmp.path().join("ws");
+    let external_dir = tmp.path().join("external_once");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&external_dir).unwrap();
+    let target_file = external_dir.join("note.txt");
+
+    let store = SqliteStore::open_in_memory().expect("open store");
+    let state = ApiServerState::new(store, 5_000);
+    let server_cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = serve_tcp(listener, state, server_cancel.clone())
+        .await
+        .unwrap();
+    let server_url = format!("http://{addr}");
+
+    let script = Arc::new(Mutex::new(vec![
+        // Activation 1, Turn 1: request_permission
+        make_openresponses_resource(
+            "resp_once_1",
+            "gpt-4.1",
+            vec![Item::FunctionCall {
+                id: Some("fc_1".into()),
+                call_id: "call_1".into(),
+                name: "request_permission".into(),
+                arguments: serde_json::json!({
+                    "capability": "file_write",
+                    "target": target_file.to_string_lossy(),
+                    "reason": "Need single write to external_once/note.txt"
+                })
+                .to_string(),
+                status: None,
+            }],
+            None,
+        ),
+        // Activation 1, Turn 2: write_file (covered by AllowActivation without prompting again)
+        make_openresponses_resource(
+            "resp_act_2",
+            "gpt-4.1",
+            vec![Item::FunctionCall {
+                id: Some("fc_2".into()),
+                call_id: "call_2".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": target_file.to_string_lossy(),
+                    "content": "first write via allow_activation"
+                })
+                .to_string(),
+                status: None,
+            }],
+            None,
+        ),
+        make_openresponses_resource(
+            "resp_act_3",
+            "gpt-4.1",
+            vec![Item::assistant_message("Activation 1 done.")],
+            None,
+        ),
+        // Activation 2, Turn 1: passive write_file (AllowActivation expired -> prompts -> AllowOnce!)
+        make_openresponses_resource(
+            "resp_once_1",
+            "gpt-4.1",
+            vec![Item::FunctionCall {
+                id: Some("fc_3".into()),
+                call_id: "call_3".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": target_file.to_string_lossy(),
+                    "content": "second write via passive allow_once"
+                })
+                .to_string(),
+                status: None,
+            }],
+            None,
+        ),
+        make_openresponses_resource(
+            "resp_once_2",
+            "gpt-4.1",
+            vec![Item::assistant_message("Activation 2 done.")],
+            None,
+        ),
+        // Activation 3, Turn 1: passive write_file again (AllowOnce did not persist -> AllowSession!)
+        make_openresponses_resource(
+            "resp_sess_1",
+            "gpt-4.1",
+            vec![Item::FunctionCall {
+                id: Some("fc_4".into()),
+                call_id: "call_4".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": target_file.to_string_lossy(),
+                    "content": "third write via allow_session"
+                })
+                .to_string(),
+                status: None,
+            }],
+            None,
+        ),
+        make_openresponses_resource(
+            "resp_sess_2",
+            "gpt-4.1",
+            vec![Item::assistant_message("Activation 3 done.")],
+            None,
+        ),
+        // Activation 4, Turn 1: write_file again (AllowSession persisted, so zero prompts!)
+        make_openresponses_resource(
+            "resp_sess_3",
+            "gpt-4.1",
+            vec![Item::FunctionCall {
+                id: Some("fc_5".into()),
+                call_id: "call_5".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": target_file.to_string_lossy(),
+                    "content": "fourth write persisted"
+                })
+                .to_string(),
+                status: None,
+            }],
+            None,
+        ),
+        make_openresponses_resource(
+            "resp_sess_4",
+            "gpt-4.1",
+            vec![Item::assistant_message("Activation 4 done.")],
+            None,
+        ),
+    ]));
+
+    let cfg = make_daemon_cfg(
+        "node-perm-test",
+        &server_url,
+        vec!["gpt-4.1"],
+        tmp.path().join("daemon_tmp"),
+    );
+    let daemon = AgentDaemon::new(cfg).with_model_backend(Arc::new(ScriptedBackend { script }));
+    let daemon_cancel = CancellationToken::new();
+    daemon.start(daemon_cancel.clone()).await.unwrap();
+
+    let client = RagentsClient::new(server_url);
+    let mut watch = client.watch_events(None, 0).await.unwrap();
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_perm_one_shot")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node-perm-test"),
+                    workspace_path: ws_root,
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![
+                    ExtensionSpec {
+                        name: "permissions".into(),
+                        path: perms_wasm.to_string_lossy().to_string(),
+                        enabled: true,
+                        config: serde_json::json!({}),
+                        allowed_dirs: vec![],
+                        filter_env: vec![],
+                    },
+                    ExtensionSpec {
+                        name: "file_editor".into(),
+                        path: file_editor_wasm.to_string_lossy().to_string(),
+                        enabled: true,
+                        config: serde_json::json!({}),
+                        allowed_dirs: vec![],
+                        filter_env: vec![],
+                    },
+                ],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("run activation 1")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+
+    let sess_id = SessionId::new(created.session.metadata.id);
+    let act1_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let mut act1_perm_prompts = 0usize;
+
+    while let Some(Ok(env)) = watch.next().await {
+        if env.activation_id.as_ref() != Some(&act1_id) {
+            continue;
+        }
+        match env.event {
+            SessionEvent::PermissionRequested { request } => {
+                act1_perm_prompts += 1;
+                assert_eq!(request.extension_id.as_deref(), Some("permissions"));
+                // AllowOnce must be rejected for explicit request_permission
+                let mut disallowed = BTreeMap::new();
+                disallowed.insert(
+                    request.id.clone(),
+                    PermissionResolutionSpec {
+                        decision: PermissionDecision::AllowOnce,
+                        override_path: None,
+                        responded_at: Utc::now(),
+                    },
+                );
+                let bad = client
+                    .patch_activation(
+                        &act1_id,
+                        PatchActivationSpecRequest {
+                            desired_phase: None,
+                            interaction_responses: disallowed,
+                        },
+                    )
+                    .await;
+                assert!(
+                    bad.is_err(),
+                    "apiserver must reject AllowOnce for explicit request_permission"
+                );
+
+                // AllowActivation succeeds and covers write_file within the same activation
+                let mut responses = BTreeMap::new();
+                responses.insert(
+                    request.id,
+                    PermissionResolutionSpec {
+                        decision: PermissionDecision::AllowActivation,
+                        override_path: None,
+                        responded_at: Utc::now(),
+                    },
+                );
+                client
+                    .patch_activation(
+                        &act1_id,
+                        PatchActivationSpecRequest {
+                            desired_phase: None,
+                            interaction_responses: responses,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            SessionEvent::ActivationCompleted { .. } => break,
+            SessionEvent::ActivationFailed { error, .. } => panic!("act1 failed: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        act1_perm_prompts, 1,
+        "request_permission AllowActivation must satisfy write_file in act1 with zero duplicate prompts"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "first write via allow_activation"
+    );
+
+    // Activation 2: AllowActivation expired; passive write_file triggers prompt -> AllowOnce succeeds!
+    let act2 = client
+        .create_activation(CreateActivationRequest {
+            activation_id: None,
+            labels: BTreeMap::new(),
+            spec: ActivationSpec {
+                session_id: sess_id.clone(),
+                submission_kind: SubmissionKind::FollowUp,
+                input: vec![Item::user_message("run activation 2")],
+                model_override: None,
+                disabled_tools: vec![],
+                desired_phase: DesiredActivationPhase::Running,
+                interaction_responses: BTreeMap::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let act2_id = ActivationId::new(act2.metadata.id);
+    let mut act2_perm_prompts = 0usize;
+
+    while let Some(Ok(env)) = watch.next().await {
+        if env.activation_id.as_ref() != Some(&act2_id) {
+            continue;
+        }
+        match env.event {
+            SessionEvent::PermissionRequested { request } => {
+                act2_perm_prompts += 1;
+                assert_eq!(request.extension_id.as_deref(), Some("file_editor"));
+                let mut responses = BTreeMap::new();
+                responses.insert(
+                    request.id,
+                    PermissionResolutionSpec {
+                        decision: PermissionDecision::AllowOnce,
+                        override_path: None,
+                        responded_at: Utc::now(),
+                    },
+                );
+                client
+                    .patch_activation(
+                        &act2_id,
+                        PatchActivationSpecRequest {
+                            desired_phase: None,
+                            interaction_responses: responses,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            SessionEvent::ActivationCompleted { .. } => break,
+            SessionEvent::ActivationFailed { error, .. } => panic!("act2 failed: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(act2_perm_prompts, 1, "AllowActivation must expire before act2");
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "second write via passive allow_once"
+    );
+
+    // Activation 3: passive AllowOnce did not persist; write_file prompts again -> AllowSession!
+    let act3 = client
+        .create_activation(CreateActivationRequest {
+            activation_id: None,
+            labels: BTreeMap::new(),
+            spec: ActivationSpec {
+                session_id: sess_id.clone(),
+                submission_kind: SubmissionKind::FollowUp,
+                input: vec![Item::user_message("run activation 3")],
+                model_override: None,
+                disabled_tools: vec![],
+                desired_phase: DesiredActivationPhase::Running,
+                interaction_responses: BTreeMap::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let act3_id = ActivationId::new(act3.metadata.id);
+    let mut act3_perm_prompts = 0usize;
+
+    while let Some(Ok(env)) = watch.next().await {
+        if env.activation_id.as_ref() != Some(&act3_id) {
+            continue;
+        }
+        match env.event {
+            SessionEvent::PermissionRequested { request } => {
+                act3_perm_prompts += 1;
+                let mut responses = BTreeMap::new();
+                responses.insert(
+                    request.id,
+                    PermissionResolutionSpec {
+                        decision: PermissionDecision::AllowSession,
+                        override_path: None,
+                        responded_at: Utc::now(),
+                    },
+                );
+                client
+                    .patch_activation(
+                        &act3_id,
+                        PatchActivationSpecRequest {
+                            desired_phase: None,
+                            interaction_responses: responses,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            SessionEvent::ActivationCompleted { .. } => break,
+            SessionEvent::ActivationFailed { error, .. } => panic!("act3 failed: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(act3_perm_prompts, 1, "passive AllowOnce must not persist into act3");
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "third write via allow_session"
+    );
+
+    // Activation 4: AllowSession persisted, so zero prompts!
+    let act4 = client
+        .create_activation(CreateActivationRequest {
+            activation_id: None,
+            labels: BTreeMap::new(),
+            spec: ActivationSpec {
+                session_id: sess_id.clone(),
+                submission_kind: SubmissionKind::FollowUp,
+                input: vec![Item::user_message("run activation 4")],
+                model_override: None,
+                disabled_tools: vec![],
+                desired_phase: DesiredActivationPhase::Running,
+                interaction_responses: BTreeMap::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let act4_id = ActivationId::new(act4.metadata.id);
+    let mut act4_perm_prompts = 0usize;
+
+    while let Some(Ok(env)) = watch.next().await {
+        if env.activation_id.as_ref() != Some(&act4_id) {
+            continue;
+        }
+        match env.event {
+            SessionEvent::PermissionRequested { .. } => {
+                act4_perm_prompts += 1;
+            }
+            SessionEvent::ActivationCompleted { .. } => break,
+            SessionEvent::ActivationFailed { error, .. } => panic!("act4 failed: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(act4_perm_prompts, 0, "AllowSession must persist into act4");
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "fourth write persisted"
+    );
+
+    daemon_cancel.cancel();
+    server_cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_concurrent_reads_same_external_dir_deduplicates_permission_ask() {
+    let editor_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+    );
+    if !editor_wasm.exists() {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws_root = tmp.path().join("ws");
+    let ext_dir = tmp.path().join("external_reads");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    let file_a = ext_dir.join("a.txt");
+    let file_b = ext_dir.join("b.txt");
+    std::fs::write(&file_a, "alpha_content").unwrap();
+    std::fs::write(&file_b, "beta_content").unwrap();
+
+    let store = SqliteStore::open_in_memory().expect("open store");
+    let state = ApiServerState::new(store.clone(), 5_000);
+    let server_cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = serve_tcp(listener, state, server_cancel.clone())
+        .await
+        .expect("serve");
+    let server_url = format!("http://{addr}");
+
+    let script = Arc::new(Mutex::new(vec![
+        make_openresponses_resource(
+            "resp_1",
+            "gpt-4.1",
+            vec![
+                Item::FunctionCall {
+                    id: Some("fc_a".into()),
+                    call_id: "call_read_a".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "path": file_a.to_string_lossy() }).to_string(),
+                    status: None,
+                },
+                Item::FunctionCall {
+                    id: Some("fc_b".into()),
+                    call_id: "call_read_b".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "path": file_b.to_string_lossy() }).to_string(),
+                    status: None,
+                },
+            ],
+            None,
+        ),
+        make_openresponses_resource(
+            "resp_2",
+            "gpt-4.1",
+            vec![Item::assistant_message("Both read.")],
+            None,
+        ),
+    ]));
+
+    let mut cfg = make_daemon_cfg(
+        "node_dedup_ask",
+        &server_url,
+        vec!["gpt-4.1"],
+        tmp.path().join("node_state"),
+    );
+    cfg.executor_mode = ExecutorMode::InProcess;
+    cfg.allowed_workspace_dirs.push(tmp.path().to_path_buf());
+
+    struct DedupAskBackend {
+        script: Arc<Mutex<Vec<openresponses_rust::ResponseResource>>>,
+    }
+    #[async_trait::async_trait]
+    impl ModelBackend for DedupAskBackend {
+        async fn create_response(
+            &self,
+            _endpoint: &ragents_core::ModelEndpointConfig,
+            _request: openresponses_rust::CreateResponseBody,
+        ) -> Result<openresponses_rust::ResponseResource, CoreError> {
+            let mut g = self.script.lock().unwrap();
+            if g.is_empty() {
+                return Err(CoreError::ResponseFailed("no more scripted responses".into()));
+            }
+            Ok(g.remove(0))
+        }
+    }
+
+    let daemon = AgentDaemon::new(cfg).with_model_backend(Arc::new(DedupAskBackend { script }));
+    let daemon_cancel = CancellationToken::new();
+    daemon.start(daemon_cancel.clone()).await.unwrap();
+
+    let client = RagentsClient::new(server_url);
+    let mut watch = client.watch_events(None, 0).await.unwrap();
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_dedup_ask")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_dedup_ask"),
+                    workspace_path: ws_root,
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![ExtensionSpec {
+                    name: "file_editor".into(),
+                    path: editor_wasm.to_string_lossy().into_owned(),
+                    enabled: true,
+                    config: serde_json::json!({}),
+                    allowed_dirs: vec![],
+                    filter_env: vec![],
+                }],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("read both files")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+
+    let sess_id = SessionId::new(created.session.metadata.id);
+    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+
+    let mut prompt_count = 0usize;
+    while let Some(Ok(env)) = watch.next().await {
+        if env.activation_id.as_ref() != Some(&act_id) {
+            continue;
+        }
+        match env.event {
+            SessionEvent::PermissionRequested { request } => {
+                prompt_count += 1;
+                let mut responses = BTreeMap::new();
+                responses.insert(
+                    request.id,
+                    PermissionResolutionSpec {
+                        decision: PermissionDecision::AllowSession,
+                        override_path: None,
+                        responded_at: Utc::now(),
+                    },
+                );
+                client
+                    .patch_activation(
+                        &act_id,
+                        PatchActivationSpecRequest {
+                            desired_phase: None,
+                            interaction_responses: responses,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            SessionEvent::ActivationCompleted { .. } => break,
+            SessionEvent::ActivationFailed { error, .. } => panic!("activation failed: {error}"),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        prompt_count, 1,
+        "concurrent reads in same directory must prompt only once"
+    );
+
+    let ctx = client.get_session_context(&sess_id).await.unwrap();
+    let ctx_json = serde_json::to_string(&ctx.effective_items).unwrap();
+    assert!(ctx_json.contains("alpha_content"), "{ctx_json}");
+    assert!(ctx_json.contains("beta_content"), "{ctx_json}");
+
+    daemon_cancel.cancel();
+    server_cancel.cancel();
+}
+
+#[test]
+fn test_write_covers_read_policy_and_workspace_grant_sync_clears_revokes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let sess_tmp = tmp.path().join("sess_tmp");
+    let ext_dir = tmp.path().join("ext_dir");
+    let ext_locked = ext_dir.join("locked");
+    let ext_secret = ext_dir.join("secret");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&sess_tmp).unwrap();
+    std::fs::create_dir_all(&ext_locked).unwrap();
+    std::fs::create_dir_all(&ext_secret).unwrap();
+
+    let policy = PermissionPolicyLayer {
+        file_read: Some(RuleSet {
+            allow: Some(vec![".".to_string()]),
+            deny: Some(vec![ext_secret.to_string_lossy().into_owned()]),
+            default: Some(DefaultPermissionDecision::Ask),
+        }),
+        file_write: Some(RuleSet {
+            allow: Some(vec![
+                ".".to_string(),
+                ext_dir.to_string_lossy().into_owned(),
+            ]),
+            deny: Some(vec![ext_locked.to_string_lossy().into_owned()]),
+            default: Some(DefaultPermissionDecision::Ask),
+        }),
+        ..Default::default()
+    };
+
+    // FileWrite allows FileRead in normal subdir
+    assert_eq!(
+        crate::permission::evaluate_capability_policy_with_extra_tmp(
+            &policy,
+            &ws,
+            &sess_tmp,
+            &[],
+            &CapabilityRequest::FileRead {
+                path: ext_dir.join("data.txt")
+            },
+        ),
+        crate::permission::PolicyEvalResult::Allow
+    );
+    // Explicit file_read.deny still wins over file_write.allow
+    assert_eq!(
+        crate::permission::evaluate_capability_policy_with_extra_tmp(
+            &policy,
+            &ws,
+            &sess_tmp,
+            &[],
+            &CapabilityRequest::FileRead {
+                path: ext_secret.join("token.txt")
+            },
+        ),
+        crate::permission::PolicyEvalResult::Deny
+    );
+    // file_write.deny blocks write-implied read (falls back to file_read default = Ask)
+    assert_eq!(
+        crate::permission::evaluate_capability_policy_with_extra_tmp(
+            &policy,
+            &ws,
+            &sess_tmp,
+            &[],
+            &CapabilityRequest::FileRead {
+                path: ext_locked.join("notes.txt")
+            },
+        ),
+        crate::permission::PolicyEvalResult::Ask
+    );
+    // FileRead does NOT cover FileWrite
+    let read_only_policy = PermissionPolicyLayer {
+        file_read: Some(RuleSet {
+            allow: Some(vec![ext_dir.to_string_lossy().into_owned()]),
+            deny: None,
+            default: Some(DefaultPermissionDecision::Ask),
+        }),
+        file_write: Some(RuleSet {
+            allow: Some(vec![".".to_string()]),
+            deny: None,
+            default: Some(DefaultPermissionDecision::Ask),
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::permission::evaluate_capability_policy_with_extra_tmp(
+            &read_only_policy,
+            &ws,
+            &sess_tmp,
+            &[],
+            &CapabilityRequest::FileWrite {
+                path: ext_dir.join("out.txt")
+            },
+        ),
+        crate::permission::PolicyEvalResult::Ask
+    );
+
+    // capability_covered_by: FileWrite covers FileRead, FileRead does NOT cover FileWrite
+    assert!(crate::permission::capability_covered_by(
+        &CapabilityRequest::FileWrite {
+            path: ext_dir.clone()
+        },
+        &CapabilityRequest::FileRead {
+            path: ext_dir.join("sub/file.txt")
+        },
+        &ws,
+    ));
+    assert!(!crate::permission::capability_covered_by(
+        &CapabilityRequest::FileRead {
+            path: ext_dir.clone()
+        },
+        &CapabilityRequest::FileWrite {
+            path: ext_dir.join("sub/file.txt")
+        },
+        &ws,
+    ));
+
+    // sync_grants_from_node_spec clears revoked workspace grants
+    let daemon = AgentDaemon::new(make_daemon_cfg(
+        "node_sync_revoke",
+        "http://127.0.0.1:1",
+        vec!["gpt-4.1"],
+        tmp.path().join("node_sync_state"),
+    ));
+    let mut ws_layer = PermissionPolicyLayer::default();
+    ws_layer.grant_capability(&CapabilityRequest::FileWrite {
+        path: ext_dir.clone(),
+    });
+    let mut node_spec = NodeSpec::default();
+    node_spec
+        .workspace_permissions
+        .insert(ws.to_string_lossy().into_owned(), ws_layer);
+    daemon.sync_grants_from_node_spec(&node_spec);
+    assert!(
+        daemon
+            .workspace_grants
+            .lock()
+            .unwrap()
+            .get(&ws)
+            .is_some_and(|v| !v.is_empty())
+    );
+    node_spec.workspace_permissions.clear();
+    daemon.sync_grants_from_node_spec(&node_spec);
+    assert!(daemon.workspace_grants.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_allow_session_write_covers_subsequent_read_without_extra_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let ext_dir = tmp.path().join("ext_rw");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    let target_file = ext_dir.join("notes.txt");
+
+    let editor_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/ragent_file_editor_extension.wasm");
+    if !editor_wasm.exists() {
+        return;
+    }
+
+    let store = SqliteStore::open_in_memory().unwrap();
+    let state = ApiServerState::new(store, 10_000);
+    let server_cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = serve_tcp(listener, state, server_cancel.clone())
+        .await
+        .unwrap();
+    let server_url = format!("http://{addr}");
+    let client = RagentsClient::new(&server_url);
+
+    let mut cfg = make_daemon_cfg(
+        "node_w_covers_r",
+        &server_url,
+        vec!["gpt-4.1"],
+        tmp.path().join("node_state"),
+    );
+    cfg.executor_mode = ExecutorMode::InProcess;
+    cfg.allowed_workspace_dirs.push(tmp.path().to_path_buf());
+
+    let call1 = Item::FunctionCall {
+        id: Some("fc_w".into()),
+        call_id: "call_w".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({
+            "path": target_file.to_string_lossy(),
+            "content": "hello_write_read"
+        })
+        .to_string(),
+        status: None,
+    };
+    let call2 = Item::FunctionCall {
+        id: Some("fc_r".into()),
+        call_id: "call_r".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({
+            "path": target_file.to_string_lossy()
+        })
+        .to_string(),
+        status: None,
+    };
+    let resp1 = make_openresponses_resource("resp_1", "gpt-4.1", vec![call1], None);
+    let resp2 = make_openresponses_resource("resp_2", "gpt-4.1", vec![call2], None);
+    let resp3 = make_openresponses_resource(
+        "resp_3",
+        "gpt-4.1",
+        vec![Item::assistant_message("done")],
+        None,
+    );
+
+    let script = Arc::new(Mutex::new(vec![resp1, resp2, resp3]));
+    struct ScriptedBackend {
+        script: Arc<Mutex<Vec<ResponseResource>>>,
+    }
+    #[async_trait]
+    impl ModelBackend for ScriptedBackend {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            _request: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            let mut g = self.script.lock().unwrap();
+            if g.is_empty() {
+                return Err(CoreError::ResponseFailed("no more scripted responses".into()));
+            }
+            Ok(g.remove(0))
+        }
+    }
+
+    let daemon = AgentDaemon::new(cfg).with_model_backend(Arc::new(ScriptedBackend { script }));
+    let daemon_cancel = CancellationToken::new();
+    daemon.start(daemon_cancel.clone()).await.unwrap();
+
+    let mut watch = client.watch_events(None, 0).await.unwrap();
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: None,
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_w_covers_r"),
+                    workspace_path: ws.clone(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![ExtensionSpec {
+                    name: "file_editor".into(),
+                    path: editor_wasm.to_string_lossy().into_owned(),
+                    enabled: true,
+                    config: serde_json::json!({}),
+                    allowed_dirs: vec![],
+                    filter_env: vec![],
+                }],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("write then read external file")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+
+    let sess_id = SessionId::new(created.session.metadata.id);
+    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+
+    let mut prompt_count = 0usize;
+    while let Some(Ok(env)) = watch.next().await {
+        if env.activation_id.as_ref() != Some(&act_id) {
+            continue;
+        }
+        match env.event {
+            SessionEvent::PermissionRequested { request } => {
+                prompt_count += 1;
+                assert!(
+                    matches!(request.capability, CapabilityRequest::FileWrite { .. }),
+                    "expected FileWrite permission request, got {:?}",
+                    request.capability
+                );
+                let mut responses = BTreeMap::new();
+                responses.insert(
+                    request.id,
+                    PermissionResolutionSpec {
+                        decision: PermissionDecision::AllowSession,
+                        override_path: None,
+                        responded_at: Utc::now(),
+                    },
+                );
+                client
+                    .patch_activation(
+                        &act_id,
+                        PatchActivationSpecRequest {
+                            desired_phase: None,
+                            interaction_responses: responses,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            SessionEvent::ActivationCompleted { .. } => break,
+            SessionEvent::ActivationFailed { error, .. } => panic!("activation failed: {error}"),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        prompt_count, 1,
+        "FileWrite AllowSession must automatically cover subsequent FileRead with no second prompt"
+    );
+
+    let sess_after = client.get_session(&sess_id).await.unwrap().unwrap();
+    assert!(
+        sess_after.spec.permissions.file_read.is_none(),
+        "FileWrite grant must NOT duplicate into session.spec.permissions.file_read: {:?}",
+        sess_after.spec.permissions
+    );
+    assert!(
+        sess_after
+            .spec
+            .permissions
+            .file_write
+            .as_ref()
+            .and_then(|r| r.allow.as_ref())
+            .is_some_and(|a| !a.is_empty())
+    );
+
+    let ctx = client.get_session_context(&sess_id).await.unwrap();
+    let ctx_json = serde_json::to_string(&ctx.effective_items).unwrap();
+    assert!(ctx_json.contains("hello_write_read"), "{ctx_json}");
+
+    daemon_cancel.cancel();
+    server_cancel.cancel();
+}
+
 

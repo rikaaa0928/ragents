@@ -38,6 +38,8 @@ pub enum ProtocolValidationError {
         workspace_path: String,
         allowed: Vec<String>,
     },
+    #[error("disallowed permission decision: {0}")]
+    DisallowedPermissionDecision(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -402,32 +402,67 @@ impl SqliteStore {
         session: &mut Session,
         node: Option<&Node>,
     ) -> bool {
-        let mut changed = session.spec.permissions.prune_redundant();
+        let mut changed = false;
         if let SchedulingMode::Pinned {
             node_id,
             workspace_path,
         } = &session.spec.scheduling
         {
             if let Some(n) = node.filter(|n| n.metadata.id == node_id.as_str()) {
-                changed |= session
-                    .spec
-                    .permissions
-                    .prune_subsumed_by(&n.spec.granted_permissions);
                 let raw_ws = workspace_path.to_string_lossy().into_owned();
                 let norm_ws = normalize_and_resolve_workspace_path(workspace_path)
                     .to_string_lossy()
                     .into_owned();
-                if let Some(ws_pol) = n.spec.workspace_permissions.get(&norm_ws) {
-                    changed |= session.spec.permissions.prune_subsumed_by(ws_pol);
-                }
-                if raw_ws != norm_ws {
-                    if let Some(ws_pol) = n.spec.workspace_permissions.get(&raw_ws) {
-                        changed |= session.spec.permissions.prune_subsumed_by(ws_pol);
+                let ws_pol_norm = n.spec.workspace_permissions.get(&norm_ws);
+                let ws_pol_raw = if raw_ws != norm_ws {
+                    n.spec.workspace_permissions.get(&raw_ws)
+                } else {
+                    None
+                };
+
+                let mut extra_write_denies: Vec<String> = Vec::new();
+                for layer in [
+                    Some(&n.spec.base_permissions),
+                    Some(&n.spec.granted_permissions),
+                    ws_pol_norm,
+                    ws_pol_raw,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(denies) = layer.file_write.as_ref().and_then(|r| r.deny.as_ref()) {
+                        for d in denies {
+                            if !extra_write_denies.contains(d) {
+                                extra_write_denies.push(d.clone());
+                            }
+                        }
                     }
                 }
+
+                changed |= session
+                    .spec
+                    .permissions
+                    .prune_redundant_with_write_denies(&extra_write_denies);
+                changed |= session
+                    .spec
+                    .permissions
+                    .prune_subsumed_by_with_write_denies(&n.spec.granted_permissions, &extra_write_denies);
+                if let Some(ws_pol) = ws_pol_norm {
+                    changed |= session
+                        .spec
+                        .permissions
+                        .prune_subsumed_by_with_write_denies(ws_pol, &extra_write_denies);
+                }
+                if let Some(ws_pol) = ws_pol_raw {
+                    changed |= session
+                        .spec
+                        .permissions
+                        .prune_subsumed_by_with_write_denies(ws_pol, &extra_write_denies);
+                }
+                return changed;
             }
         }
-        changed
+        session.spec.permissions.prune_redundant()
     }
 
     pub(crate) fn prune_session_permissions_in_tx(
@@ -457,9 +492,25 @@ impl SqliteStore {
         mut current_session: Option<&mut Session>,
         force_save_node: bool,
     ) -> Result<(), StoreError> {
-        let mut node_changed = node.spec.granted_permissions.prune_redundant();
+        let mut node_write_denies: Vec<String> = Vec::new();
+        for layer in [&node.spec.base_permissions, &node.spec.granted_permissions] {
+            if let Some(denies) = layer.file_write.as_ref().and_then(|r| r.deny.as_ref()) {
+                for d in denies {
+                    if !node_write_denies.contains(d) {
+                        node_write_denies.push(d.clone());
+                    }
+                }
+            }
+        }
+        let mut node_changed = node
+            .spec
+            .granted_permissions
+            .prune_redundant_with_write_denies(&node_write_denies);
         for ws_pol in node.spec.workspace_permissions.values_mut() {
-            node_changed |= ws_pol.prune_subsumed_by(&node.spec.granted_permissions);
+            node_changed |= ws_pol.prune_subsumed_by_with_write_denies(
+                &node.spec.granted_permissions,
+                &node_write_denies,
+            );
         }
         let ws_before = node.spec.workspace_permissions.len();
         node.spec

@@ -98,6 +98,29 @@ pub fn normalize_violation_to_request_dir(raw_path: &Path) -> PathBuf {
 
     let dir = if raw_path.exists() && raw_path.is_dir() {
         raw_path.to_path_buf()
+    } else if raw_path.exists() {
+        if let Some(parent) = raw_path.parent() {
+            if !parent.as_os_str().is_empty() && !is_broad_top_or_home_dir(parent) {
+                parent.to_path_buf()
+            } else {
+                raw_path.to_path_buf()
+            }
+        } else {
+            raw_path.to_path_buf()
+        }
+    } else if let Some(parent) = raw_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && p.exists())
+    {
+        if !is_broad_top_or_home_dir(parent) {
+            parent.to_path_buf()
+        } else {
+            raw_path.to_path_buf()
+        }
+    } else if let Some(existing_dir) =
+        closest_existing_dir(raw_path).filter(|d| !is_broad_top_or_home_dir(d))
+    {
+        existing_dir
     } else if let Some(parent) = raw_path.parent() {
         if !parent.as_os_str().is_empty() && !is_broad_top_or_home_dir(parent) {
             parent.to_path_buf()
@@ -112,44 +135,77 @@ pub fn normalize_violation_to_request_dir(raw_path: &Path) -> PathBuf {
 }
 
 /// Returns `true` if `dir` is `/` or a user home directory (`/Users/<user>`, `/home/<user>`, `$HOME`)
-/// or top-level mount point (`/Users`, `/home`, `/Volumes`) that must never be auto-suggested as a
+/// or top-level mount point (`/Users`, `/home`, `/Volumes`, `/tmp`) that must never be auto-suggested as a
 /// broad directory grant when a single file directly inside it (e.g. `~/.gitconfig`) is accessed.
-fn is_broad_top_or_home_dir(dir: &Path) -> bool {
+pub(crate) fn is_broad_top_or_home_dir(dir: &Path) -> bool {
+    let norm_dir = canonicalize_with_nonexistent_tail(dir).unwrap_or_else(|| dir.to_path_buf());
     if let Ok(home) = std::env::var("HOME") {
-        if dir == Path::new(&home) {
+        let home_path = Path::new(&home);
+        let norm_home =
+            canonicalize_with_nonexistent_tail(home_path).unwrap_or_else(|| home_path.to_path_buf());
+        if dir == home_path || norm_dir == home_path || norm_dir == norm_home {
             return true;
         }
     }
-    let normal_parts: Vec<String> = dir
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_string_lossy().to_string()),
-            _ => None,
-        })
-        .collect();
-    match normal_parts.len() {
-        0 => true,
-        1 => matches!(
-            normal_parts[0].as_str(),
-            "Users" | "home" | "Volumes" | "root" | "var" | "private"
-        ),
-        2 => matches!(normal_parts[0].as_str(), "Users" | "home" | "Volumes"),
-        _ => false,
+    for candidate in [dir, norm_dir.as_path()] {
+        let normal_parts: Vec<String> = candidate
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+                _ => None,
+            })
+            .collect();
+        let is_broad = match normal_parts.len() {
+            0 => true,
+            1 => matches!(
+                normal_parts[0].as_str(),
+                "Users" | "home" | "Volumes" | "root" | "var" | "private" | "tmp"
+            ),
+            2 => matches!(
+                (normal_parts[0].as_str(), normal_parts[1].as_str()),
+                ("Users", _) | ("home", _) | ("Volumes", _) | ("private", "tmp") | ("var", "home")
+            ),
+            3 => normal_parts[0] == "var" && normal_parts[1] == "home",
+            _ => false,
+        };
+        if is_broad {
+            return true;
+        }
     }
+    false
 }
 
-/// Fast-path extraction of absolute paths from error lines containing `Operation not permitted` / `os error 1`.
-pub(crate) fn extract_eperm_paths_from_text(text: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtractedSandboxErrorPath {
+    pub(crate) path: PathBuf,
+    pub(crate) is_read_only_fs: bool,
+}
+
+/// Fast-path extraction of absolute paths from error lines containing OS sandbox errors:
+/// - `Operation not permitted` / `os error 1` / `不允许的操作` (macOS Seatbelt / EPERM)
+/// - `Read-only file system` / `os error 30` / `只读文件系统` (Linux `bwrap --ro-bind / /` / EROFS)
+pub(crate) fn extract_sandbox_error_paths_from_text(text: &str) -> Vec<ExtractedSandboxErrorPath> {
+    let mut out: Vec<ExtractedSandboxErrorPath> = Vec::new();
     for line in text.lines() {
-        if !line.contains("Operation not permitted") && !line.contains("os error 1") {
+        let is_rofs = line.contains("Read-only file system")
+            || line.contains("os error 30")
+            || line.contains("只读文件系统");
+        let is_eperm = line.contains("Operation not permitted")
+            || line.contains("os error 1")
+            || line.contains("不允许的操作");
+        if !is_rofs && !is_eperm {
             continue;
         }
         for candidate in split_path_candidates(line) {
             if candidate.starts_with('/') && candidate.len() > 1 && !candidate.starts_with("//") {
                 let p = PathBuf::from(candidate);
-                if !out.contains(&p) {
-                    out.push(p);
+                if let Some(existing) = out.iter_mut().find(|item| item.path == p) {
+                    existing.is_read_only_fs |= is_rofs;
+                } else {
+                    out.push(ExtractedSandboxErrorPath {
+                        path: p,
+                        is_read_only_fs: is_rofs,
+                    });
                 }
             }
         }
@@ -161,29 +217,57 @@ fn split_path_candidates(line: &str) -> Vec<&str> {
     let mut candidates = Vec::new();
     for token in line.split_whitespace() {
         let trimmed = token
-            .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ':' | '(' | ')' | ',' | ';'))
-            .trim_end_matches(':');
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '`' | '\''
+                        | '"'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '「'
+                        | '」'
+                        | ':'
+                        | '：'
+                        | '('
+                        | ')'
+                        | ','
+                        | ';'
+                )
+            })
+            .trim_end_matches(&[':', '：'][..]);
         if trimmed.starts_with('/') && trimmed.len() > 1 && !trimmed.starts_with("//") {
             candidates.push(trimmed);
         }
     }
-    for quote in ['`', '\'', '"'] {
+    for (open_q, close_q) in [
+        ('`', '`'),
+        ('\'', '\''),
+        ('"', '"'),
+        ('“', '”'),
+        ('‘', '’'),
+        ('「', '」'),
+    ] {
         let mut rest = line;
-        while let Some(start) = rest.find(quote) {
-            let after_open = &rest[start + 1..];
-            let Some(end) = after_open.find(quote) else {
+        while let Some(start) = rest.find(open_q) {
+            let after_open = &rest[start + open_q.len_utf8()..];
+            let Some(end) = after_open.find(close_q) else {
                 break;
             };
-            let inside = after_open[..end].trim().trim_end_matches(':');
+            let inside = after_open[..end]
+                .trim()
+                .trim_end_matches(&[':', '：'][..]);
             if inside.starts_with('/')
                 && inside.len() > 1
                 && !inside.starts_with("//")
                 && !inside.contains(": ")
+                && !inside.contains("： ")
                 && !candidates.contains(&inside)
             {
                 candidates.push(inside);
             }
-            rest = &after_open[end + 1..];
+            rest = &after_open[end + close_q.len_utf8()..];
         }
     }
     candidates

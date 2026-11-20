@@ -124,6 +124,7 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
 
                 tools.push(serde_json::json!({
                     "enabled": true,
+                    "concurrency_safe": false,
                     "name": "shell",
                     "description": "Execute a shell command on the host system. Supports synchronous blocking execution (wait=true, default) or asynchronous background execution returning process_id and pid (wait=false). For blocking commands, output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file.",
                     "parameters": {
@@ -161,6 +162,7 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
 
                 tools.push(serde_json::json!({
                     "enabled": true,
+                    "concurrency_safe": true,
                     "name": "process_status",
                     "description": "查询由 shell(wait=false) 启动的后台任务进程的运行状态、真实 PID、返回码（exit_code）与运行时长。",
                     "parameters": {
@@ -176,6 +178,7 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
 
                 tools.push(serde_json::json!({
                     "enabled": true,
+                    "concurrency_safe": true,
                     "name": "process_logs",
                     "description": "查询后台任务进程的输出日志，支持单独查看 stdout、stderr 或按时间合并的 combined (stdout+stderr)。",
                     "parameters": {
@@ -209,6 +212,7 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
 
                 tools.push(serde_json::json!({
                     "enabled": true,
+                    "concurrency_safe": false,
                     "name": "process_stop",
                     "description": "主动停止（终止）指定的后台任务进程及其子进程组。",
                     "parameters": {

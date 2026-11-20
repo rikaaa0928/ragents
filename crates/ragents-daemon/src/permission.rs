@@ -23,6 +23,29 @@ pub fn evaluate_capability_policy(
     )
 }
 
+pub fn is_capability_explicitly_denied(
+    policy: &PermissionPolicyLayer,
+    workspace_root: &Path,
+    capability: &CapabilityRequest,
+) -> bool {
+    match capability {
+        CapabilityRequest::FileRead { path } => {
+            is_path_explicitly_denied(policy.file_read.as_ref(), path, workspace_root)
+        }
+        CapabilityRequest::FileWrite { path } => {
+            is_path_explicitly_denied(policy.file_write.as_ref(), path, workspace_root)
+        }
+        CapabilityRequest::CommandWorkDir { work_dir } => {
+            is_path_explicitly_denied(policy.command_work_dir.as_ref(), work_dir, workspace_root)
+        }
+        CapabilityRequest::Http { host, .. } => policy
+            .http_hosts
+            .as_ref()
+            .and_then(|r| r.deny.as_ref())
+            .is_some_and(|denies| denies.iter().any(|r| host_matches(r, host))),
+    }
+}
+
 pub fn evaluate_capability_policy_with_extra_tmp(
     policy: &PermissionPolicyLayer,
     workspace_root: &Path,
@@ -31,13 +54,32 @@ pub fn evaluate_capability_policy_with_extra_tmp(
     capability: &CapabilityRequest,
 ) -> PolicyEvalResult {
     match capability {
-        CapabilityRequest::FileRead { path } => evaluate_path_rules(
-            policy.file_read.as_ref(),
-            path,
-            workspace_root,
-            session_tmp_dir,
-            extra_tmp_dirs,
-        ),
+        CapabilityRequest::FileRead { path } => {
+            if is_path_explicitly_denied(policy.file_read.as_ref(), path, workspace_root) {
+                return PolicyEvalResult::Deny;
+            }
+            let read_eval = evaluate_path_rules(
+                policy.file_read.as_ref(),
+                path,
+                workspace_root,
+                session_tmp_dir,
+                extra_tmp_dirs,
+            );
+            if read_eval == PolicyEvalResult::Allow {
+                return PolicyEvalResult::Allow;
+            }
+            if evaluate_path_rules(
+                policy.file_write.as_ref(),
+                path,
+                workspace_root,
+                session_tmp_dir,
+                extra_tmp_dirs,
+            ) == PolicyEvalResult::Allow
+            {
+                return PolicyEvalResult::Allow;
+            }
+            read_eval
+        }
         CapabilityRequest::FileWrite { path } => evaluate_path_rules(
             policy.file_write.as_ref(),
             path,
@@ -75,6 +117,24 @@ pub fn evaluate_capability_policy_with_extra_tmp(
             }
         }
     }
+}
+
+pub fn is_path_explicitly_denied(
+    rules: Option<&RuleSet<String>>,
+    target_path: &Path,
+    workspace_root: &Path,
+) -> bool {
+    let Some(rule_set) = rules else {
+        return false;
+    };
+    let Some(ref denies) = rule_set.deny else {
+        return false;
+    };
+    let norm_target = normalize_path(target_path, workspace_root);
+    denies.iter().any(|pattern| {
+        let norm_pat = normalize_path(Path::new(pattern), workspace_root);
+        norm_target.starts_with(&norm_pat) || pattern == "*"
+    })
 }
 
 fn evaluate_path_rules(
@@ -152,6 +212,7 @@ pub fn capability_covered_by(
     match (granted, requested) {
         (CapabilityRequest::FileWrite { path: g }, CapabilityRequest::FileWrite { path: r })
         | (CapabilityRequest::FileRead { path: g }, CapabilityRequest::FileRead { path: r })
+        | (CapabilityRequest::FileWrite { path: g }, CapabilityRequest::FileRead { path: r })
         | (
             CapabilityRequest::CommandWorkDir { work_dir: g },
             CapabilityRequest::CommandWorkDir { work_dir: r },

@@ -1661,3 +1661,788 @@ async fn test_extension_filter_env_strips_secrets_from_session_execution() {
     assert_eq!(out.stdout, "SEC=|GLOB=|PUB=visible_val");
 }
 
+#[test]
+fn test_linux_bwrap_rofs_and_multilevel_nonexistent_violation_extraction() {
+    use crate::sandbox::{
+        canonicalize_or_normalize, normalize_violation_to_request_dir, SandboxMode, SandboxState,
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws_root = tmp.path().join("ws");
+    let sess_tmp = tmp.path().join("tmp");
+    let ext_existing = tmp.path().join("models");
+    let ext_already_writable = tmp.path().join("writable_ext");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&sess_tmp).unwrap();
+    std::fs::create_dir_all(&ext_existing).unwrap();
+    std::fs::create_dir_all(&ext_already_writable).unwrap();
+
+    // Multi-level non-existent path inside an existing safe directory resolves to the closest existing safe ancestor
+    let deep_missing = ext_existing.join("sub_a").join("sub_b").join("ckpt.bin");
+    assert_eq!(
+        normalize_violation_to_request_dir(&deep_missing),
+        canonicalize_or_normalize(&ext_existing)
+    );
+
+    let mut policy = PermissionPolicyLayer::default();
+    policy.file_write = Some(RuleSet {
+        deny: None,
+        allow: Some(vec![
+            ".".to_string(),
+            ext_already_writable.to_string_lossy().to_string(),
+        ]),
+        default: Some(DefaultPermissionDecision::Ask),
+    });
+    let sandbox = SandboxState::from_policy(SandboxMode::Auto, &ws_root, &sess_tmp, &policy);
+
+    let missing_file_en = ext_existing.join("out_en.txt");
+    let missing_dir_zh = ext_existing.join("new_dir_zh");
+    let missing_touch_zh = ext_existing.join("sub_a").join("touch_zh.txt");
+    let writable_file = ext_already_writable.join("ok.txt");
+
+    let combined_stderr = format!(
+        "cp: cannot create regular file '{}': Read-only file system\n\
+         mkdir: 无法创建目录 “{}”: 只读文件系统\n\
+         touch: 无法 touch '{}': 只读文件系统\n\
+         touch: cannot touch '{}': Read-only file system\n",
+        missing_file_en.display(),
+        missing_dir_zh.display(),
+        missing_touch_zh.display(),
+        writable_file.display(),
+    );
+
+    let violations = sandbox.extract_violations_from_output(&combined_stderr);
+    assert_eq!(
+        violations.len(),
+        1,
+        "all three non-writable ROFS paths under ext_existing collapse to 1 FileWrite violation and skip writable_ext; got: {violations:?}"
+    );
+    assert_eq!(
+        violations[0].capability,
+        CapabilityRequest::FileWrite {
+            path: canonicalize_or_normalize(&ext_existing)
+        }
+    );
+    assert_eq!(violations[0].operation, "file-write");
+}
+
+#[tokio::test]
+async fn test_permissions_extension_prompt_and_end_to_end_allow_and_deny() {
+    let perms_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/permissions/target/wasm32-wasip2/release/ragent_permissions_extension.wasm",
+    );
+    let file_editor_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+    );
+    if !perms_wasm.exists() || !file_editor_wasm.exists() {
+        return;
+    }
+
+    struct DenyAwareHost {
+        items: Mutex<Vec<Item>>,
+        events: Mutex<Vec<SessionEvent>>,
+        checked: Mutex<Vec<(Option<String>, CapabilityRequest, Option<std::path::PathBuf>, Option<String>)>>,
+        deny_substring: String,
+    }
+
+    #[async_trait]
+    impl CoreHost for DenyAwareHost {
+        async fn load_effective_context(&self) -> Result<Vec<Item>, CoreError> {
+            Ok(self.items.lock().unwrap().clone())
+        }
+
+        async fn commit_model_output(
+            &self,
+            _turn_id: &TurnId,
+            _response_id: Option<String>,
+            items: Vec<Item>,
+            _usage: Option<Usage>,
+        ) -> Result<BatchSeq, CoreError> {
+            self.items.lock().unwrap().extend(items);
+            Ok(BatchSeq::new(1))
+        }
+
+        async fn commit_tool_output(
+            &self,
+            _turn_id: &TurnId,
+            _call_id: &str,
+            _tool_name: &str,
+            _success: bool,
+            _duration_ms: u64,
+            items: Vec<Item>,
+        ) -> Result<BatchSeq, CoreError> {
+            self.items.lock().unwrap().extend(items);
+            Ok(BatchSeq::new(2))
+        }
+
+        async fn emit_event(
+            &self,
+            _turn_id: Option<TurnId>,
+            event: SessionEvent,
+        ) -> Result<(), CoreError> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        async fn check_permission(
+            &self,
+            extension_id: Option<&str>,
+            capability: CapabilityRequest,
+            reason: Option<String>,
+        ) -> Result<PermissionOutcome, CoreError> {
+            self.check_permission_with_original_path(extension_id, capability, None, reason)
+                .await
+        }
+
+        async fn check_permission_with_original_path(
+            &self,
+            extension_id: Option<&str>,
+            capability: CapabilityRequest,
+            original_path: Option<std::path::PathBuf>,
+            reason: Option<String>,
+        ) -> Result<PermissionOutcome, CoreError> {
+            self.checked.lock().unwrap().push((
+                extension_id.map(str::to_string),
+                capability.clone(),
+                original_path,
+                reason,
+            ));
+            let target_str = capability
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if target_str.contains(&self.deny_substring) {
+                return Ok(PermissionOutcome::Denied {
+                    reason: "Denied by user interaction".to_string(),
+                });
+            }
+            Ok(PermissionOutcome::allowed_with(capability, true))
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws_root = tmp.path().join("ws");
+    let ext_dir = tmp.path().join("external_models");
+    let denied_dir = tmp.path().join("forbidden_zone");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    std::fs::create_dir_all(&denied_dir).unwrap();
+
+    let host = Arc::new(DenyAwareHost {
+        items: Mutex::new(vec![Item::user_message("Request external permissions and write a file")]),
+        events: Mutex::new(vec![]),
+        checked: Mutex::new(vec![]),
+        deny_substring: "forbidden_zone".to_string(),
+    });
+
+    let target_file = ext_dir.join("approved.txt");
+    let resp1 = make_openresponses_resource(
+        "resp_p1",
+        "gpt-4.1",
+        vec![
+            Item::FunctionCall {
+                id: Some("fc_p1".to_string()),
+                call_id: "call_p1".to_string(),
+                name: "request_permission".to_string(),
+                arguments: serde_json::json!({
+                    "capability": "file_write",
+                    "target": ext_dir.to_string_lossy(),
+                    "reason": "Need write access to external_models"
+                })
+                .to_string(),
+                status: None,
+            },
+            Item::FunctionCall {
+                id: Some("fc_p2".to_string()),
+                call_id: "call_p2".to_string(),
+                name: "request_permission".to_string(),
+                arguments: serde_json::json!({
+                    "capability": "http",
+                    "target": "https://huggingface.co/models",
+                    "reason": "Need to download model weights"
+                })
+                .to_string(),
+                status: None,
+            },
+            Item::FunctionCall {
+                id: Some("fc_p3".to_string()),
+                call_id: "call_p3".to_string(),
+                name: "request_permission".to_string(),
+                arguments: serde_json::json!({
+                    "capability": "file_write",
+                    "target": denied_dir.to_string_lossy(),
+                    "reason": "Testing denial path"
+                })
+                .to_string(),
+                status: None,
+            },
+        ],
+        None,
+    );
+    let resp2 = make_openresponses_resource(
+        "resp_p2",
+        "gpt-4.1",
+        vec![Item::FunctionCall {
+            id: Some("fc_w1".to_string()),
+            call_id: "call_w1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": target_file.to_string_lossy(),
+                "content": "unlocked via request_permission"
+            })
+            .to_string(),
+            status: None,
+        }],
+        None,
+    );
+    let resp3 = make_openresponses_resource(
+        "resp_p3",
+        "gpt-4.1",
+        vec![Item::assistant_message("Done.")],
+        None,
+    );
+
+    let captured_requests = Arc::new(Mutex::new(Vec::<CreateResponseBody>::new()));
+    struct CapturingModelBackend {
+        responses: Mutex<Vec<ResponseResource>>,
+        captured: Arc<Mutex<Vec<CreateResponseBody>>>,
+    }
+    #[async_trait]
+    impl ModelBackend for CapturingModelBackend {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            request: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            self.captured.lock().unwrap().push(request);
+            let mut guard = self.responses.lock().unwrap();
+            Ok(guard.remove(0))
+        }
+    }
+
+    let model_backend = Arc::new(CapturingModelBackend {
+        responses: Mutex::new(vec![resp1, resp2, resp3]),
+        captured: captured_requests.clone(),
+    });
+
+    let cfg = ConfigRevision::new_merged(
+        "Base prompt.".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![
+            ExtensionSpec {
+                name: "permissions".to_string(),
+                path: perms_wasm.to_string_lossy().to_string(),
+                enabled: true,
+                config: serde_json::json!({}),
+                allowed_dirs: vec![],
+                filter_env: vec![],
+            },
+            ExtensionSpec {
+                name: "file_editor".to_string(),
+                path: file_editor_wasm.to_string_lossy().to_string(),
+                enabled: true,
+                config: serde_json::json!({}),
+                allowed_dirs: vec![],
+                filter_env: vec![],
+            },
+        ],
+    );
+
+    let run_spec = CoreRunSpec {
+        session_id: SessionId::new("sess_perm_ext"),
+        activation_id: ActivationId::new("act_perm_ext"),
+        workspace_root: ws_root,
+        session_tmp_dir: tmp.path().join("tmp"),
+        extra_tmp_dirs: vec![],
+        effective_config: cfg,
+        effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
+        model_endpoint: ModelEndpointConfig {
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            ..Default::default()
+        },
+        max_turns: Some(5),
+    };
+
+    let summary = SubprocessExecutor::default()
+        .execute(run_spec, host.clone(), model_backend, CancellationToken::new())
+        .await
+        .expect("subprocess executor should succeed");
+    assert_eq!(summary.final_text, "Done.");
+
+    // 1. `<permission_guidance>` must be present in the instructions sent to the model
+    let reqs = captured_requests.lock().unwrap();
+    let instr = reqs[0].instructions.as_deref().unwrap_or("");
+    assert!(
+        instr.contains("<permission_guidance>") && instr.contains("request_permission"),
+        "expected <permission_guidance> in instructions: {instr}"
+    );
+
+    // 2. Host received exactly 3 permission checks (all from `permissions` extension);
+    // `file_editor` did NOT trigger a duplicate check because `sandbox_state` synced in worker!
+    let checks = host.checked.lock().unwrap();
+    assert_eq!(checks.len(), 3, "checks: {checks:?}");
+    assert_eq!(checks[0].0.as_deref(), Some("permissions"));
+    assert_eq!(
+        checks[1].1,
+        CapabilityRequest::Http {
+            scheme: "https".to_string(),
+            host: "huggingface.co".to_string(),
+            port: None,
+            method: "GET".to_string(),
+        }
+    );
+    assert!(checks[1].2.is_none(), "Http check should not set original_path");
+
+    // 3. Verify tool outputs include GRANTED, [PERMISSION_DENIED], and written file exists
+    let items_json = serde_json::to_string(&*host.items.lock().unwrap()).unwrap();
+    assert!(items_json.contains("Permission GRANTED"), "{items_json}");
+    assert!(items_json.contains("[PERMISSION_DENIED]"), "{items_json}");
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "unlocked via request_permission"
+    );
+}
+
+#[test]
+fn test_partition_tool_call_batches_read_read_write_read() {
+    use crate::runner::{partition_tool_call_batches, ToolCallBatch};
+
+    assert_eq!(
+        partition_tool_call_batches(&[true, true, false, true], 10),
+        vec![
+            ToolCallBatch::Concurrent(vec![0, 1]),
+            ToolCallBatch::Sequential(2),
+            ToolCallBatch::Concurrent(vec![3]),
+        ]
+    );
+
+    assert_eq!(partition_tool_call_batches(&[], 10), vec![]);
+
+    assert_eq!(
+        partition_tool_call_batches(&[false, false], 10),
+        vec![ToolCallBatch::Sequential(0), ToolCallBatch::Sequential(1)]
+    );
+
+    assert_eq!(
+        partition_tool_call_batches(&[true, true, true, true, true], 2),
+        vec![
+            ToolCallBatch::Concurrent(vec![0, 1]),
+            ToolCallBatch::Concurrent(vec![2, 3]),
+            ToolCallBatch::Concurrent(vec![4]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_wasm_plugin_concurrent_invoke_pooling_runs_in_parallel() {
+    let sh_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/session_history/target/wasm32-wasip2/release/ragent_session_history_extension.wasm",
+    );
+    if !sh_wasm.exists() {
+        return;
+    }
+
+    struct BarrierHost {
+        barrier: tokio::sync::Barrier,
+    }
+
+    #[async_trait]
+    impl CoreHost for BarrierHost {
+        async fn load_effective_context(&self) -> Result<Vec<Item>, CoreError> {
+            Ok(vec![])
+        }
+        async fn commit_model_output(
+            &self,
+            _turn_id: &TurnId,
+            _response_id: Option<String>,
+            _items: Vec<Item>,
+            _usage: Option<Usage>,
+        ) -> Result<BatchSeq, CoreError> {
+            Ok(BatchSeq::new(1))
+        }
+        async fn commit_tool_output(
+            &self,
+            _turn_id: &TurnId,
+            _call_id: &str,
+            _tool_name: &str,
+            _success: bool,
+            _duration_ms: u64,
+            _items: Vec<Item>,
+        ) -> Result<BatchSeq, CoreError> {
+            Ok(BatchSeq::new(1))
+        }
+        async fn emit_event(
+            &self,
+            _turn_id: Option<TurnId>,
+            _event: SessionEvent,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn check_permission(
+            &self,
+            _extension_id: Option<&str>,
+            _capability: CapabilityRequest,
+            _reason: Option<String>,
+        ) -> Result<PermissionOutcome, CoreError> {
+            Ok(PermissionOutcome::allowed())
+        }
+        async fn query_session_history(
+            &self,
+            _request: SessionHistoryQueryRequest,
+        ) -> Result<SessionHistoryQueryResponse, CoreError> {
+            tokio::time::timeout(std::time::Duration::from_secs(3), self.barrier.wait())
+                .await
+                .expect("two pooled WasmPlugin invocations must reach barrier concurrently");
+            Ok(SessionHistoryQueryResponse {
+                ok: true,
+                workspace_scope: Some("/tmp".into()),
+                ..Default::default()
+            })
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let host: Arc<dyn CoreHost> = Arc::new(BarrierHost {
+        barrier: tokio::sync::Barrier::new(2),
+    });
+    let sandbox = Arc::new(SandboxState::from_policy(
+        SandboxMode::Auto,
+        tmp.path(),
+        tmp.path(),
+        &PermissionPolicyLayer::default(),
+    ));
+    let plugin = crate::hooks::runtime::WasmPlugin::load_from_file_with_host(
+        "session_history",
+        &sh_wasm,
+        tmp.path(),
+        &[tmp.path().to_path_buf()],
+        Some(host),
+        sandbox,
+    )
+    .await
+    .expect("load session_history wasm");
+    plugin.initialize(&serde_json::Value::Null).await.unwrap();
+
+    let req1 = HookRequest {
+        hook: HOOK_TOOLS_CALL.into(),
+        protocol_version: 1,
+        invocation_id: 1,
+        iteration: Some(1),
+        payload: serde_json::json!({
+            "call_id": "c1",
+            "tool_id": "t1",
+            "name": "session_history_list",
+            "arguments": {}
+        }),
+    };
+    let req2 = HookRequest {
+        hook: HOOK_TOOLS_CALL.into(),
+        protocol_version: 1,
+        invocation_id: 2,
+        iteration: Some(1),
+        payload: serde_json::json!({
+            "call_id": "c2",
+            "tool_id": "t1",
+            "name": "session_history_list",
+            "arguments": {}
+        }),
+    };
+
+    let (r1, r2) = tokio::join!(plugin.invoke(&req1), plugin.invoke(&req2));
+    assert!(r1.is_ok(), "r1 failed: {r1:?}");
+    assert!(r2.is_ok(), "r2 failed: {r2:?}");
+    plugin.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_in_process_executor_batches_read_read_write_read_in_order() {
+    let sh_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/session_history/target/wasm32-wasip2/release/ragent_session_history_extension.wasm",
+    );
+    let editor_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+    );
+    if !sh_wasm.exists() || !editor_wasm.exists() {
+        return;
+    }
+
+    struct BatchTestHost {
+        items: Mutex<Vec<Item>>,
+        timeline: Mutex<Vec<String>>,
+        read_barrier: tokio::sync::Barrier,
+    }
+
+    #[async_trait]
+    impl CoreHost for BatchTestHost {
+        async fn load_effective_context(&self) -> Result<Vec<Item>, CoreError> {
+            Ok(self.items.lock().unwrap().clone())
+        }
+        async fn commit_model_output(
+            &self,
+            _turn_id: &TurnId,
+            _response_id: Option<String>,
+            items: Vec<Item>,
+            _usage: Option<Usage>,
+        ) -> Result<BatchSeq, CoreError> {
+            self.items.lock().unwrap().extend(items);
+            Ok(BatchSeq::new(1))
+        }
+        async fn commit_tool_output(
+            &self,
+            _turn_id: &TurnId,
+            call_id: &str,
+            tool_name: &str,
+            _success: bool,
+            _duration_ms: u64,
+            items: Vec<Item>,
+        ) -> Result<BatchSeq, CoreError> {
+            self.timeline
+                .lock()
+                .unwrap()
+                .push(format!("commit:{call_id}:{tool_name}"));
+            self.items.lock().unwrap().extend(items);
+            Ok(BatchSeq::new(2))
+        }
+        async fn emit_event(
+            &self,
+            _turn_id: Option<TurnId>,
+            event: SessionEvent,
+        ) -> Result<(), CoreError> {
+            if let SessionEvent::ToolCallStarted { call_id, name } = event {
+                self.timeline
+                    .lock()
+                    .unwrap()
+                    .push(format!("start:{call_id}:{name}"));
+            }
+            Ok(())
+        }
+        async fn check_permission(
+            &self,
+            _extension_id: Option<&str>,
+            _capability: CapabilityRequest,
+            _reason: Option<String>,
+        ) -> Result<PermissionOutcome, CoreError> {
+            Ok(PermissionOutcome::allowed())
+        }
+        async fn query_session_history(
+            &self,
+            _request: SessionHistoryQueryRequest,
+        ) -> Result<SessionHistoryQueryResponse, CoreError> {
+            tokio::time::timeout(std::time::Duration::from_secs(3), self.read_barrier.wait())
+                .await
+                .expect("two reads in Batch 1 must run concurrently");
+            Ok(SessionHistoryQueryResponse {
+                ok: true,
+                workspace_scope: Some("ws".into()),
+                ..Default::default()
+            })
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws_root = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    let target_file = ws_root.join("batch_note.txt");
+
+    let host = Arc::new(BatchTestHost {
+        items: Mutex::new(vec![Item::user_message("run read, read, write, read")]),
+        timeline: Mutex::new(Vec::new()),
+        read_barrier: tokio::sync::Barrier::new(2),
+    });
+
+    // Turn 1: [read(session_history_list), read(session_history_list), write(write_file), read(read_file)]
+    let resp1 = make_openresponses_resource(
+        "resp_batch_1",
+        "gpt-4.1",
+        vec![
+            Item::FunctionCall {
+                id: None,
+                call_id: "c0_read1".into(),
+                name: "session_history_list".into(),
+                arguments: "{}".into(),
+                status: None,
+            },
+            Item::FunctionCall {
+                id: None,
+                call_id: "c1_read2".into(),
+                name: "session_history_list".into(),
+                arguments: "{}".into(),
+                status: None,
+            },
+            Item::FunctionCall {
+                id: None,
+                call_id: "c2_write".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": target_file.to_string_lossy(),
+                    "content": "written_in_batch_2"
+                })
+                .to_string(),
+                status: None,
+            },
+            Item::FunctionCall {
+                id: None,
+                call_id: "c3_read3".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({
+                    "path": target_file.to_string_lossy()
+                })
+                .to_string(),
+                status: None,
+            },
+        ],
+        None,
+    );
+    let resp2 = make_openresponses_resource(
+        "resp_batch_2",
+        "gpt-4.1",
+        vec![Item::assistant_message("All 3 batches done.")],
+        None,
+    );
+
+    let cfg = ConfigRevision::new_merged(
+        "Base.".into(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![
+            ExtensionSpec {
+                name: "session_history".into(),
+                path: sh_wasm.to_string_lossy().into_owned(),
+                enabled: true,
+                config: serde_json::json!({}),
+                allowed_dirs: vec![],
+                filter_env: vec![],
+            },
+            ExtensionSpec {
+                name: "file_editor".into(),
+                path: editor_wasm.to_string_lossy().into_owned(),
+                enabled: true,
+                config: serde_json::json!({}),
+                allowed_dirs: vec![],
+                filter_env: vec![],
+            },
+        ],
+    );
+
+    let run_spec = CoreRunSpec {
+        session_id: SessionId::new("sess_batch"),
+        activation_id: ActivationId::new("act_batch"),
+        workspace_root: ws_root,
+        session_tmp_dir: tmp.path().join("tmp"),
+        extra_tmp_dirs: vec![],
+        effective_config: cfg,
+        effective_permissions: PermissionPolicyLayer::default(),
+        disabled_tools: vec![],
+        model_endpoint: ModelEndpointConfig {
+            base_url: "http://127.0.0.1:9999/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        },
+        max_turns: Some(4),
+    };
+
+    let model = Arc::new(MockModelBackend {
+        responses: Mutex::new(vec![resp1, resp2]),
+    });
+
+    let summary = InProcessExecutor
+        .execute(run_spec, host.clone(), model, CancellationToken::new())
+        .await
+        .expect("batched executor should succeed");
+    assert_eq!(summary.final_text, "All 3 batches done.");
+
+    let timeline = host.timeline.lock().unwrap().clone();
+    assert_eq!(
+        timeline,
+        vec![
+            // Batch 1 (concurrent)
+            "start:c0_read1:session_history_list",
+            "start:c1_read2:session_history_list",
+            "commit:c0_read1:session_history_list",
+            "commit:c1_read2:session_history_list",
+            // Batch 2 (sequential write)
+            "start:c2_write:write_file",
+            "commit:c2_write:write_file",
+            // Batch 3 (read after write)
+            "start:c3_read3:read_file",
+            "commit:c3_read3:read_file",
+        ],
+        "unexpected batch execution timeline: {timeline:?}"
+    );
+
+    let items = host.items.lock().unwrap();
+    let outputs: Vec<(String, String)> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::FunctionCallOutput {
+                call_id, output, ..
+            } => Some((call_id.clone(), format!("{output:?}"))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outputs.len(), 4);
+    assert_eq!(outputs[0].0, "c0_read1");
+    assert_eq!(outputs[1].0, "c1_read2");
+    assert_eq!(outputs[2].0, "c2_write");
+    assert_eq!(outputs[3].0, "c3_read3");
+    assert!(
+        outputs[3].1.contains("written_in_batch_2"),
+        "Batch 3 read_file must observe Batch 2 write_file output: {:?}",
+        outputs[3]
+    );
+}
+
+#[test]
+fn test_sandbox_writable_implies_readable_respecting_denies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let ext_write = tmp.path().join("ext_write");
+    let ext_write_locked = ext_write.join("locked");
+    let ext_secret = ext_write.join("secret");
+    let ws_secret = ws.join(".env");
+    std::fs::create_dir_all(&ext_write_locked).unwrap();
+    std::fs::create_dir_all(&ext_secret).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(&ws_secret, "SECRET=1").unwrap();
+
+    let policy = PermissionPolicyLayer {
+        file_read: Some(RuleSet {
+            allow: Some(vec![".".to_string()]),
+            deny: Some(vec![
+                ws_secret.to_string_lossy().into_owned(),
+                ext_secret.to_string_lossy().into_owned(),
+            ]),
+            default: Some(DefaultPermissionDecision::Ask),
+        }),
+        file_write: Some(RuleSet {
+            allow: Some(vec![
+                ".".to_string(),
+                ext_write.to_string_lossy().into_owned(),
+            ]),
+            deny: Some(vec![ext_write_locked.to_string_lossy().into_owned()]),
+            default: Some(DefaultPermissionDecision::Ask),
+        }),
+        ..Default::default()
+    };
+
+    let sess_tmp = tmp.path().join("sess_tmp");
+    std::fs::create_dir_all(&sess_tmp).unwrap();
+    let sandbox = SandboxState::from_policy_with_extra_tmp(
+        SandboxMode::Auto,
+        &ws,
+        &sess_tmp,
+        &[],
+        &policy,
+    );
+
+    assert!(sandbox.is_path_writable(&ext_write.join("a.txt")));
+    assert!(sandbox.is_path_readable(&ext_write.join("a.txt")));
+    assert!(!sandbox.is_path_writable(&ext_write_locked.join("b.txt")));
+    assert!(!sandbox.is_path_readable(&ext_write_locked.join("b.txt")));
+    assert!(!sandbox.is_path_readable(&ext_secret.join("k.txt")));
+    assert!(sandbox.is_read_denied(&ws_secret));
+    assert!(!sandbox.is_path_readable(&ws_secret));
+}
+
+

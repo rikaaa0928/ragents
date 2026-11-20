@@ -151,6 +151,15 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_mode_placeholder: Option<String>,
+    /// Tool-level static declaration indicating whether invocations are read-only /
+    /// side-effect free and safe to run concurrently with other concurrency-safe calls.
+    /// Defaults to `false` (conservative sequential execution).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub concurrency_safe: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +168,10 @@ pub struct ToolCallRequest {
     pub tool_id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Optional call-level override for concurrency safety (can be mutated in `tool.call.prepare`).
+    /// When `None`, falls back to `ToolDefinition.concurrency_safe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_safe: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

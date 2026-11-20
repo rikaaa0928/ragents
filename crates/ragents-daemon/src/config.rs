@@ -936,6 +936,7 @@ impl DaemonConfig {
                 }
             }
         }
+        effective_permissions.prune_redundant();
 
         let config_rev = ConfigRevision::new_merged_with_parts(
             prompt_parts,
@@ -947,21 +948,6 @@ impl DaemonConfig {
         let perm_snap = PermissionSnapshot::from_effective_policy(effective_permissions);
 
         Ok((config_rev, perm_snap, endpoint))
-    }
-}
-
-pub fn merge_permission_layers(
-    base: &PermissionPolicyLayer,
-    override_layer: &PermissionPolicyLayer,
-) -> PermissionPolicyLayer {
-    PermissionPolicyLayer {
-        file_read: merge_rule_set(base.file_read.as_ref(), override_layer.file_read.as_ref()),
-        file_write: merge_rule_set(base.file_write.as_ref(), override_layer.file_write.as_ref()),
-        http_hosts: merge_rule_set(base.http_hosts.as_ref(), override_layer.http_hosts.as_ref()),
-        command_work_dir: merge_rule_set(
-            base.command_work_dir.as_ref(),
-            override_layer.command_work_dir.as_ref(),
-        ),
     }
 }
 
@@ -986,22 +972,6 @@ pub fn ensure_builtin_path_whitelist(policy: &mut PermissionPolicyLayer) {
                 }
             }
         }
-    }
-}
-
-fn merge_rule_set<R: Clone>(
-    base: Option<&RuleSet<R>>,
-    over: Option<&RuleSet<R>>,
-) -> Option<RuleSet<R>> {
-    match (base, over) {
-        (None, None) => None,
-        (Some(b), None) => Some(b.clone()),
-        (None, Some(o)) => Some(o.clone()),
-        (Some(b), Some(o)) => Some(RuleSet {
-            deny: o.deny.clone().or_else(|| b.deny.clone()),
-            allow: o.allow.clone().or_else(|| b.allow.clone()),
-            default: o.default.or(b.default),
-        }),
     }
 }
 
