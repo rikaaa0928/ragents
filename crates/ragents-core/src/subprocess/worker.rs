@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub async fn run_subprocess_worker(ipc_addr: &str, ipc_token: &str) -> Result<(), CoreError> {
+    crate::ensure_rustls_crypto_provider();
     let (reader, mut writer) = connect_ipc_stream(ipc_addr).await?;
     let mut lines = BufReader::new(reader).lines();
 

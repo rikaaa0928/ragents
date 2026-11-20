@@ -7,6 +7,12 @@ pub use tunnel::*;
 
 use thiserror::Error;
 
+/// Ensures a process-wide default `rustls` `CryptoProvider` is installed before
+/// `tokio-tungstenite` or other `rustls::ClientConfig::builder()` callers run.
+pub fn ensure_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("http error: {0}")]

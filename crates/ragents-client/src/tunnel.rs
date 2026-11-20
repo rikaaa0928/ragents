@@ -791,6 +791,7 @@ pub async fn connect_daemon_tunnel_with_token(
             req.headers_mut().insert("Authorization", val);
         }
     }
+    crate::ensure_rustls_crypto_provider();
     let (ws_stream, _) = connect_async(req)
         .await
         .map_err(|e| ClientError::WebSocket(Box::new(e)))?;

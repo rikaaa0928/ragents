@@ -28,6 +28,7 @@ bytes.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]

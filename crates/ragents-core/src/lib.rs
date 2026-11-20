@@ -21,5 +21,11 @@ pub use runner::*;
 pub use sandbox::*;
 pub use subprocess::*;
 
+/// Ensures a process-wide default `rustls` `CryptoProvider` is installed before
+/// `wasmtime-wasi-http` or other `rustls::ClientConfig::builder()` callers run.
+pub fn ensure_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[cfg(test)]
 mod tests;

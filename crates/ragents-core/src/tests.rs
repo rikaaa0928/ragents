@@ -2445,4 +2445,58 @@ fn test_sandbox_writable_implies_readable_respecting_denies() {
     assert!(!sandbox.is_path_readable(&ws_secret));
 }
 
+#[tokio::test]
+async fn test_wasi_https_does_not_panic_on_rustls_crypto_provider() {
+    crate::ensure_rustls_crypto_provider();
+    assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+
+    let editor_wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm");
+    if !editor_wasm_path.exists() {
+        return;
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept_task = tokio::spawn(async move {
+        if let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    });
+
+    let base_tmp = std::env::temp_dir().join(format!("ragents-wasi-https-{}", uuid::Uuid::now_v7()));
+    let ws_root = base_tmp.join("ws");
+    let sess_tmp = base_tmp.join("tmp");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&sess_tmp).unwrap();
+
+    let host = Arc::new(MockCoreHost::default());
+    let sandbox = Arc::new(SandboxState::from_policy(
+        SandboxMode::Auto,
+        &ws_root,
+        &sess_tmp,
+        &PermissionPolicyLayer::default(),
+    ));
+    let plugin = crate::hooks::runtime::WasmPlugin::load_from_file_with_host(
+        "file_editor",
+        &editor_wasm_path,
+        &ws_root,
+        &[sess_tmp],
+        Some(host),
+        sandbox,
+    )
+    .await
+    .unwrap();
+
+    // Connecting to a non-TLS local TCP listener over https:// must return a clean TLS/transport error
+    // rather than panicking inside `rustls::ClientConfig::builder()`.
+    let res = plugin
+        .invoke_wasi_http_for_test("GET", &format!("https://{addr}/ping"))
+        .await;
+    assert!(res.is_err(), "expected clean TLS error instead of {res:?}");
+
+    let _ = accept_task.await;
+    let _ = std::fs::remove_dir_all(&base_tmp);
+}
+
 

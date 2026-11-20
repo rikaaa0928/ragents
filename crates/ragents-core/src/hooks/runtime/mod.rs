@@ -26,6 +26,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 static SHARED_ENGINE: OnceLock<Engine> = OnceLock::new();
 
 fn global_engine() -> Result<&'static Engine, CoreError> {
+    crate::ensure_rustls_crypto_provider();
     if let Some(engine) = SHARED_ENGINE.get() {
         return Ok(engine);
     }

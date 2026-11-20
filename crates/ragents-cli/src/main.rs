@@ -6,6 +6,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    ragents_core::ensure_rustls_crypto_provider();
     let cli = Cli::parse();
     run_cli(cli).await
 }

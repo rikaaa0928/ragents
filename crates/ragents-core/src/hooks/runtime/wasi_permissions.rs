@@ -43,6 +43,7 @@ impl WasiHttpHooks for HostHttpHooks {
             > + Send,
     > {
         _ = fut;
+        crate::ensure_rustls_crypto_provider();
         let mut opts = options.unwrap_or_default();
         opts.connect_timeout = Some(
             opts.connect_timeout

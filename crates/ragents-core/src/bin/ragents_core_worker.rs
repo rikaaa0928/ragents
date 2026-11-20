@@ -5,6 +5,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    ragents_core::ensure_rustls_crypto_provider();
     let mut args = std::env::args().skip(1);
     let mut ipc_addr = None;
     let mut ipc_token = None;

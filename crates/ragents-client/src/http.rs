@@ -15,6 +15,7 @@ pub struct RagentsClient {
 
 impl RagentsClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        crate::ensure_rustls_crypto_provider();
         let raw = base_url.into();
         let trimmed = raw.trim_end_matches('/').to_string();
         Self {
