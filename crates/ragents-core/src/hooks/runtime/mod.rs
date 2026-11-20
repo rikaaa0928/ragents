@@ -19,7 +19,7 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p2::bindings::filesystem::{preopens as wasi_preopens, types as wasi_fs_types};
 use wasmtime_wasi::{
-    DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+    FsPerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
@@ -29,8 +29,7 @@ fn global_engine() -> Result<&'static Engine, CoreError> {
     if let Some(engine) = SHARED_ENGINE.get() {
         return Ok(engine);
     }
-    let mut config = Config::new();
-    config.async_support(true);
+    let config = Config::new();
     let engine = Engine::new(&config).map_err(tool_error)?;
     let _ = SHARED_ENGINE.set(engine);
     SHARED_ENGINE
@@ -46,7 +45,7 @@ fn load_or_precompile_component(engine: &Engine, path: &Path) -> Result<Componen
     })?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"wasmtime-37-component-v2:");
+    hasher.update(b"wasmtime-50-component-v2:");
     hasher.update(std::env::consts::OS.as_bytes());
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(&wasm_bytes);
@@ -91,6 +90,7 @@ wasmtime::component::bindgen!({
 pub(crate) struct HostState {
     pub(crate) wasi_ctx: WasiCtx,
     pub(crate) http_ctx: WasiHttpCtx,
+    pub(crate) http_hooks: wasi_permissions::HostHttpHooks,
     pub(crate) table: ResourceTable,
     pub(crate) plugin_name: String,
     pub(crate) workspace_root: PathBuf,
@@ -508,7 +508,7 @@ impl WasmPlugin {
 
         let mut linker = Linker::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(tool_error)?;
-        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker).map_err(tool_error)?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(tool_error)?;
 
         linker.allow_shadowing(true);
         wasi_preopens::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |state| state)
@@ -559,20 +559,10 @@ impl WasmPlugin {
         let mut wasi_builder = WasiCtxBuilder::new();
         wasi_builder.inherit_stdout().inherit_stderr();
 
-        let _ = wasi_builder.preopened_dir(
-            &self.workspace_root,
-            ".",
-            DirPerms::all(),
-            FilePerms::all(),
-        );
+        let _ = wasi_builder.preopened_dir(&self.workspace_root, ".", FsPerms::ReadWrite);
         if let Some(ws_str) = self.workspace_root.to_str() {
             wasi_builder.env("PWD", ws_str);
-            let _ = wasi_builder.preopened_dir(
-                &self.workspace_root,
-                ws_str,
-                DirPerms::all(),
-                FilePerms::all(),
-            );
+            let _ = wasi_builder.preopened_dir(&self.workspace_root, ws_str, FsPerms::ReadWrite);
         }
 
         if let Ok(home_str) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
@@ -582,18 +572,12 @@ impl WasmPlugin {
         for dir in &self.preopen_dirs {
             if dir.exists() {
                 if let Some(dir_str) = dir.to_str() {
-                    let _ =
-                        wasi_builder.preopened_dir(dir, dir_str, DirPerms::all(), FilePerms::all());
+                    let _ = wasi_builder.preopened_dir(dir, dir_str, FsPerms::ReadWrite);
                 }
                 if let Ok(canon) = dir.canonicalize() {
                     if canon != *dir {
                         if let Some(canon_str) = canon.to_str() {
-                            let _ = wasi_builder.preopened_dir(
-                                &canon,
-                                canon_str,
-                                DirPerms::all(),
-                                FilePerms::all(),
-                            );
+                            let _ = wasi_builder.preopened_dir(&canon, canon_str, FsPerms::ReadWrite);
                         }
                     }
                 }
@@ -601,7 +585,7 @@ impl WasmPlugin {
         }
         #[cfg(unix)]
         if self.core_host.is_some() {
-            let _ = wasi_builder.preopened_dir("/", "/", DirPerms::all(), FilePerms::all());
+            let _ = wasi_builder.preopened_dir("/", "/", FsPerms::ReadWrite);
         }
 
         wasi_builder.allow_ip_name_lookup(true);
@@ -668,6 +652,10 @@ impl WasmPlugin {
         HostState {
             wasi_ctx: wasi_builder.build(),
             http_ctx: WasiHttpCtx::new(),
+            http_hooks: wasi_permissions::HostHttpHooks {
+                core_host: self.core_host.clone(),
+                plugin_name: self.name.clone(),
+            },
             table: ResourceTable::new(),
             plugin_name: self.name.clone(),
             workspace_root: self.workspace_root.clone(),
@@ -818,31 +806,32 @@ impl WasmPlugin {
         use http_body_util::{BodyExt, Empty};
         let mut runtime = self.acquire_runtime().await?;
         let parsed: hyper::Uri = url.parse().map_err(tool_error)?;
-        let use_tls = parsed.scheme_str() == Some("https");
         let empty_body = Empty::<bytes::Bytes>::new()
             .map_err(|never| match never {})
-            .boxed();
+            .boxed_unsync();
         let req = hyper::Request::builder()
             .method(method)
             .uri(parsed)
             .body(empty_body)
             .map_err(tool_error)?;
-        let cfg = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls,
-            connect_timeout: std::time::Duration::from_secs(10),
-            first_byte_timeout: std::time::Duration::from_secs(10),
-            between_bytes_timeout: std::time::Duration::from_secs(10),
+        let opts = wasmtime_wasi_http::RequestOptions {
+            connect_timeout: Some(std::time::Duration::from_secs(10)),
+            first_byte_timeout: Some(std::time::Duration::from_secs(10)),
+            between_bytes_timeout: Some(std::time::Duration::from_secs(10)),
         };
-        let mut fut_resp = WasiHttpView::send_request(runtime.store.data_mut(), req, cfg)
-            .map_err(|e| CoreError::ToolError(e.to_string()))?;
-        wasmtime_wasi::p2::Pollable::ready(&mut fut_resp).await;
-        let incoming = fut_resp
-            .unwrap_ready()
-            .map_err(tool_error)?
-            .map_err(|code| CoreError::ToolError(format!("WASI HTTP error: {code:?}")))?;
-        let status = incoming.resp.status().as_u16();
-        let body_bytes = incoming
-            .resp
+        let fut_resp = {
+            let view = WasiHttpView::http(runtime.store.data_mut());
+            std::pin::Pin::from(view.hooks.send_request(
+                req,
+                Some(opts),
+                Box::new(async { Ok(()) }),
+            ))
+        };
+        let (resp, _io) = fut_resp
+            .await
+            .map_err(|err| CoreError::ToolError(format!("WASI HTTP error: {err:?}")))?;
+        let status = resp.status().as_u16();
+        let body_bytes = resp
             .into_body()
             .collect()
             .await

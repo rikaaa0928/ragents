@@ -1,40 +1,72 @@
 use super::HostState;
-use crate::host::PermissionOutcome;
+use crate::host::{CoreHost, PermissionOutcome};
+use http_body_util::BodyExt;
 use ragents_protocol::CapabilityRequest;
+use std::future::Future;
 use std::path::{Component as PathComponent, Path, PathBuf};
+use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::filesystem::{WasiFilesystemCtxView, WasiFilesystemView as _};
 use wasmtime_wasi::p2::bindings::filesystem::{preopens as wasi_preopens, types as wasi_fs_types};
 use wasmtime_wasi::p2::{DynInputStream, DynOutputStream, FsError, FsResult};
-use wasmtime_wasi::ResourceTable;
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::{
+    RequestOptions, WasiHttpCtxView, WasiHttpHooks, WasiHttpView, WasiBody,
+};
+
+pub(crate) struct HostHttpHooks {
+    pub(crate) core_host: Option<Arc<dyn CoreHost>>,
+    pub(crate) plugin_name: String,
+}
 
 impl WasiHttpView for HostState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        &mut self.http_ctx
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
     }
+}
 
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-
+impl WasiHttpHooks for HostHttpHooks {
     fn send_request(
         &mut self,
-        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        mut config: wasmtime_wasi_http::types::OutgoingRequestConfig,
-    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
-        config.connect_timeout = config
-            .connect_timeout
-            .max(std::time::Duration::from_secs(30));
-        config.first_byte_timeout = config
-            .first_byte_timeout
-            .max(std::time::Duration::from_secs(600));
-        config.between_bytes_timeout = config
-            .between_bytes_timeout
-            .max(std::time::Duration::from_secs(600));
+        request: hyper::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        fut: Box<dyn Future<Output = wasmtime_wasi_http::Result<(), wasmtime_wasi_http::Error>> + Send>,
+    ) -> Box<
+        dyn Future<
+                Output = wasmtime_wasi_http::Result<(
+                    hyper::Response<WasiBody>,
+                    Box<dyn Future<Output = wasmtime_wasi_http::Result<(), wasmtime_wasi_http::Error>> + Send>,
+                )>,
+            > + Send,
+    > {
+        _ = fut;
+        let mut opts = options.unwrap_or_default();
+        opts.connect_timeout = Some(
+            opts.connect_timeout
+                .unwrap_or_default()
+                .max(std::time::Duration::from_secs(30)),
+        );
+        opts.first_byte_timeout = Some(
+            opts.first_byte_timeout
+                .unwrap_or_default()
+                .max(std::time::Duration::from_secs(600)),
+        );
+        opts.between_bytes_timeout = Some(
+            opts.between_bytes_timeout
+                .unwrap_or_default()
+                .max(std::time::Duration::from_secs(600)),
+        );
         let core_host = self.core_host.clone();
         let plugin_name = self.plugin_name.clone();
-        let scheme = if config.use_tls { "https" } else { "http" }.to_string();
+        let scheme = request
+            .uri()
+            .scheme_str()
+            .unwrap_or("https")
+            .to_ascii_lowercase();
+        let use_tls = scheme == "https";
         let host_str = request
             .uri()
             .host()
@@ -43,13 +75,13 @@ impl WasiHttpView for HostState {
         let port = request
             .uri()
             .port_u16()
-            .or(Some(if config.use_tls { 443 } else { 80 }));
+            .or(Some(if use_tls { 443 } else { 80 }));
         let method_str = request.method().as_str().to_ascii_uppercase();
         let full_url = request.uri().to_string();
         let is_internal_chatroom_rpc =
             plugin_name == "chatroom" && request.uri().path().starts_with("/api/v1/internal/");
 
-        let handle = wasmtime_wasi::runtime::spawn(async move {
+        Box::new(async move {
             if !is_internal_chatroom_rpc {
                 if let Some(host_cb) = core_host {
                     let cap = CapabilityRequest::Http {
@@ -80,23 +112,26 @@ impl WasiHttpView for HostState {
                             }) = effective_capability
                             {
                                 if !host_matches_pattern(approved_host, &host_str) {
-                                    return Ok(Err(
-                                        wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
-                                    ));
+                                    return Err(wasmtime_wasi_http::Error::HttpRequestDenied);
                                 }
                             }
                         }
                         Ok(PermissionOutcome::Denied { .. }) | Err(_) => {
-                            return Ok(Err(
-                                wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
-                            ));
+                            return Err(wasmtime_wasi_http::Error::HttpRequestDenied);
                         }
                     }
                 }
             }
-            Ok(wasmtime_wasi_http::types::default_send_request_handler(request, config).await)
-        });
-        Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle))
+            let (res, io) = wasmtime_wasi_http::default_send_request(request, Some(opts)).await?;
+            Ok((
+                res.map(BodyExt::boxed_unsync),
+                Box::new(io)
+                    as Box<
+                        dyn Future<Output = wasmtime_wasi_http::Result<(), wasmtime_wasi_http::Error>>
+                            + Send,
+                    >,
+            ))
+        })
     }
 }
 
@@ -277,14 +312,14 @@ impl wasi_preopens::Host for HostState {
 }
 
 impl wasi_fs_types::Host for HostState {
-    fn convert_error_code(&mut self, err: FsError) -> anyhow::Result<wasi_fs_types::ErrorCode> {
+    fn convert_error_code(&mut self, err: FsError) -> wasmtime::Result<wasi_fs_types::ErrorCode> {
         wasi_fs_types::Host::convert_error_code(&mut self.filesystem(), err)
     }
 
     fn filesystem_error_code(
         &mut self,
-        err: Resource<anyhow::Error>,
-    ) -> anyhow::Result<Option<wasi_fs_types::ErrorCode>> {
+        err: Resource<wasmtime::Error>,
+    ) -> wasmtime::Result<Option<wasi_fs_types::ErrorCode>> {
         wasi_fs_types::Host::filesystem_error_code(&mut self.filesystem(), err)
     }
 }
@@ -304,7 +339,7 @@ impl wasi_fs_types::HostDirectoryEntryStream for HostState {
     fn drop(
         &mut self,
         stream: Resource<wasi_fs_types::DirectoryEntryStream>,
-    ) -> anyhow::Result<()> {
+    ) -> wasmtime::Result<()> {
         wasi_fs_types::HostDirectoryEntryStream::drop(&mut self.filesystem(), stream)
     }
 }
@@ -498,7 +533,7 @@ impl wasi_fs_types::HostDescriptor for HostState {
         Ok(child_fd)
     }
 
-    fn drop(&mut self, fd: Resource<wasi_fs_types::Descriptor>) -> anyhow::Result<()> {
+    fn drop(&mut self, fd: Resource<wasi_fs_types::Descriptor>) -> wasmtime::Result<()> {
         self.dir_paths.remove(&fd.rep());
         wasi_fs_types::HostDescriptor::drop(&mut self.filesystem(), fd)
     }
@@ -599,7 +634,7 @@ impl wasi_fs_types::HostDescriptor for HostState {
         &mut self,
         a: Resource<wasi_fs_types::Descriptor>,
         b: Resource<wasi_fs_types::Descriptor>,
-    ) -> anyhow::Result<bool> {
+    ) -> wasmtime::Result<bool> {
         wasi_fs_types::HostDescriptor::is_same_object(&mut self.filesystem(), a, b).await
     }
 

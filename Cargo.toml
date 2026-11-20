@@ -42,9 +42,9 @@ thiserror = "2.0"
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-wasmtime = { version = "37", features = ["component-model", "async"] }
-wasmtime-wasi = "37"
-wasmtime-wasi-http = "37"
+wasmtime = { version = "50", features = ["component-model", "async"] }
+wasmtime-wasi = "50"
+wasmtime-wasi-http = "50"
 toml = "0.8"
 dirs = "5.0"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
