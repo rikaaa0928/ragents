@@ -220,3 +220,202 @@ async fn test_static_token_authn() {
 
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_tunnel_reconnect_preserves_inflight_rpc_and_deduplicates_request_id() {
+    let store = SqliteStore::open_in_memory().expect("open store");
+    let state = ApiServerState::new(store, DEFAULT_LEASE_TTL_MS);
+    let cancel = CancellationToken::new();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = serve_tcp(listener, state, cancel.clone())
+        .await
+        .expect("serve");
+    let base_url = format!("http://{addr}");
+
+    let client = RagentsClient::new(&base_url);
+    let (tunnel, mut push_rx) = connect_daemon_tunnel(&client.ws_tunnel_url())
+        .await
+        .expect("connect daemon tunnel");
+    tunnel.set_auto_reconnect(true);
+    assert_eq!(tunnel.current_epoch(), 0);
+
+    tunnel
+        .register_node(
+            NodeId::new("node_reconn"),
+            "test-host".to_string(),
+            "linux".to_string(),
+            "x86_64".to_string(),
+            BTreeMap::new(),
+            vec!["gpt-4.1".to_string()],
+            Some("gpt-4.1".to_string()),
+            vec!["shell".to_string()],
+            4,
+        )
+        .await
+        .expect("register node");
+
+    client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_reconn_1")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Floating {
+                    node_selector: BTreeMap::new(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: Some("System".to_string()),
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_activation: Some(InitialActivationRequest {
+                input: vec![Item::user_message("hello")],
+                model_override: None,
+                disabled_tools: vec![],
+            }),
+        })
+        .await
+        .expect("create session");
+
+    let (sess_id, act_id, lease_epoch) = match push_rx.recv().await.expect("push") {
+        DaemonPushEvent::DispatchActivation {
+            session,
+            activation,
+            lease_epoch,
+            ..
+        } => (
+            SessionId::new(session.metadata.id),
+            ActivationId::new(activation.metadata.id),
+            lease_epoch,
+        ),
+        other => panic!("expected DispatchActivation, got {other:?}"),
+    };
+
+    let cfg = ConfigRevision::new_merged(
+        "System".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![],
+    );
+    let perm = PermissionSnapshot::from_effective_policy(PermissionPolicyLayer::default());
+    tunnel
+        .accept_activation(sess_id.clone(), act_id.clone(), lease_epoch, cfg, perm)
+        .await
+        .expect("accept activation");
+
+    // Simulate a heartbeat timeout disconnecting epoch 0 right before an RPC runs,
+    // with reconnect taking 1.2s (longer than the old 900ms backoff window).
+    assert!(tunnel.force_disconnect_if_epoch(0));
+    assert!(tunnel.is_disconnected());
+
+    let tunnel_for_rpc = tunnel.clone();
+    let sess_for_rpc = sess_id.clone();
+    let act_for_rpc = act_id.clone();
+    let rpc_task = tokio::spawn(async move {
+        tunnel_for_rpc
+            .commit_batch(
+                sess_for_rpc,
+                act_for_rpc,
+                lease_epoch,
+                ItemBatchKind::ModelOutput,
+                Some(TurnId::new("turn_reconn")),
+                Some("resp_reconn".to_string()),
+                vec![Item::assistant_message("recovered after reconnect")],
+                BatchCompanionEvent::TurnCompleted {
+                    response_id: Some("resp_reconn".to_string()),
+                    usage: None,
+                },
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (new_tunnel, _new_rx) = connect_daemon_tunnel(&client.ws_tunnel_url())
+        .await
+        .expect("reconnect daemon tunnel");
+    new_tunnel
+        .register_node_with_running_activations(
+            NodeId::new("node_reconn"),
+            "test-host".to_string(),
+            "linux".to_string(),
+            "x86_64".to_string(),
+            BTreeMap::new(),
+            vec!["gpt-4.1".to_string()],
+            Some("gpt-4.1".to_string()),
+            None,
+            PermissionPolicyLayer::default(),
+            vec!["shell".to_string()],
+            vec!["/tmp".to_string()],
+            4,
+            Some(vec![act_id.clone()]),
+        )
+        .await
+        .expect("re-register node");
+    tunnel.replace_connection(&new_tunnel);
+    assert_eq!(tunnel.current_epoch(), 1);
+    assert!(!tunnel.is_disconnected());
+
+    // A stale heartbeat timeout from epoch 0 must NOT tear down epoch 1.
+    assert!(!tunnel.force_disconnect_if_epoch(0));
+    assert!(!tunnel.is_disconnected());
+
+    let batch_seq = rpc_task
+        .await
+        .expect("rpc task join")
+        .expect("commit_batch survives reconnect");
+    assert_eq!(batch_seq.value(), 1);
+
+    // Verify server-side request_id deduplication across reconnects using raw `call`.
+    let dup_req_id = "req_dedup_fixed_001".to_string();
+    let dup_msg = DaemonToServerMessage::CommitBatch {
+        request_id: dup_req_id,
+        session_id: sess_id.clone(),
+        activation_id: act_id.clone(),
+        lease_epoch,
+        kind: ItemBatchKind::ToolOutput,
+        turn_id: Some(TurnId::new("turn_reconn")),
+        response_id: None,
+        items: vec![Item::assistant_message("idempotent item")],
+        companion_event: BatchCompanionEvent::ToolCallFinished {
+            call_id: "call_dedup_1".to_string(),
+            name: "shell".to_string(),
+            success: true,
+            duration_ms: 10,
+            view_mode_placeholder: None,
+        },
+        drain_realtime: false,
+    };
+    let r1 = tunnel.call(dup_msg.clone()).await.expect("first call");
+    let r2 = tunnel.call(dup_msg).await.expect("duplicate call");
+    match (r1, r2) {
+        (
+            ServerToDaemonMessage::Ack {
+                ok: true,
+                batch_seq: b1,
+                ..
+            },
+            ServerToDaemonMessage::Ack {
+                ok: true,
+                batch_seq: b2,
+                ..
+            },
+        ) => {
+            assert_eq!(b1, b2);
+            assert_eq!(b1.unwrap().value(), 2);
+        }
+        other => panic!("unexpected replies: {other:?}"),
+    }
+
+    let ctx = client
+        .get_session_context(&sess_id)
+        .await
+        .expect("get context");
+    // Input (1) + recovered assistant (1) + idempotent item once (1) = 3
+    assert_eq!(ctx.effective_items.len(), 3);
+
+    tunnel.set_auto_reconnect(false);
+    cancel.cancel();
+}

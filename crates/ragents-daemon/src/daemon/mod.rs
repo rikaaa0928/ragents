@@ -196,17 +196,25 @@ impl AgentDaemon {
             lease_epochs: lease_epochs.clone(),
         }))));
 
+        tunnel.set_auto_reconnect(true);
+
         let hb_tunnel = tunnel.clone();
         let hb_node_id = self.config.node_id.clone();
         let hb_runners = active_runners.clone();
         let hb_tasks = active_tasks.clone();
         let hb_shutdown = shutdown.clone();
         let hb_interval = Duration::from_millis((lease_ttl_ms / 3).max(500));
+        let hb_timeout = Duration::from_millis(((lease_ttl_ms * 2) / 3).clamp(2_000, 30_000));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(hb_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        if hb_tunnel.is_disconnected() {
+                            continue;
+                        }
+                        let epoch = hb_tunnel.current_epoch();
                         let count = hb_runners.load(Ordering::Relaxed);
                         let running_ids: Vec<ActivationId> = hb_tasks
                             .lock()
@@ -215,11 +223,16 @@ impl AgentDaemon {
                             .cloned()
                             .collect();
                         if hb_tunnel
-                            .heartbeat_with_activations(hb_node_id.clone(), count, Some(running_ids))
+                            .heartbeat_with_activations_timeout(
+                                hb_node_id.clone(),
+                                count,
+                                Some(running_ids),
+                                hb_timeout,
+                            )
                             .await
                             .is_err()
                         {
-                            hb_tunnel.force_disconnect();
+                            hb_tunnel.force_disconnect_if_epoch(epoch);
                         }
                     }
                     _ = hb_shutdown.cancelled() => break,
@@ -350,7 +363,11 @@ impl AgentDaemon {
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                            _ = shutdown.cancelled() => return,
+                            _ = shutdown.cancelled() => {
+                                tunnel.set_auto_reconnect(false);
+                                tunnel.force_disconnect();
+                                return;
+                            }
                         }
                         if let Ok((new_tunnel, new_rx)) = connect_daemon_tunnel_with_token(
                             &ws_url_for_loop,
@@ -400,11 +417,14 @@ impl AgentDaemon {
                                 push_rx = new_rx;
                                 break;
                             }
+                            new_tunnel.force_disconnect();
                         }
                         backoff_ms = (backoff_ms * 2).min(2000);
                     }
                 }
             }
+            tunnel.set_auto_reconnect(false);
+            tunnel.force_disconnect();
         });
 
         Ok(())

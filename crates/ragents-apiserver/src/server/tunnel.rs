@@ -83,6 +83,28 @@ async fn run_daemon_tunnel_socket(socket: WebSocket, state: ApiServerState) {
     writer_task.abort();
 }
 
+fn cached_tunnel_reply(state: &ApiServerState, request_id: &str) -> Option<ServerToDaemonMessage> {
+    state
+        .tunnel_reply_cache
+        .lock()
+        .expect("tunnel_reply_cache mutex poisoned")
+        .get(request_id)
+}
+
+fn cache_and_send(
+    state: &ApiServerState,
+    out_tx: &mpsc::UnboundedSender<ServerToDaemonMessage>,
+    request_id: String,
+    reply: ServerToDaemonMessage,
+) {
+    state
+        .tunnel_reply_cache
+        .lock()
+        .expect("tunnel_reply_cache mutex poisoned")
+        .insert(request_id, reply.clone());
+    let _ = out_tx.send(reply);
+}
+
 fn handle_daemon_message(
     state: &ApiServerState,
     out_tx: &mpsc::UnboundedSender<ServerToDaemonMessage>,
@@ -205,20 +227,39 @@ fn handle_daemon_message(
             lease_epoch,
             effective_config,
             effective_permission,
-        } => match state.store.accept_activation(
-            &session_id,
-            &activation_id,
-            lease_epoch,
-            *effective_config,
-            *effective_permission,
-        ) {
-            Ok(act) => {
-                send_ack_ok(out_tx, request_id, Some(act.metadata.resource_version));
+        } => {
+            if let Some(cached) = cached_tunnel_reply(state, &request_id) {
+                let _ = out_tx.send(cached);
+                return;
             }
-            Err(e) => {
-                send_ack_err(out_tx, request_id, e.to_string());
-            }
-        },
+            let reply = match state.store.accept_activation(
+                &session_id,
+                &activation_id,
+                lease_epoch,
+                *effective_config,
+                *effective_permission,
+            ) {
+                Ok(act) => ServerToDaemonMessage::Ack {
+                    request_id: request_id.clone(),
+                    ok: true,
+                    resource_version: Some(act.metadata.resource_version),
+                    batch_seq: None,
+                    spawned_session_id: None,
+                    drained_items: vec![],
+                    error: None,
+                },
+                Err(e) => ServerToDaemonMessage::Ack {
+                    request_id: request_id.clone(),
+                    ok: false,
+                    resource_version: None,
+                    batch_seq: None,
+                    spawned_session_id: None,
+                    drained_items: vec![],
+                    error: Some(e.to_string()),
+                },
+            };
+            cache_and_send(state, out_tx, request_id, reply);
+        }
         DaemonToServerMessage::CommitBatch {
             request_id,
             session_id,
@@ -230,32 +271,43 @@ fn handle_daemon_message(
             items,
             companion_event,
             drain_realtime,
-        } => match state.store.commit_batch_with_drain(
-            &session_id,
-            &activation_id,
-            lease_epoch,
-            kind,
-            turn_id,
-            response_id,
-            items,
-            companion_event,
-            drain_realtime,
-        ) {
-            Ok((batch_seq, rv, drained_items)) => {
-                let _ = out_tx.send(ServerToDaemonMessage::Ack {
-                    request_id,
+        } => {
+            if let Some(cached) = cached_tunnel_reply(state, &request_id) {
+                let _ = out_tx.send(cached);
+                return;
+            }
+            let reply = match state.store.commit_batch_with_drain(
+                &session_id,
+                &activation_id,
+                lease_epoch,
+                kind,
+                turn_id,
+                response_id,
+                items,
+                companion_event,
+                drain_realtime,
+            ) {
+                Ok((batch_seq, rv, drained_items)) => ServerToDaemonMessage::Ack {
+                    request_id: request_id.clone(),
                     ok: true,
                     resource_version: Some(rv),
                     batch_seq: Some(batch_seq),
                     spawned_session_id: None,
                     drained_items,
                     error: None,
-                });
-            }
-            Err(e) => {
-                send_ack_err(out_tx, request_id, e.to_string());
-            }
-        },
+                },
+                Err(e) => ServerToDaemonMessage::Ack {
+                    request_id: request_id.clone(),
+                    ok: false,
+                    resource_version: None,
+                    batch_seq: None,
+                    spawned_session_id: None,
+                    drained_items: vec![],
+                    error: Some(e.to_string()),
+                },
+            };
+            cache_and_send(state, out_tx, request_id, reply);
+        }
         DaemonToServerMessage::BeginTurn {
             request_id,
             session_id,
@@ -263,32 +315,35 @@ fn handle_daemon_message(
             lease_epoch,
             turn_id,
             include_context,
-        } => match state.store.begin_turn(
-            &session_id,
-            &activation_id,
-            lease_epoch,
-            turn_id,
-            include_context,
-        ) {
-            Ok((drained_items, effective_items)) => {
-                let _ = out_tx.send(ServerToDaemonMessage::BeginTurnReply {
-                    request_id,
+        } => {
+            if let Some(cached) = cached_tunnel_reply(state, &request_id) {
+                let _ = out_tx.send(cached);
+                return;
+            }
+            let reply = match state.store.begin_turn(
+                &session_id,
+                &activation_id,
+                lease_epoch,
+                turn_id,
+                include_context,
+            ) {
+                Ok((drained_items, effective_items)) => ServerToDaemonMessage::BeginTurnReply {
+                    request_id: request_id.clone(),
                     ok: true,
                     drained_items,
                     effective_items,
                     error: None,
-                });
-            }
-            Err(e) => {
-                let _ = out_tx.send(ServerToDaemonMessage::BeginTurnReply {
-                    request_id,
+                },
+                Err(e) => ServerToDaemonMessage::BeginTurnReply {
+                    request_id: request_id.clone(),
                     ok: false,
                     drained_items: vec![],
                     effective_items: None,
                     error: Some(e.to_string()),
-                });
-            }
-        },
+                },
+            };
+            cache_and_send(state, out_tx, request_id, reply);
+        }
         DaemonToServerMessage::EmitEvent {
             request_id,
             session_id,
@@ -298,6 +353,12 @@ fn handle_daemon_message(
             event,
         } => {
             let is_ephemeral = event.is_ephemeral_stream_delta();
+            if !is_ephemeral && !request_id.is_empty() {
+                if let Some(cached) = cached_tunnel_reply(state, &request_id) {
+                    let _ = out_tx.send(cached);
+                    return;
+                }
+            }
             match state.store.emit_daemon_event(
                 &session_id,
                 &activation_id,
@@ -307,12 +368,30 @@ fn handle_daemon_message(
             ) {
                 Ok(env) => {
                     if !is_ephemeral && !request_id.is_empty() {
-                        send_ack_ok(out_tx, request_id, Some(env.resource_version));
+                        let reply = ServerToDaemonMessage::Ack {
+                            request_id: request_id.clone(),
+                            ok: true,
+                            resource_version: Some(env.resource_version),
+                            batch_seq: None,
+                            spawned_session_id: None,
+                            drained_items: vec![],
+                            error: None,
+                        };
+                        cache_and_send(state, out_tx, request_id, reply);
                     }
                 }
                 Err(e) => {
                     if !is_ephemeral && !request_id.is_empty() {
-                        send_ack_err(out_tx, request_id, e.to_string());
+                        let reply = ServerToDaemonMessage::Ack {
+                            request_id: request_id.clone(),
+                            ok: false,
+                            resource_version: None,
+                            batch_seq: None,
+                            spawned_session_id: None,
+                            drained_items: vec![],
+                            error: Some(e.to_string()),
+                        };
+                        cache_and_send(state, out_tx, request_id, reply);
                     }
                 }
             }
@@ -343,45 +422,67 @@ fn handle_daemon_message(
             session_id,
             activation_id: _,
             content,
-        } => match state.store.push_realtime_message(&session_id, content) {
-            Ok(_count) => {
-                send_ack_ok(out_tx, request_id, None);
+        } => {
+            if let Some(cached) = cached_tunnel_reply(state, &request_id) {
+                let _ = out_tx.send(cached);
+                return;
             }
-            Err(e) => {
-                send_ack_err(out_tx, request_id, e.to_string());
-            }
-        },
+            let reply = match state.store.push_realtime_message(&session_id, content) {
+                Ok(_count) => ServerToDaemonMessage::Ack {
+                    request_id: request_id.clone(),
+                    ok: true,
+                    resource_version: None,
+                    batch_seq: None,
+                    spawned_session_id: None,
+                    drained_items: vec![],
+                    error: None,
+                },
+                Err(e) => ServerToDaemonMessage::Ack {
+                    request_id: request_id.clone(),
+                    ok: false,
+                    resource_version: None,
+                    batch_seq: None,
+                    spawned_session_id: None,
+                    drained_items: vec![],
+                    error: Some(e.to_string()),
+                },
+            };
+            cache_and_send(state, out_tx, request_id, reply);
+        }
         DaemonToServerMessage::DrainRealtimeMessages {
             request_id,
             session_id,
             activation_id,
             lease_epoch,
             turn_id,
-        } => match state.store.drain_realtime_messages(
-            &session_id,
-            &activation_id,
-            lease_epoch,
-            turn_id,
-        ) {
-            Ok((items, batch_seq)) => {
-                let _ = out_tx.send(ServerToDaemonMessage::RealtimeMessagesReply {
-                    request_id,
+        } => {
+            if let Some(cached) = cached_tunnel_reply(state, &request_id) {
+                let _ = out_tx.send(cached);
+                return;
+            }
+            let reply = match state.store.drain_realtime_messages(
+                &session_id,
+                &activation_id,
+                lease_epoch,
+                turn_id,
+            ) {
+                Ok((items, batch_seq)) => ServerToDaemonMessage::RealtimeMessagesReply {
+                    request_id: request_id.clone(),
                     ok: true,
                     items,
                     batch_seq,
                     error: None,
-                });
-            }
-            Err(e) => {
-                let _ = out_tx.send(ServerToDaemonMessage::RealtimeMessagesReply {
-                    request_id,
+                },
+                Err(e) => ServerToDaemonMessage::RealtimeMessagesReply {
+                    request_id: request_id.clone(),
                     ok: false,
                     items: vec![],
                     batch_seq: None,
                     error: Some(e.to_string()),
-                });
-            }
-        },
+                },
+            };
+            cache_and_send(state, out_tx, request_id, reply);
+        }
         DaemonToServerMessage::CompleteActivation {
             request_id,
             session_id,
@@ -389,40 +490,62 @@ fn handle_daemon_message(
             lease_epoch,
             turn_id,
             outcome,
-        } => match state.store.complete_activation(
-            &session_id,
-            &activation_id,
-            lease_epoch,
-            turn_id,
-            outcome,
-        ) {
-            Ok((act, _)) => {
-                send_ack_ok(out_tx, request_id, Some(act.metadata.resource_version));
+        } => {
+            if let Some(cached) = cached_tunnel_reply(state, &request_id) {
+                let _ = out_tx.send(cached);
+                return;
             }
-            Err(e) => {
-                send_ack_err(out_tx, request_id, e.to_string());
-            }
-        },
+            let reply = match state.store.complete_activation(
+                &session_id,
+                &activation_id,
+                lease_epoch,
+                turn_id,
+                outcome,
+            ) {
+                Ok((act, _)) => ServerToDaemonMessage::Ack {
+                    request_id: request_id.clone(),
+                    ok: true,
+                    resource_version: Some(act.metadata.resource_version),
+                    batch_seq: None,
+                    spawned_session_id: None,
+                    drained_items: vec![],
+                    error: None,
+                },
+                Err(e) => ServerToDaemonMessage::Ack {
+                    request_id: request_id.clone(),
+                    ok: false,
+                    resource_version: None,
+                    batch_seq: None,
+                    spawned_session_id: None,
+                    drained_items: vec![],
+                    error: Some(e.to_string()),
+                },
+            };
+            cache_and_send(state, out_tx, request_id, reply);
+        }
         DaemonToServerMessage::RolloverCompactedSession {
             request_id,
             request,
-        } => match state.store.rollover_compacted_session(*request) {
-            Ok((response, _)) => {
-                let _ = out_tx.send(ServerToDaemonMessage::RolloverCompactedSessionReply {
-                    request_id,
+        } => {
+            if let Some(cached) = cached_tunnel_reply(state, &request_id) {
+                let _ = out_tx.send(cached);
+                return;
+            }
+            let reply = match state.store.rollover_compacted_session(*request) {
+                Ok((response, _)) => ServerToDaemonMessage::RolloverCompactedSessionReply {
+                    request_id: request_id.clone(),
                     ok: true,
                     response: Some(Box::new(response)),
                     error: None,
-                });
-            }
-            Err(e) => {
-                let _ = out_tx.send(ServerToDaemonMessage::RolloverCompactedSessionReply {
-                    request_id,
+                },
+                Err(e) => ServerToDaemonMessage::RolloverCompactedSessionReply {
+                    request_id: request_id.clone(),
                     ok: false,
                     response: None,
                     error: Some(e.to_string()),
-                });
-            }
+                },
+            };
+            cache_and_send(state, out_tx, request_id, reply);
         },
         DaemonToServerMessage::QuerySessionHistory {
             request_id,

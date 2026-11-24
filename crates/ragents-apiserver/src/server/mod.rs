@@ -14,16 +14,70 @@ use chrono::Utc;
 use ragents_protocol::*;
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
+const TUNNEL_REPLY_CACHE_MAX_ENTRIES: usize = 4096;
+const TUNNEL_REPLY_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+pub(crate) struct TunnelReplyCache {
+    order: VecDeque<String>,
+    entries: HashMap<String, (Instant, ServerToDaemonMessage)>,
+}
+
+impl TunnelReplyCache {
+    fn purge_expired(&mut self, now: Instant) {
+        while let Some(front) = self.order.front() {
+            let expired = self
+                .entries
+                .get(front)
+                .map(|(ts, _)| now.duration_since(*ts) > TUNNEL_REPLY_CACHE_TTL)
+                .unwrap_or(true);
+            if expired {
+                let key = self.order.pop_front().unwrap();
+                self.entries.remove(&key);
+            } else {
+                break;
+            }
+        }
+        while self.entries.len() > TUNNEL_REPLY_CACHE_MAX_ENTRIES {
+            if let Some(key) = self.order.pop_front() {
+                self.entries.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn get(&mut self, request_id: &str) -> Option<ServerToDaemonMessage> {
+        if request_id.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        self.purge_expired(now);
+        self.entries.get(request_id).map(|(_, msg)| msg.clone())
+    }
+
+    pub(crate) fn insert(&mut self, request_id: String, reply: ServerToDaemonMessage) {
+        if request_id.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        if !self.entries.contains_key(&request_id) {
+            self.order.push_back(request_id.clone());
+        }
+        self.entries.insert(request_id, (now, reply));
+        self.purge_expired(now);
+    }
+}
 
 #[derive(Clone)]
 pub struct ApiServerState {
@@ -35,6 +89,7 @@ pub struct ApiServerState {
         Arc<Mutex<HashMap<NodeId, mpsc::UnboundedSender<ServerToDaemonMessage>>>>,
     pub(crate) pending_node_ext:
         Arc<Mutex<HashMap<String, oneshot::Sender<NodeExtensionCallResponse>>>>,
+    pub(crate) tunnel_reply_cache: Arc<Mutex<TunnelReplyCache>>,
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -56,6 +111,7 @@ impl ApiServerState {
             model_catalog,
             daemon_peers: Arc::new(Mutex::new(HashMap::new())),
             pending_node_ext: Arc::new(Mutex::new(HashMap::new())),
+            tunnel_reply_cache: Arc::new(Mutex::new(TunnelReplyCache::default())),
             shutdown: CancellationToken::new(),
         };
         state.spawn_background_workers();
