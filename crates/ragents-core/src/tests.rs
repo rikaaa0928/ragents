@@ -2499,4 +2499,114 @@ async fn test_wasi_https_does_not_panic_on_rustls_crypto_provider() {
     let _ = std::fs::remove_dir_all(&base_tmp);
 }
 
+#[tokio::test]
+async fn test_sse_stream_handles_keepalive_comments_and_times_out_when_stalled() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Case 1: Slow upstream emitting `: keepalive\n\n` comments every 25ms keeps a 70ms idle timeout alive.
+    let listener_ok = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_ok = listener_ok.local_addr().unwrap();
+    let srv_ok = tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener_ok.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp_headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            let _ = sock.write_all(resp_headers.as_bytes()).await;
+            let _ = sock
+                .write_all(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+                .await;
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                let _ = sock.write_all(b": keepalive\n\n").await;
+            }
+            let _ = sock
+                .write_all(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+                .await;
+            let _ = sock.write_all(b"data: [DONE]\n\n").await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let backend = crate::OpenResponsesModelBackend;
+    let endpoint_ok = ModelEndpointConfig {
+        base_url: format!("http://{addr_ok}"),
+        api_key: "sk-test".to_string(),
+        ..Default::default()
+    };
+    let req_json = serde_json::json!({
+        "model": "test-model",
+        "input": [],
+        "stream": true,
+    });
+    let res_ok = backend
+        .create_response_raw_streaming_with_timeouts(
+            &endpoint_ok,
+            req_json.clone(),
+            None,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(70),
+        )
+        .await
+        .expect("keepalive comments should prevent idle timeout and complete cleanly");
+    assert_eq!(res_ok.id, "resp_ka");
+    assert_eq!(res_ok.output.len(), 1);
+    let _ = srv_ok.await;
+
+    // Case 2: Half-open proxy stall (headers + initial chunk sent, then silence forever without FIN/RST)
+    // must fail cleanly with idle timeout instead of hanging indefinitely.
+    let listener_stall = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_stall = listener_stall.local_addr().unwrap();
+    let (hold_tx, hold_rx) = tokio::sync::watch::channel(false);
+    let srv_stall = tokio::spawn(async move {
+        let mut kept_sockets = Vec::new();
+        let mut rx = hold_rx;
+        loop {
+            tokio::select! {
+                accepted = listener_stall.accept() => {
+                    if let Ok((mut sock, _)) = accepted {
+                        let mut buf = [0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let resp_headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                        let _ = sock.write_all(resp_headers.as_bytes()).await;
+                        let _ = sock
+                            .write_all(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stall\"}}\n\n")
+                            .await;
+                        kept_sockets.push(sock);
+                    }
+                }
+                _ = rx.changed() => {
+                    if *rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let endpoint_stall = ModelEndpointConfig {
+        base_url: format!("http://{addr_stall}"),
+        api_key: "sk-test".to_string(),
+        ..Default::default()
+    };
+    let err = backend
+        .create_response_raw_streaming_with_timeouts(
+            &endpoint_stall,
+            req_json,
+            None,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(60),
+        )
+        .await
+        .expect_err("stalled SSE stream must time out instead of hanging forever");
+    assert!(
+        err.to_string().contains("SSE stream idle timed out"),
+        "unexpected error: {err}"
+    );
+    let _ = hold_tx.send(true);
+    let _ = srv_stall.await;
+}
+
+
 

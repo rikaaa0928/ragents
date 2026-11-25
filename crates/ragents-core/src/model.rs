@@ -116,6 +116,9 @@ pub fn emit_synthetic_deltas_from_items(items: &[Item], cb: &ModelStreamCallback
 }
 
 const MAX_TRANSIENT_RETRIES: u32 = 3;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(180);
+const SSE_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn is_transient_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
@@ -134,13 +137,17 @@ impl OpenResponsesModelBackend {
         }
     }
 
-    async fn send_with_retry(
+    async fn send_with_retry_timeouts(
         endpoint: &ModelEndpointConfig,
         request_json: &serde_json::Value,
         accept_sse: bool,
+        connect_timeout: Duration,
+        read_timeout: Duration,
     ) -> Result<reqwest::Response, CoreError> {
         let url = Self::build_endpoint_url(&endpoint.base_url);
         let http = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
             .tcp_keepalive(Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -189,6 +196,90 @@ impl OpenResponsesModelBackend {
                         "HTTP transport error: {err}"
                     )));
                 }
+            }
+        }
+    }
+
+    async fn send_with_retry(
+        endpoint: &ModelEndpointConfig,
+        request_json: &serde_json::Value,
+        accept_sse: bool,
+    ) -> Result<reqwest::Response, CoreError> {
+        Self::send_with_retry_timeouts(
+            endpoint,
+            request_json,
+            accept_sse,
+            HTTP_CONNECT_TIMEOUT,
+            HTTP_READ_TIMEOUT,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn create_response_raw_streaming_with_timeouts(
+        &self,
+        endpoint: &ModelEndpointConfig,
+        mut request_json: serde_json::Value,
+        on_delta: Option<ModelStreamCallback>,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+        sse_idle_timeout: Duration,
+    ) -> Result<ResponseResource, CoreError> {
+        if let Some(obj) = request_json.as_object_mut() {
+            obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+        }
+
+        let mut stream_attempt = 0u32;
+        loop {
+            let resp = Self::send_with_retry_timeouts(
+                endpoint,
+                &request_json,
+                true,
+                connect_timeout,
+                read_timeout,
+            )
+            .await?;
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            let res = if content_type.contains("text/event-stream") {
+                parse_sse_response_stream_with_idle_timeout(
+                    resp,
+                    &request_json,
+                    on_delta.clone(),
+                    sse_idle_timeout,
+                )
+                .await
+            } else {
+                match resp.text().await {
+                    Ok(body_text) => match serde_json::from_str::<ResponseResource>(&body_text) {
+                        Ok(parsed) => {
+                            if let Some(ref cb) = on_delta {
+                                emit_synthetic_deltas_from_items(&parsed.output, cb);
+                            }
+                            Ok(parsed)
+                        }
+                        Err(e) => Err(CoreError::Json(e)),
+                    },
+                    Err(e) => Err(CoreError::ResponseFailed(format!(
+                        "HTTP read body error: {e}"
+                    ))),
+                }
+            };
+
+            match res {
+                Ok(parsed) => return Ok(parsed),
+                Err(err) if stream_attempt < MAX_TRANSIENT_RETRIES => {
+                    stream_attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(50 * (1 << (stream_attempt - 1))))
+                        .await;
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
             }
         }
     }
@@ -324,7 +415,36 @@ async fn parse_sse_response_stream(
     request_json: &serde_json::Value,
     on_delta: Option<ModelStreamCallback>,
 ) -> Result<ResponseResource, CoreError> {
-    let mut byte_stream = resp.bytes_stream();
+    parse_sse_response_stream_with_idle_timeout(
+        resp,
+        request_json,
+        on_delta,
+        SSE_CHUNK_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+async fn parse_sse_response_stream_with_idle_timeout(
+    resp: reqwest::Response,
+    request_json: &serde_json::Value,
+    on_delta: Option<ModelStreamCallback>,
+    idle_timeout: Duration,
+) -> Result<ResponseResource, CoreError> {
+    let byte_stream = resp.bytes_stream();
+    parse_sse_byte_stream(byte_stream, request_json, on_delta, idle_timeout).await
+}
+
+pub(crate) async fn parse_sse_byte_stream<S, T, E>(
+    mut byte_stream: S,
+    request_json: &serde_json::Value,
+    on_delta: Option<ModelStreamCallback>,
+    idle_timeout: Duration,
+) -> Result<ResponseResource, CoreError>
+where
+    S: futures::Stream<Item = Result<T, E>> + Unpin,
+    T: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
     let mut buffer = String::new();
     let mut completed_response: Option<ResponseResource> = None;
     let mut last_response_id: Option<String> = None;
@@ -334,10 +454,20 @@ async fn parse_sse_response_stream(
         std::collections::BTreeMap::new();
     let mut accumulated_text = String::new();
 
-    while let Some(chunk_res) = byte_stream.next().await {
-        let chunk = chunk_res
+    loop {
+        let next_chunk = match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
+            Ok(Some(res)) => res,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(CoreError::ResponseFailed(format!(
+                    "SSE stream idle timed out after {:.1}s waiting for next chunk",
+                    idle_timeout.as_secs_f64()
+                )));
+            }
+        };
+        let chunk = next_chunk
             .map_err(|e| CoreError::ResponseFailed(format!("SSE stream read error: {e}")))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
 
         while let Some(newline_pos) = buffer.find('\n') {
             let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
