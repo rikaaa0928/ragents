@@ -117,8 +117,8 @@ pub fn emit_synthetic_deltas_from_items(items: &[Item], cb: &ModelStreamCallback
 
 const MAX_TRANSIENT_RETRIES: u32 = 3;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(180);
-const SSE_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(900);
+const SSE_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 
 fn is_transient_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
