@@ -2,12 +2,14 @@ pub mod activation;
 pub mod node;
 pub mod policy;
 pub mod process;
+pub mod queue;
 pub mod session;
 
 pub use activation::*;
 pub use node::*;
 pub use policy::*;
 pub use process::*;
+pub use queue::*;
 pub use session::*;
 
 use crate::ids::*;

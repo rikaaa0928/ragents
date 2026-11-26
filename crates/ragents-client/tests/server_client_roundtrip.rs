@@ -61,11 +61,7 @@ async fn test_http_sse_and_ws_daemon_tunnel_roundtrip() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("ping over cluster")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("ping over cluster")),
         })
         .await
         .expect("create session");
@@ -272,11 +268,7 @@ async fn test_tunnel_reconnect_preserves_inflight_rpc_and_deduplicates_request_i
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("hello")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("hello")),
         })
         .await
         .expect("create session");

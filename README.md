@@ -10,24 +10,28 @@
 
 > **核心取舍：借鉴 Kubernetes 声明式调谐思想，但拒绝 CRD 大包大揽**
 > - **为什么放弃 CRD（CustomResourceDefinition）**：在 Kubernetes 中，CRD 本质上只是让第三方组件复用 `kube-apiserver + etcd` 存储与 Watch 总线的**便利机制**，而非架构必要条件，且会引入动态 Schema、Admission Webhook 链与复杂 RBAC 等沉重负担。更重要的是，即便在 K8s 生态中，超高频变动状态与大体积数据也绝不会放入 `apiserver / etcd`，而是交由独立的配置中心或数据面服务处理。
-> - **两层 SSOT 解耦模型**：`ragents-apiserver` **仅对固定、闭合的 5 个核心执行原语（`Node`、`Session`、`Activation`、`ItemBatch`、`Event`）做 SSOT**；上层业务系统（如 `ragents-chat`）自带独立的领域级 SSOT Server（管理房间、成员、消息、ACL 与文件暂存），高频业务交互与大体积数据传输由节点 WASM 插件直连上层业务 Server 旁路完成。
+> - **两层 SSOT 解耦模型**：`ragents-apiserver` **仅对固定、闭合的核心执行原语（`Node`、`Session`、`SessionQueue`、`Activation`、`ItemBatch`、`SessionEvent`）做 SSOT**；上层业务系统（如 `ragents-chat`）自带独立的领域级 SSOT Server（管理房间、成员、未投递暂存池、消息、ACL 与文件暂存），高频业务交互与大体积数据传输由节点 WASM 插件直连上层业务 Server 旁路完成。
 
 | 维度 | `ragents-apiserver`（核心执行控制面） | 上层业务 Server（如 `ragents-chat`）+ `.wasm` 插件 |
 | :--- | :--- | :--- |
-| **定位** | 仅管理 **Agent 算力节点与会话执行生命周期** 的微内核控制面 | 独立的 **领域业务 SSOT Server** + 数据面中转网关 |
-| **资源模型** | **固定闭合模型**（`Node` / `Session` / `Activation`），不支持 CRD | **领域自治模型**（`Room` / `RoomAgent` / `RoomMessage` / `TokenAcl` / `FileStage`） |
-| **控制信令** | 节点注册、心跳租约、激活调度、5 级权限 SSOT、按需唤醒节点插件（`NodeExtensionCall`） | 房间编排、轮流窥屏/概率插嘴调度、群管家招募 |
+| **定位** | 仅管理 **Agent 算力节点、会话双消息队列与执行生命周期** 的微内核控制面 | 独立的 **领域业务 SSOT Server** + 数据面中转网关 |
+| **资源模型** | **固定闭合模型**（`Node` / `Session` / `SessionQueue` / `Activation`），不支持 CRD | **领域自治模型**（`Room` / `RoomAgent` / `RoomMessage` / `RoomPendingPool` / `TokenAcl` / `FileStage`） |
+| **控制信令** | 节点注册、心跳租约、双队列驱动的激活调度、5 级权限 SSOT、按需唤醒节点插件（`NodeExtensionCall`） | 房间编排、未投递池管理、轮流窥屏/概率插嘴调度、群管家招募 |
 | **数据面与大文件** | **零参与**（不存储、不转发任何文件或业务回调） | 浏览器 $\leftrightarrow$ 业务 Server 暂存区 $\leftrightarrow$ 节点 `.wasm` 插件通过 `wasi:http` 直连流式传输 |
 
 后续所有架构演进与功能改动均严格遵循以下 6 条核心设计理念：
 
 ### 1.1 极简、业务无关的控制面（Lean & Business-Agnostic Control Plane）
-- **`ragents-apiserver` 只做纯粹的集群状态协调与事件分发**：维护 `Node`、`Session`、`Activation`、`ItemBatch`、`SessionEvent` 与 `RealtimeQueue` 的声明式状态机，负责双模调度（`Pinned` / `Floating`）、两阶段节点租约巡检（5 分钟运行期宽限 + 双向 `running_activation_ids` 对账）及基于 `ResourceVersion (rv)` 的 SSE 事件流广播。
-- **严禁在 `ragents` 核心中耦合上层应用业务概念**：不在 `ragents-protocol`、`ragents-apiserver`、`ragents-daemon` 或 `ragents-core` 中硬编码任何具体业务语义（例如聊天室发言逻辑、特定模型内置工具名 `"web_search"`、节点文件管理 `ListDir`/`Upload`/`Download` 等）。
+- **`ragents-apiserver` 只做纯粹的集群状态协调与事件分发**：维护 `Node`、`Session`、`SessionQueue`（`Realtime` + `Pending` 双队列）、`Activation`、`ItemBatch` 与 `SessionEvent` 的声明式状态机，负责双模调度（`Pinned` / `Floating`）、两阶段节点租约巡检（5 分钟运行期宽限 + 双向 `running_activation_ids` 对账）及基于 `ResourceVersion (rv)` 的 SSE 事件流广播（含队列入队/出队/撤回的实时 `SessionQueueUpdated` 通知）。
+- **队列驱动执行与 Per-Turn 动态工具切换（Queue-Driven Execution）**：
+  - `ragent-base`（`apiserver` + `core`）对外抽象为 **Session 级双消息队列**：只要进入队列就保证自动调度消费到两队都空，对上层不暴露手动创建 `Turn`/`Activation` 的业务分支（另保留 `resume` 专用于异常中断后无新消息续跑）。
+  - **`Realtime` 实时队列**：空闲时批量消费新建 `Activation`；若当前已有 `Activation` 在运行，则在 `Turn` 间隙（`begin_turn`）或准备退出前（`commit_model_output_with_drain`）原子 `drain` 注入同一 `Activation`，并按入队消息携带的 `QueueToolPolicy`（`enabled_tools` / `disabled_tools`）**当场动态重算并刷新 `active_tools` 与发往模型的 `request_tools`**。
+  - **`Pending` 阻塞等待队列**：当前 `Activation` 彻底结束后（且 `Realtime` 为空时），严格按 FIFO **逐条出队**（1 条消息 = 1 个独立 `Activation`），方便安排系列任务与单条撤回；**工具禁用/启用配置严格限定在单个 `Activation` 生命周期内，绝不跨 `Activation` 继承**。
+- **严禁在 `ragents` 核心中耦合上层应用业务概念**：不在 `ragents-protocol`、`ragents-apiserver`、`ragents-daemon` 或 `ragents-core` 中硬编码任何具体业务语义（例如“禁言”概念、聊天室发言逻辑、特定模型内置工具名 `"web_search"`、节点文件管理 `ListDir`/`Upload`/`Download` 等）；类似禁言等业务限制全部由上层通过入队消息自带的 `QueueToolPolicy` 表达，并由 `ragents-core` 工具白名单机制物理兜底。
 - **零重型依赖与零二进制数据中转**：`ragents-apiserver` 不依赖 `ragents-core`（Wasmtime）或 `reqwest`，不存储或转发任何文件二进制/Base64 载荷；控制面鉴权仅保留内置常量时间 Bearer Token 校验（`StaticTokenAuthnPlugin`），多租户与业务级 ACL 交由上层应用网关实现。
 
 ### 1.2 `api-server` 唯一事实源（SSOT）与 `NodeSpec` 基础/增量分层
-- **配置与权限唯一事实源（Single Source of Truth）**：集群级提示词（`store_meta.cluster_system_prompt`）、节点级提示词与权限（`NodeSpec` / `NodeStatus`）、会话级提示词与权限（`SessionSpec.system_prompt`、`SessionSpec.permissions`）以及激活级工具禁用（`ActivationSpec.disabled_tools`）全部持久化在 `api-server` 中。
+- **配置与权限唯一事实源（Single Source of Truth）**：集群级提示词（`store_meta.cluster_system_prompt`）、节点级提示词与权限（`NodeSpec` / `NodeStatus`）、会话级提示词与权限（`SessionSpec.system_prompt`、`SessionSpec.permissions`）以及队列消息级 `QueueToolPolicy`（`enabled_tools` / `disabled_tools`）全部持久化在 `api-server` 中。
 - **`NodeSpec` 静态基础与控制面动态增量分离**：
   - 每次 `ragents-daemon` 启动注册（`RegisterNode`）时，用本地 `daemon.toml` 的最新配置刷新 `NodeSpec.node_prompt` 与 `NodeSpec.base_permissions`（以及 `NodeStatus` 中的模型列表、已安装扩展列表、允许工作区目录）。
   - 运行时通过控制面审批追加的 `NodeSpec.granted_permissions`（`AllowNode`）、`NodeSpec.workspace_permissions`（`AllowWorkspace`）与 `NodeSpec.node_prompt_override` 跨 Daemon 重启持久保留，并支持通过 `PATCH /api/v1/nodes/{node_id}` 或 `PATCH /api/v1/sessions/{session_id}` 随时撤销非默认规则。

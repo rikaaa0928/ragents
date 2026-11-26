@@ -138,11 +138,7 @@ async fn test_multi_daemon_floating_failover_and_context_continuity() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("hello turn 1")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("hello turn 1")),
         })
         .await
         .expect("create floating session");
@@ -182,24 +178,19 @@ async fn test_multi_daemon_floating_failover_and_context_continuity() {
         .expect("start node_b");
 
     let act2 = client
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: sess_id.clone(),
-                submission_kind: SubmissionKind::FollowUp,
-                input: vec![Item::user_message("hello turn 2 after failover")],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
+        .enqueue_session_message(
+            &sess_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text("hello turn 2 after failover"),
+        )
         .await
-        .expect("create turn 2 activation");
+        .expect("enqueue turn 2 message");
+    let act2_id = act2
+        .spawned_activation_id
+        .expect("idle session spawns turn 2 activation");
 
     while let Some(Ok(env)) = watch.next().await {
-        if env.activation_id.as_ref().map(|a| a.as_str()) == Some(&act2.metadata.id)
+        if env.activation_id.as_ref() == Some(&act2_id)
             && matches!(env.event, SessionEvent::ActivationCompleted { .. })
         {
             break;
@@ -383,17 +374,15 @@ async fn test_daemon_model_interceptor_mutates_params_headers_and_vendor_fields(
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("test model interceptor")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "test model interceptor",
+            )),
         })
         .await
         .unwrap();
 
     let sess_id = SessionId::new(created.session.metadata.id);
-    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act_id = created.spawned_activation_id.unwrap();
 
     while let Some(Ok(env)) = watch.next().await {
         if env.activation_id.as_ref() == Some(&act_id)
@@ -587,18 +576,20 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
                     if let Some(sess_id) = maybe_sess {
                         let _ = self
                             .client
-                            .push_realtime_message(
+                            .enqueue_session_message(
                                 &sess_id,
-                                PushRealtimeMessageRequest::from_text(
+                                QueueKind::Realtime,
+                                EnqueueSessionMessageRequest::from_text(
                                     "User steer message block #1",
                                 ),
                             )
                             .await;
                         let _ = self
                             .client
-                            .push_realtime_message(
+                            .enqueue_session_message(
                                 &sess_id,
-                                PushRealtimeMessageRequest::from_text(
+                                QueueKind::Realtime,
+                                EnqueueSessionMessageRequest::from_text(
                                     "User steer message block #2",
                                 ),
                             )
@@ -720,7 +711,7 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: None,
+            initial_message: None,
         })
         .await
         .unwrap();
@@ -728,22 +719,14 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
     *session_id_holder.lock().unwrap() = Some(sess_id.clone());
 
     let act1 = client
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: sess_id.clone(),
-                submission_kind: SubmissionKind::Normal,
-                input: vec![Item::user_message("Start background services")],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
+        .enqueue_session_message(
+            &sess_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text("Start background services"),
+        )
         .await
         .unwrap();
-    let act1_id = ActivationId::new(act1.metadata.id);
+    let act1_id = act1.spawned_activation_id.unwrap();
 
     let mut watch = client.watch_events(Some(&sess_id), 0).await.unwrap();
     while let Some(Ok(env)) = watch.next().await {
@@ -794,22 +777,14 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
     }
 
     let act2 = client
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: sess_id.clone(),
-                submission_kind: SubmissionKind::FollowUp,
-                input: vec![Item::user_message("Check and stop session process")],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
+        .enqueue_session_message(
+            &sess_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text("Check and stop session process"),
+        )
         .await
         .unwrap();
-    let act2_id = ActivationId::new(act2.metadata.id);
+    let act2_id = act2.spawned_activation_id.unwrap();
 
     while let Some(Ok(env)) = watch.next().await {
         if env.activation_id.as_ref() == Some(&act2_id)
@@ -832,18 +807,19 @@ async fn test_background_process_lifecycle_logs_stop_and_multi_block_realtime_qu
     assert!(ctx2_json.contains("out_line_1"), "ctx2: {ctx2_json}");
     assert!(ctx2_json.contains("err_line_1"), "ctx2: {ctx2_json}");
 
-    // Now that `sess_id` is completely idle (`act2` has completed), push a realtime message
-    // and verify that `push_realtime_message` automatically spawns and runs a Continuation Activation!
+    // Now that `sess_id` is completely idle (`act2` has completed), enqueue a realtime message
+    // and verify that `enqueue_session_message(Realtime)` automatically spawns and runs a Continuation Activation!
     let wake_resp = client
-        .push_realtime_message(
+        .enqueue_session_message(
             &sess_id,
-            PushRealtimeMessageRequest::from_text("Wake up idle session via realtime queue!"),
+            QueueKind::Realtime,
+            EnqueueSessionMessageRequest::from_text("Wake up idle session via realtime queue!"),
         )
         .await
         .unwrap();
     let wake_act_id = wake_resp
         .spawned_activation_id
-        .expect("push_realtime_message on idle session must auto-spawn an activation");
+        .expect("enqueue_session_message(Realtime) on idle session must auto-spawn an activation");
 
     while let Some(Ok(env)) = watch.next().await {
         if env.activation_id.as_ref() == Some(&wake_act_id)
@@ -1118,13 +1094,9 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message(
-                    "Please inspect config.toml and write output_v1.txt with the initial payload.",
-                )],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "Please inspect config.toml and write output_v1.txt with the initial payload.",
+            )),
         })
         .await
         .unwrap();
@@ -1212,25 +1184,17 @@ async fn test_three_session_context_compaction_and_multi_generation_chain() {
     // Now submit a second task targeting `sess_1_id` (verifying automatic compaction-chain routing to `sess_2`!)
     // which will trigger a second consecutive compaction (`sess_2 -> compact_2 -> sess_3`, generation = 2)!
     let act_phase2 = client
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: sess_1_id.clone(),
-                submission_kind: SubmissionKind::Normal,
-                input: vec![Item::user_message(
-                    "Now read schema.sql and update output_v1.txt for phase 2.",
-                )],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
+        .enqueue_session_message(
+            &sess_1_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text(
+                "Now read schema.sql and update output_v1.txt for phase 2.",
+            ),
+        )
         .await
         .unwrap();
-    // Because `sess_1` was compacted into `sess_2`, `create_activation` automatically routed it to `sess_2`!
-    assert_eq!(act_phase2.spec.session_id, sess_2_id);
+    // Because `sess_1` was compacted into `sess_2`, `enqueue_session_message` automatically routed it to `sess_2`!
+    assert_eq!(act_phase2.message.session_id, sess_2_id);
 
     let mut compact_2_id: Option<SessionId> = None;
     let mut sess_3_id: Option<SessionId> = None;
@@ -1431,16 +1395,14 @@ async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("Start session background sleep")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "Start session background sleep",
+            )),
         })
         .await
         .unwrap();
     let sess_id = SessionId::new(created.session.metadata.id);
-    let act1_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act1_id = created.spawned_activation_id.unwrap();
 
     let mut watch1 = client.watch_events(Some(&sess_id), 0).await.unwrap();
     while let Some(Ok(env)) = watch1.next().await {
@@ -1482,24 +1444,16 @@ async fn test_daemon_auto_reconnect_and_session_close_process_cleanup() {
     // Wait briefly for `AgentDaemon` exponential-backoff loop to reconnect and re-register
     let mut watch2 = client.watch_events(Some(&sess_id), 0).await.unwrap();
     let act2 = client
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: sess_id.clone(),
-                submission_kind: SubmissionKind::Normal,
-                input: vec![Item::user_message(
-                    "Verify daemon reconnected after server restart",
-                )],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
+        .enqueue_session_message(
+            &sess_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text(
+                "Verify daemon reconnected after server restart",
+            ),
+        )
         .await
         .unwrap();
-    let act2_id = ActivationId::new(act2.metadata.id);
+    let act2_id = act2.spawned_activation_id.unwrap();
 
     while let Some(Ok(env)) = watch2.next().await {
         if env.activation_id.as_ref() == Some(&act2_id)
@@ -1669,16 +1623,14 @@ async fn test_daemon_auto_discover_models_from_v1_models_endpoint() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("hello discovered model")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "hello discovered model",
+            )),
         })
         .await
         .expect("create session on discovered model");
 
-    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act_id = created.spawned_activation_id.unwrap();
     let mut completed = false;
     for _ in 0..80 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1801,7 +1753,7 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: None,
+            initial_message: None,
         })
         .await;
     assert!(
@@ -1828,7 +1780,7 @@ async fn test_daemon_allowed_workspace_dirs_restriction_and_default_tmp() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: None,
+            initial_message: None,
         })
         .await;
     assert!(
@@ -1959,16 +1911,19 @@ async fn test_four_segment_system_prompt_ssot_permissions_and_disabled_tools() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("hello")],
+            initial_message: Some(EnqueueSessionMessageRequest {
+                content: vec![openresponses_rust::MessageContent::InputText {
+                    text: "hello".to_string(),
+                }],
+                tool_policy: QueueToolPolicy::with_disabled(["write_file".to_string()]),
+                metadata: BTreeMap::new(),
                 model_override: None,
-                disabled_tools: vec!["write_file".to_string()],
             }),
         })
         .await
         .unwrap();
 
-    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act_id = created.spawned_activation_id.unwrap();
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         if let Some(act) = client.get_activation(&act_id).await.unwrap() {
@@ -2221,19 +2176,13 @@ async fn test_session_history_extension_list_search_read_and_workspace_isolation
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("Investigate OOM in train_model.py")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "Investigate OOM in train_model.py",
+            )),
         })
         .await
         .unwrap();
-    wait_for_act(
-        ActivationId::new(created_alpha.initial_activation.unwrap().metadata.id),
-        &mut events_rx,
-    )
-    .await;
+    wait_for_act(created_alpha.spawned_activation_id.unwrap(), &mut events_rx).await;
 
     // 2. Create and run `sess_other_ws` in `ws_other`
     let created_other = client
@@ -2254,19 +2203,13 @@ async fn test_session_history_extension_list_search_read_and_workspace_isolation
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("Secret task in other workspace")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "Secret task in other workspace",
+            )),
         })
         .await
         .unwrap();
-    wait_for_act(
-        ActivationId::new(created_other.initial_activation.unwrap().metadata.id),
-        &mut events_rx,
-    )
-    .await;
+    wait_for_act(created_other.spawned_activation_id.unwrap(), &mut events_rx).await;
 
     // 3. Create and run `sess_beta` in `ws_shared` with `session_history` extension
     let mut beta_labels = BTreeMap::new();
@@ -2296,19 +2239,13 @@ async fn test_session_history_extension_list_search_read_and_workspace_isolation
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("Check what Alpha found")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "Check what Alpha found",
+            )),
         })
         .await
         .unwrap();
-    wait_for_act(
-        ActivationId::new(created_beta.initial_activation.unwrap().metadata.id),
-        &mut events_rx,
-    )
-    .await;
+    wait_for_act(created_beta.spawned_activation_id.unwrap(), &mut events_rx).await;
 
     // Inspect Beta's effective context to verify the outputs of all 4 tool calls!
     let beta_ctx = client
@@ -2538,15 +2475,13 @@ async fn test_centralized_cluster_models_direct_invocation_and_local_override() 
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("hello cluster default")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "hello cluster default",
+            )),
         })
         .await
         .unwrap();
-    let act1_id = ActivationId::new(created_default.initial_activation.unwrap().metadata.id);
+    let act1_id = created_default.spawned_activation_id.unwrap();
     while let Some(Ok(env)) = events_rx.next().await {
         if env.activation_id.as_ref() == Some(&act1_id)
             && matches!(env.event, SessionEvent::ActivationCompleted { .. })
@@ -2573,15 +2508,13 @@ async fn test_centralized_cluster_models_direct_invocation_and_local_override() 
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("hello local override")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "hello local override",
+            )),
         })
         .await
         .unwrap();
-    let act2_id = ActivationId::new(created_local.initial_activation.unwrap().metadata.id);
+    let act2_id = created_local.spawned_activation_id.unwrap();
     while let Some(Ok(env)) = events_rx.next().await {
         if env.activation_id.as_ref() == Some(&act2_id)
             && matches!(env.event, SessionEvent::ActivationCompleted { .. })
@@ -2813,17 +2746,15 @@ async fn test_permissions_extension_disallows_allow_once_and_passive_allow_once_
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("run activation 1")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "run activation 1",
+            )),
         })
         .await
         .unwrap();
 
     let sess_id = SessionId::new(created.session.metadata.id);
-    let act1_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act1_id = created.spawned_activation_id.unwrap();
     let mut act1_perm_prompts = 0usize;
 
     while let Some(Ok(env)) = watch.next().await {
@@ -2895,22 +2826,14 @@ async fn test_permissions_extension_disallows_allow_once_and_passive_allow_once_
 
     // Activation 2: AllowActivation expired; passive write_file triggers prompt -> AllowOnce succeeds!
     let act2 = client
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: sess_id.clone(),
-                submission_kind: SubmissionKind::FollowUp,
-                input: vec![Item::user_message("run activation 2")],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
+        .enqueue_session_message(
+            &sess_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text("run activation 2"),
+        )
         .await
         .unwrap();
-    let act2_id = ActivationId::new(act2.metadata.id);
+    let act2_id = act2.spawned_activation_id.unwrap();
     let mut act2_perm_prompts = 0usize;
 
     while let Some(Ok(env)) = watch.next().await {
@@ -2954,22 +2877,14 @@ async fn test_permissions_extension_disallows_allow_once_and_passive_allow_once_
 
     // Activation 3: passive AllowOnce did not persist; write_file prompts again -> AllowSession!
     let act3 = client
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: sess_id.clone(),
-                submission_kind: SubmissionKind::FollowUp,
-                input: vec![Item::user_message("run activation 3")],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
+        .enqueue_session_message(
+            &sess_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text("run activation 3"),
+        )
         .await
         .unwrap();
-    let act3_id = ActivationId::new(act3.metadata.id);
+    let act3_id = act3.spawned_activation_id.unwrap();
     let mut act3_perm_prompts = 0usize;
 
     while let Some(Ok(env)) = watch.next().await {
@@ -3012,22 +2927,14 @@ async fn test_permissions_extension_disallows_allow_once_and_passive_allow_once_
 
     // Activation 4: AllowSession persisted, so zero prompts!
     let act4 = client
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: sess_id.clone(),
-                submission_kind: SubmissionKind::FollowUp,
-                input: vec![Item::user_message("run activation 4")],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
+        .enqueue_session_message(
+            &sess_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text("run activation 4"),
+        )
         .await
         .unwrap();
-    let act4_id = ActivationId::new(act4.metadata.id);
+    let act4_id = act4.spawned_activation_id.unwrap();
     let mut act4_perm_prompts = 0usize;
 
     while let Some(Ok(env)) = watch.next().await {
@@ -3170,17 +3077,13 @@ async fn test_concurrent_reads_same_external_dir_deduplicates_permission_ask() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("read both files")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("read both files")),
         })
         .await
         .unwrap();
 
     let sess_id = SessionId::new(created.session.metadata.id);
-    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act_id = created.spawned_activation_id.unwrap();
 
     let mut prompt_count = 0usize;
     while let Some(Ok(env)) = watch.next().await {
@@ -3488,17 +3391,15 @@ async fn test_allow_session_write_covers_subsequent_read_without_extra_prompt() 
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("write then read external file")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text(
+                "write then read external file",
+            )),
         })
         .await
         .unwrap();
 
     let sess_id = SessionId::new(created.session.metadata.id);
-    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act_id = created.spawned_activation_id.unwrap();
 
     let mut prompt_count = 0usize;
     while let Some(Ok(env)) = watch.next().await {
@@ -3563,6 +3464,283 @@ async fn test_allow_session_write_covers_subsequent_read_without_extra_prompt() 
     let ctx = client.get_session_context(&sess_id).await.unwrap();
     let ctx_json = serde_json::to_string(&ctx.effective_items).unwrap();
     assert!(ctx_json.contains("hello_write_read"), "{ctx_json}");
+
+    daemon_cancel.cancel();
+    server_cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_dual_queue_mid_activation_tool_reenable_pending_fifo_and_sse() {
+    let editor_wasm = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm",
+    );
+    if !editor_wasm.exists() {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_path = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws_path).unwrap();
+    let ws_canon = std::fs::canonicalize(&ws_path).unwrap();
+
+    let store = SqliteStore::open_in_memory().unwrap();
+    let state = ApiServerState::new(store, 5_000);
+    let server_cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = serve_tcp(listener, state, server_cancel.clone())
+        .await
+        .unwrap();
+    let server_url = format!("http://{addr}");
+    let client = RagentsClient::new(&server_url);
+
+    struct DualQueueModel {
+        client: RagentsClient,
+        session_id: Arc<Mutex<Option<SessionId>>>,
+        turn_tools: Arc<Mutex<Vec<(Vec<String>, String)>>>,
+        call_idx: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ModelBackend for DualQueueModel {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            request: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            let idx = self
+                .call_idx
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let tool_names: Vec<String> = request
+                .tools
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|t| match t {
+                    openresponses_rust::Tool::Function { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let input_json = serde_json::to_string(&request.input).unwrap_or_default();
+            self.turn_tools
+                .lock()
+                .unwrap()
+                .push((tool_names.clone(), input_json.clone()));
+
+            if idx == 0 {
+                // Activation 1, Turn 1 (`write_file` disabled): enqueue 2 Pending (1 withdrawn) + 1 Realtime re-enabling `write_file`!
+                let sess_id = self.session_id.lock().unwrap().clone().unwrap();
+                let p_drop = self
+                    .client
+                    .enqueue_session_message(
+                        &sess_id,
+                        QueueKind::Pending,
+                        EnqueueSessionMessageRequest::from_text("dropped pending task"),
+                    )
+                    .await
+                    .unwrap();
+                let _p_keep = self
+                    .client
+                    .enqueue_session_message(
+                        &sess_id,
+                        QueueKind::Pending,
+                        EnqueueSessionMessageRequest::from_text("kept pending task"),
+                    )
+                    .await
+                    .unwrap();
+                self.client
+                    .withdraw_session_queue_message(&sess_id, p_drop.message.id)
+                    .await
+                    .unwrap();
+                let _rt = self
+                    .client
+                    .enqueue_session_message(
+                        &sess_id,
+                        QueueKind::Realtime,
+                        EnqueueSessionMessageRequest {
+                            content: vec![openresponses_rust::MessageContent::InputText {
+                                text: "urgent unlock write_file".to_string(),
+                            }],
+                            tool_policy: QueueToolPolicy::with_enabled(["write_file".to_string()]),
+                            metadata: BTreeMap::new(),
+                            model_override: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                return Ok(make_openresponses_resource(
+                    "resp_dq_1",
+                    "gpt-4.1",
+                    vec![Item::FunctionCall {
+                        id: Some("fc_dq_1".into()),
+                        call_id: "call_dq_1".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({ "path": "missing.txt" }).to_string(),
+                        status: None,
+                    }],
+                    None,
+                ));
+            }
+
+            if idx == 1 {
+                // Activation 1, Turn 2: `write_file` MUST now be re-enabled in request.tools!
+                assert!(
+                    tool_names.contains(&"write_file".to_string()),
+                    "Turn 2 must dynamically re-enable write_file: {tool_names:?}"
+                );
+                return Ok(make_openresponses_resource(
+                    "resp_dq_2",
+                    "gpt-4.1",
+                    vec![Item::FunctionCall {
+                        id: Some("fc_dq_2".into()),
+                        call_id: "call_dq_2".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "unlocked.txt",
+                            "content": "ok_mid_turn"
+                        })
+                        .to_string(),
+                        status: None,
+                    }],
+                    None,
+                ));
+            }
+
+            Ok(make_openresponses_resource(
+                &format!("resp_dq_{idx}"),
+                "gpt-4.1",
+                vec![Item::assistant_message(format!("done turn {idx}"))],
+                None,
+            ))
+        }
+    }
+
+    let session_holder = Arc::new(Mutex::new(None));
+    let turn_tools = Arc::new(Mutex::new(Vec::new()));
+    let model = Arc::new(DualQueueModel {
+        client: client.clone(),
+        session_id: session_holder.clone(),
+        turn_tools: turn_tools.clone(),
+        call_idx: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    let mut cfg = make_daemon_cfg(
+        "node_dual_q",
+        &server_url,
+        vec!["gpt-4.1"],
+        tmp.path().join("node_state"),
+    );
+    cfg.executor_mode = ExecutorMode::InProcess;
+    cfg.allowed_workspace_dirs.push(ws_canon.clone());
+    let daemon = AgentDaemon::new(cfg).with_model_backend(model);
+    let daemon_cancel = CancellationToken::new();
+    daemon.start(daemon_cancel.clone()).await.unwrap();
+
+    // Create idle session first, subscribe SSE, then enqueue initial Pending with `write_file` disabled
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_dual_q")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Pinned {
+                    node_id: NodeId::new("node_dual_q"),
+                    workspace_path: ws_canon.clone(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: None,
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![ExtensionSpec {
+                    name: "file_editor".into(),
+                    path: editor_wasm.to_string_lossy().into_owned(),
+                    enabled: true,
+                    config: serde_json::json!({}),
+                    allowed_dirs: vec![],
+                    filter_env: vec![],
+                }],
+                permissions: PermissionPolicyLayer {
+                    file_write: Some(RuleSet {
+                        allow: Some(vec![".".into()]),
+                        deny: None,
+                        default: None,
+                    }),
+                    ..Default::default()
+                },
+                extra_tmp_dirs: vec![],
+            },
+            initial_message: None,
+        })
+        .await
+        .unwrap();
+    let sess_id = SessionId::new(created.session.metadata.id);
+    *session_holder.lock().unwrap() = Some(sess_id.clone());
+
+    let mut watch = client.watch_events(Some(&sess_id), 0).await.unwrap();
+    let enq1 = client
+        .enqueue_session_message(
+            &sess_id,
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest {
+                content: vec![openresponses_rust::MessageContent::InputText {
+                    text: "start muted act 1".to_string(),
+                }],
+                tool_policy: QueueToolPolicy::with_disabled(["write_file".to_string()]),
+                metadata: BTreeMap::new(),
+                model_override: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(enq1.spawned_activation_id.is_some());
+
+    let mut completed_count = 0usize;
+    let mut saw_queue_sse = false;
+    while let Some(Ok(env)) = watch.next().await {
+        match env.event {
+            SessionEvent::SessionQueueUpdated {
+                realtime_count,
+                pending_count,
+            } => {
+                if pending_count >= 1 || realtime_count >= 1 {
+                    saw_queue_sse = true;
+                }
+            }
+            SessionEvent::ActivationCompleted { .. } => {
+                completed_count += 1;
+                if completed_count == 2 {
+                    break;
+                }
+            }
+            SessionEvent::ActivationFailed { error, .. } => panic!("failed: {error}"),
+            _ => {}
+        }
+    }
+
+    assert!(saw_queue_sse, "expected SessionQueueUpdated SSE events");
+    assert_eq!(
+        std::fs::read_to_string(ws_canon.join("unlocked.txt")).unwrap(),
+        "ok_mid_turn"
+    );
+    let recorded = turn_tools.lock().unwrap();
+    assert!(
+        !recorded[0].0.contains(&"write_file".to_string()),
+        "Activation 1 Turn 1 must start without write_file: {:?}",
+        recorded[0].0
+    );
+    assert!(
+        recorded.last().unwrap().0.contains(&"write_file".to_string()),
+        "Activation 2 (kept pending task) must NOT inherit Activation 1 disabled_tools: {:?}",
+        recorded.last().unwrap().0
+    );
+    assert!(
+        !recorded
+            .iter()
+            .any(|(_, inp)| inp.contains("dropped pending task")),
+        "withdrawn pending task must never reach model"
+    );
+
+    let queues_after = client.list_session_queues(&sess_id).await.unwrap();
+    assert!(queues_after.realtime.is_empty());
+    assert!(queues_after.pending.is_empty());
 
     daemon_cancel.cancel();
     server_cancel.cancel();

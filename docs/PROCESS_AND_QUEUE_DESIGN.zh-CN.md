@@ -19,58 +19,52 @@
 
 ---
 
-## 2. 双消息队列架构设计（等待队列 vs 实时队列）
+## 2. 统一双消息队列架构设计（`Realtime` 实时队列 vs `Pending` 逐条等待队列）
 
-### 2.1 当前版本现状说明
+### 2.1 核心理念与边界收口
 
-在当前版本的代码中，消息队列的实现状态如下：
-1. **等待消息队列（`FollowUp / Activation Queue`）—— 已在 `api-server` 实现**：
-   - 当一个 `Session` 正在运行 `Activation #1` 时，新提交给该 `Session` 的任务会在 SQLite `activations` 表中以 `phase = Queued` 入队（`SessionStatus.queued_activation_count` 递增）。
-   - 当 `Activation #1` 结束（`CompleteActivation`）时，调度器在同一个事务内自动按 FIFO 顺序取出下一个 `Queued` 的 `Activation #2` 投入运行，相当于“等当前任务完成后自动续上下一个 Activation”。
-2. **实时消息队列（`Realtime / In-Loop Queue`）—— 协议已预留 `SubmissionKind::Steer`，但 ReAct 循环内尚未打通每轮读取**：
-   - 当前 `runner.rs` 的 ReAct 循环在每轮 `Turn` 开始前仅读取已提交的历史上下文，尚未在每轮 `Turn` 边界从实时队列拉取（Drain）新到达的异步通知（如后台进程退出通知、用户运行中实时插话）。
+`ragent-base`（`ragents-apiserver` + `ragents-core`）对上层业务抽象为 **Session 级双消息队列**：**只要消息进入队列，控制面与执行器即保证自动调度消费直至两队为空**，上层无需关心或手动拼接 `Continuation`/`Normal` 等激活类型（另保留 `POST /api/v1/sessions/{id}/resume` 专用于中断/失败后不追加消息的断点续跑；`Activation` 在内部继续作为执行单元、租约边界、事件批次与观测对象保留）。
 
-### 2.2 补齐后的双队列完整工作流（统一由 `api-server` 持久化托管）
-
-**是的，两个队列的写入与出队全部统一收口在控制面 `api-server` 的 SQLite 数据库中**：
-- **客户端（CLI / SDK）**：通过 HTTP REST 接口调用 `api-server`，向等待队列或实时队列写入消息；
-- **`agent-daemon`（进程托管方）**：当它监控到后台命令进程（`wait = false`）自行结束时，**由 `agent-daemon` 通过现有的 WebSocket 控制隧道（`DaemonToServerMessage`）主动调用 `api-server`**，将进程退出通知写入 `api-server` 的实时消息队列；
-- **`agent-core`（执行内核）**：在每轮 ReAct Loop（每个 `Turn` 开始前及循环结束前）通过 `CoreHost::drain_realtime_messages` 请求 `api-server` 原子取出（Drain）实时队列中的消息并落盘为上下文 `ItemBatch`。
+两个队列的读写全部持久化在 `api-server` SQLite 的统一表 `session_queue_messages`（`queue_kind IN ('realtime', 'pending')`）中，且每条入队记录均可附带声明式的单次工具开关配置 **`QueueToolPolicy { enabled_tools, disabled_tools }`**（以及展示用 `metadata`）：
 
 ```text
-  [CLI / SDK 客户端]                                       [agent-daemon 进程监控协程]
+  [上层业务 Server / CLI / SDK]                           [agent-daemon 进程监控协程]
          │                                                             │
          │ HTTP REST:                                                  │ WebSocket 隧道:
-         │ 1. 提交等待队列 (FollowUp)                                   │ 检测到后台进程 (wait=false) 退出
-         │ 2. 提交实时队列 (Steer / Realtime)                           │ 主动上报 PushRealtimeMessage
+         │ 1. POST /sessions/{id}/queues/pending   (入等待队列)         │ 后台进程自然退出
+         │ 2. POST /sessions/{id}/queues/realtime  (入实时队列)         │ 入队 Realtime
          ▼                                                             ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                              api-server (SQLite 单一事实源)                            │
+│                        api-server (SQLite: session_queue_messages)                   │
 │                                                                                      │
 │  ┌───────────────────────────────────────┐  ┌──────────────────────────────────────┐ │
-│  │ 1. 实时消息队列 (realtime_messages 表) │  │ 2. 等待消息队列 (activations 表)      │ │
-│  │  - 后台进程退出通知 (由 daemon 上报)   │  │  - phase = Queued 的后续任务         │ │
-│  │  - 用户实时插话 (由 client 提交)       │  │  - 等当前 Activation 完成后自动调度   │ │
+│  │ 1. 实时队列 (queue_kind = 'realtime') │  │ 2. 等待队列 (queue_kind = 'pending') │ │
+│  │  - 携带 content + tool_policy         │  │  - 携带 content + tool_policy        │ │
+│  │  - 空闲时批量消费建新 Activation      │  │  - 空闲时立刻逐条出队建 Activation   │ │
+│  │  - 忙时在 Turn 间隙批量 Drain 注入     │  │  - 忙时等当前 Activation 完成后       │ │
+│  │    当前 Activation 并动态刷新工具集    │  │    FIFO 逐条出队开启独立 Activation  │ │
 │  └───────────────────┬───────────────────┘  └──────────────────┬───────────────────┘ │
 └──────────────────────┼─────────────────────────────────────────┼─────────────────────┘
                        │                                         │
-                       │ 每次 ReAct Loop (Turn) 开始前            │ 等当前 Activation #1
-                       │ 通过 DrainRealtimeMessages 原子消费      │ 彻底完成后自动续接
+                       │ Turn 间隙 / 退出前 Drain                │ Activation 完成且 Realtime 空时
+                       │ 实时覆盖当前 Activation 工具集           │ 严格 POP 队头 1 条（不跨 Activation 继承）
                        ▼                                         ▼
               ┌─────────────────────────────────────┐   ┌──────────────────┐
               │     当前正在运行的 Activation #1     │   │  Activation #2   │
-              │  Turn 1 ──► [Drain] ──► Turn 2 ...  │   │  (自动接力启动)   │
+              │  Turn 1 ──► [Drain] ──► Turn 2 ...  │   │  (独立新使命/配置)│
               └─────────────────────────────────────┘   └──────────────────┘
 ```
 
-#### 两个队列的职责边界与调用链路对比
+### 2.2 双队列调度、工具动态刷新与跨 `Activation` 隔离规则
 
-| 维度 | 1. 实时消息队列（`Realtime Queue`） | 2. 等待消息队列（`FollowUp Queue`） |
+| 维度 | 1. `Realtime` 实时队列 | 2. `Pending` 等待队列 |
 | :--- | :--- | :--- |
-| **存储位置** | `api-server` SQLite (`realtime_messages` 表) | `api-server` SQLite (`activations` 表，`phase = Queued`) |
-| **谁调用 `api-server` 写入？** | ① **`agent-daemon`**：监控到 `wait=false` 后台进程退出时，通过 WS 隧道发送 `PushRealtimeMessage` 给 `api-server`<br>② **客户端 (CLI/SDK)**：通过 HTTP `POST /api/v1/sessions/{id}/realtime`（或 `SubmissionKind::Steer`）发送给 `api-server` | **客户端 (CLI/SDK)**：通过 HTTP `POST /api/v1/sessions/{id}/activations`（`SubmissionKind::Normal / FollowUp`）发送给 `api-server` |
-| **谁调用 `api-server` 读取？** | **`agent-core` -> `agent-daemon`**：在每次 ReAct Loop（每个 `Turn` 调用大模型前）发送 `DrainRealtimeMessages` 给 `api-server` | **`api-server` 内部调度器**：在当前 `Activation` 完成（`CompleteActivation`）的同一个事务内自动取出下一个 `Queued` Activation 派发给 `agent-daemon` |
-| **边界情况：当最后一次 Tool 执行完、模型正准备结束 Activation 时，或当 Session 已停止运行（空闲）时收到实时消息** | ① 在 ReAct 循环准备 `break` 退出前，会再做一次 `drain_realtime_messages()` 检查：若 `api-server` 实时队列非空（例如后台进程刚好在最后一刻退出），**自动继续下一轮 `Turn`** 让模型处理该通知；<br>② 若 `Session` 当前处于空闲期（`active_activation_id == None && queued_activation_count == 0`）时收到实时消息（如用户执行 `ragents steer` 或 `lifecycle=session` 的后台进程退出），`push_realtime_message` 会在同一个 SQLite 事务内**自动创建并调度一个 `Continuation` 类型的 `Activation`** 立即唤醒 Session 消费该消息！ | 当 `Session` 空闲时提交 `Activation` 会立即被调度器派发运行；当 `Session` 忙碌时以 `Queued` 状态排队，等当前 `Activation` 结束后自动按 FIFO 顺序唤醒运行。 |
+| **入队与出队粒度** | 每次消费（空闲启动或运行中 `drain`）**全量批量取出**当前所有实时消息 | 调度器在 `active_activation_id IS NULL`（且 `Realtime` 为空）时**严格逐条出队**（`ORDER BY id ASC LIMIT 1`），1 条消息 = 1 个独立 `Activation` |
+| **优先级** | **最高优先**：正在运行中在 `Turn` 间隙/准备结束前立刻吸收；旧 `Activation` 结束瞬间若仍有残留实时消息，优先于 `Pending` 启动消费 | 等当前 `Activation`（含其内部中途吸入的全部 `Realtime` 消息）彻底结束后，再按 FIFO 依次取出下一条独立执行 |
+| **工具开关 (`QueueToolPolicy`) 作用域** | 每次 `begin_turn()` / `commit_model_output_with_drain()` `drain` 出实时消息后，按入队 `id ASC` 顺序将其 `disabled_tools` / `enabled_tools` 叠加至当前 `Activation` 的生效禁用集，**立即重新构建 `active_tools` 与 `request_tools`**（本 `Activation` 后续所有 `Turn` 沿用最新工具集） | 新建 `Activation` 仅从 Session 基础工具全集 + **本次出队那 1 条消息自身的 `tool_policy`** 初始化，**绝不继承上一个 `Activation` 的任何禁用/启用状态** |
+| **物理安全性** | `ragents-core::runner::prepare_tool_call` 严格基于实时刷新后的 `active_tools` 做白名单执行校验，被禁工具即使模型幻觉输出调用也会被内核拒绝 | 每次入队 / 出队 / 撤回均触发 `SessionEvent::SessionQueueUpdated`，前端/业务侧通过 SSE 即可实时同步队列快照与原子撤回 |
+
+> **典型协同示例（禁言窥屏中途实时解禁）**：上层业务将某条只读窥屏消息以 `disabled_tools: ["chatroom_speak"]` 投入 `Pending`，开启 `Activation #1`；在其运行期间突然收到明确点名消息，业务以 `enabled_tools: ["chatroom_speak"]` 投入 `Realtime` 队列；`runner.rs` 在下一个 `Turn`（或准备退出前）原子 `drain` 该实时消息并实时刷新 `request_tools`，`Activation #1` **无需等待结束**即可在下一轮模型请求中直接使用 `chatroom_speak` 回复；而 `Activation #1` 结束后，下一个独立 `Pending` 任务开启 `Activation #2` 时天然不受先前任何状态影响。
 
 ---
 

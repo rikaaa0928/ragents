@@ -234,6 +234,10 @@ pub enum SessionEvent {
         count: usize,
         batch_seq: BatchSeq,
     },
+    SessionQueueUpdated {
+        realtime_count: usize,
+        pending_count: usize,
+    },
     SessionCompacted {
         from_session_id: SessionId,
         compaction_session_id: SessionId,
@@ -277,6 +281,7 @@ impl SessionEvent {
             SessionEvent::BackgroundProcessStarted { .. } => "background_process_started",
             SessionEvent::BackgroundProcessExited { .. } => "background_process_exited",
             SessionEvent::RealtimeMessagesDrained { .. } => "realtime_messages_drained",
+            SessionEvent::SessionQueueUpdated { .. } => "session_queue_updated",
             SessionEvent::SessionCompacted { .. } => "session_compacted",
         }
     }

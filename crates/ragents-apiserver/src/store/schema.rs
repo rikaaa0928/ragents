@@ -104,13 +104,17 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS idx_events_session_seq ON events(session_id, event_seq);
 
-            CREATE TABLE IF NOT EXISTS realtime_messages (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id   TEXT NOT NULL REFERENCES sessions(session_id),
-                content_json TEXT NOT NULL,
-                created_at   TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS session_queue_messages (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id          TEXT NOT NULL REFERENCES sessions(session_id),
+                queue_kind          TEXT NOT NULL CHECK (queue_kind IN ('realtime', 'pending')),
+                content_json        TEXT NOT NULL,
+                tool_policy_json    TEXT NOT NULL DEFAULT '{}',
+                metadata_json       TEXT NOT NULL DEFAULT '{}',
+                model_override_json TEXT,
+                created_at          TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_realtime_messages_session ON realtime_messages(session_id, id);",
+            CREATE INDEX IF NOT EXISTS idx_session_queue_messages_session ON session_queue_messages(session_id, queue_kind, id);",
         )?;
         Ok(())
     }

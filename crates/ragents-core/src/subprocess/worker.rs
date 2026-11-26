@@ -191,12 +191,6 @@ impl CoreHost for IpcCoreHostProxy {
             ParentToWorkerMessage::CommitModelOutputReply { result } => {
                 result.map_err(CoreError::HostError)
             }
-            ParentToWorkerMessage::CommitBatchReply { result } => result
-                .map(|batch_seq| CommitModelOutputResult {
-                    batch_seq,
-                    drained_realtime_items: Vec::new(),
-                })
-                .map_err(CoreError::HostError),
             other => Err(CoreError::HostError(format!(
                 "unexpected reply to CommitModelOutput: {other:?}"
             ))),
@@ -322,7 +316,7 @@ impl CoreHost for IpcCoreHostProxy {
     async fn drain_realtime_messages(
         &self,
         turn_id: Option<TurnId>,
-    ) -> Result<Vec<Item>, CoreError> {
+    ) -> Result<DrainedRealtimeBatch, CoreError> {
         let mut ch = self.channel.lock().await;
         match ch
             .call(&WorkerToParentMessage::DrainRealtimeMessages { turn_id })

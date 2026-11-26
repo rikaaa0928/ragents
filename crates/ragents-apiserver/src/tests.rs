@@ -51,25 +51,13 @@ fn test_pinned_session_never_migrates_across_nodes() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("edit main.rs")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("edit main.rs")),
         })
         .expect("create pinned session");
 
     assert_eq!(dispatches.len(), 1);
     assert_eq!(dispatches[0].node_id, NodeId::new("node_a"));
-    let act_id = ActivationId::new(
-        created
-            .initial_activation
-            .as_ref()
-            .unwrap()
-            .metadata
-            .id
-            .clone(),
-    );
+    let act_id = created.spawned_activation_id.expect("spawned activation");
 
     let future_time = Utc::now() + Duration::seconds(20);
     let rescheduled = store
@@ -80,23 +68,17 @@ fn test_pinned_session_never_migrates_across_nodes() {
     let act = store.get_activation(&act_id).unwrap().unwrap();
     assert_eq!(act.status.phase, ActivationPhase::Interrupted);
 
-    let (act2, dispatches2) = store
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: SessionId::new("sess_pinned_1"),
-                submission_kind: SubmissionKind::FollowUp,
-                input: vec![Item::user_message("try again")],
-                model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
-            },
-        })
-        .expect("create second activation");
+    // Enqueue a pending message while node_a is NotReady -> stays in Pending queue without migrating to node_b
+    let (enq2, dispatches2) = store
+        .enqueue_session_message(
+            &SessionId::new("sess_pinned_1"),
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text("try again"),
+        )
+        .expect("enqueue second message");
     assert!(dispatches2.is_empty());
-    assert_eq!(act2.status.phase, ActivationPhase::Queued);
+    assert!(enq2.spawned_activation_id.is_none());
+    assert_eq!(enq2.pending_count, 1);
 }
 
 #[test]
@@ -121,26 +103,14 @@ fn test_floating_session_failover_and_fencing_token() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("analyze algorithm")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("analyze algorithm")),
         })
         .expect("create floating session");
 
     assert_eq!(dispatches.len(), 1);
     assert_eq!(dispatches[0].node_id, NodeId::new("node_a"));
     assert_eq!(dispatches[0].lease_epoch, LeaseEpoch::new(1));
-    let act_id = ActivationId::new(
-        created
-            .initial_activation
-            .as_ref()
-            .unwrap()
-            .metadata
-            .id
-            .clone(),
-    );
+    let act_id = created.spawned_activation_id.expect("spawned activation");
 
     register_test_node(&store, "node_b", vec!["claude-sonnet-4"], 120_000);
     let future_time = Utc::now() + Duration::seconds(20);
@@ -236,15 +206,11 @@ fn test_cross_session_source_lineage_context_resolution() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("turn 1 user")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("turn 1 user")),
         })
         .expect("create parent");
 
-    let act_id = ActivationId::new(parent_res.initial_activation.unwrap().metadata.id);
+    let act_id = parent_res.spawned_activation_id.expect("parent activation");
     let epoch = dispatches[0].lease_epoch;
     store
         .commit_batch(
@@ -284,11 +250,7 @@ fn test_cross_session_source_lineage_context_resolution() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("child follow-up")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("child follow-up")),
         })
         .expect("create child session");
 
@@ -320,77 +282,78 @@ fn test_deferred_queued_activation_batch_and_atomic_withdrawal() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("turn 1 running")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("turn 1 running")),
         })
         .expect("create session");
 
-    let act1_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act1_id = created.spawned_activation_id.expect("spawned activation");
     let epoch1 = dispatches[0].lease_epoch;
-    assert!( store.withdraw_queued_activation(&act1_id).is_err(), "scheduled activation cannot be withdrawn" );
 
-    // Submit a second activation while act1 is still active -> act2 stays Queued
-    let (act2, dispatches2) = store
-        .create_activation(CreateActivationRequest {
-            activation_id: None,
-            labels: BTreeMap::new(),
-            spec: ActivationSpec {
-                session_id: SessionId::new("sess_withdraw_1"),
-                submission_kind: SubmissionKind::FollowUp,
-                input: vec![Item::user_message("turn 2 queued to withdraw")],
+    // Enqueue 3 pending messages while act1 is still active: [p1 (muted), p2 (to withdraw), p3 (normal)]
+    let (p1, d1) = store
+        .enqueue_session_message(
+            &SessionId::new("sess_withdraw_1"),
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest {
+                content: vec![openresponses_rust::MessageContent::InputText {
+                    text: "pending 1 muted".to_string(),
+                }],
+                tool_policy: QueueToolPolicy::with_disabled(["chatroom_speak".to_string()]),
+                metadata: BTreeMap::new(),
                 model_override: None,
-                disabled_tools: vec![],
-                desired_phase: DesiredActivationPhase::Running,
-                interaction_responses: BTreeMap::new(),
             },
-        })
-        .expect("create queued activation");
-    assert!(dispatches2.is_empty());
-    assert_eq!(act2.status.phase, ActivationPhase::Queued);
-    let act2_id = ActivationId::new(act2.metadata.id);
+        )
+        .expect("enqueue p1");
+    assert!(d1.is_empty());
+    let (p2, _) = store
+        .enqueue_session_message(
+            &SessionId::new("sess_withdraw_1"),
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest::from_text("pending 2 to withdraw"),
+        )
+        .expect("enqueue p2");
+    let (p3, _) = store
+        .enqueue_session_message(
+            &SessionId::new("sess_withdraw_1"),
+            QueueKind::Pending,
+            EnqueueSessionMessageRequest {
+                content: vec![openresponses_rust::MessageContent::InputText {
+                    text: "pending 3 enabled".to_string(),
+                }],
+                tool_policy: QueueToolPolicy::with_enabled(["chatroom_speak".to_string()]),
+                metadata: BTreeMap::new(),
+                model_override: None,
+            },
+        )
+        .expect("enqueue p3");
+    assert_eq!(p3.pending_count, 3);
 
-    // While act2 is Queued, its input must NOT be in effective_items yet!
+    // While pending, their inputs must NOT be in effective_items yet!
     let ctx_while_queued = store
         .read_effective_context(&SessionId::new("sess_withdraw_1"))
         .expect("read context");
     assert_eq!(ctx_while_queued.effective_items.len(), 1);
 
-    // Withdraw act2 while Queued -> succeeds and leaves zero residue in effective_items
+    // Withdraw p2 atomically
     let withdrawn = store
-        .withdraw_queued_activation(&act2_id)
-        .expect("withdraw queued activation");
-    assert_eq!(withdrawn.status.phase, ActivationPhase::Cancelled);
+        .withdraw_session_queue_message(&SessionId::new("sess_withdraw_1"), p2.message.id)
+        .expect("withdraw pending p2");
+    assert_eq!(withdrawn.pending_count, 2);
 
-    let ctx_after_withdraw = store
-        .read_effective_context(&SessionId::new("sess_withdraw_1"))
-        .expect("read context after withdraw");
-    assert_eq!(ctx_after_withdraw.effective_items.len(), 1);
-
-    // Also test realtime message push + withdraw before drain
-    let rt_pushed = store
-        .push_realtime_message(
+    // Also test realtime message enqueue + withdraw before drain
+    let (rt_pushed, _) = store
+        .enqueue_session_message(
             &SessionId::new("sess_withdraw_1"),
-            vec![openresponses_rust::MessageContent::InputText {
-                text: "urgent realtime".to_string(),
-            }],
+            QueueKind::Realtime,
+            EnqueueSessionMessageRequest::from_text("urgent realtime"),
         )
-        .expect("push realtime");
-    assert_eq!(rt_pushed.queued_count, 1);
-    assert_eq!(rt_pushed.inserted_ids.len(), 1);
+        .expect("enqueue realtime");
+    assert_eq!(rt_pushed.realtime_count, 1);
 
     let rt_withdrawn = store
-        .withdraw_realtime_messages(
-            &SessionId::new("sess_withdraw_1"),
-            WithdrawRealtimeMessageRequest {
-                message_ids: rt_pushed.inserted_ids,
-            },
-        )
+        .withdraw_session_queue_message(&SessionId::new("sess_withdraw_1"), rt_pushed.message.id)
         .expect("withdraw realtime");
-    assert_eq!(rt_withdrawn.removed_count, 1);
-    assert_eq!(rt_withdrawn.remaining_count, 0);
+    assert_eq!(rt_withdrawn.realtime_count, 0);
 
     let (drained, _) = store
         .drain_realtime_messages(
@@ -400,7 +363,53 @@ fn test_deferred_queued_activation_batch_and_atomic_withdrawal() {
             None,
         )
         .expect("drain realtime");
-    assert!(drained.is_empty());
+    assert!(drained.items.is_empty());
+
+    // Complete act1 -> MUST pop ONLY head 1 (`p1`) with `disabled_tools: ["chatroom_speak"]`, leaving `p3` queued!
+    let (_, next_dispatches_1) = store
+        .complete_activation(
+            &SessionId::new("sess_withdraw_1"),
+            &act1_id,
+            epoch1,
+            None,
+            ActivationTerminalOutcome::Succeeded { usage: None },
+        )
+        .expect("complete act1");
+    assert_eq!(next_dispatches_1.len(), 1);
+    assert_eq!(
+        next_dispatches_1[0].activation.spec.tool_policy,
+        p1.message.tool_policy
+    );
+    let q_after_act1 = store
+        .list_session_queues(&SessionId::new("sess_withdraw_1"))
+        .expect("list queues");
+    assert_eq!(q_after_act1.pending.len(), 1);
+    assert_eq!(q_after_act1.pending[0].id, p3.message.id);
+
+    // Complete act2 (`p1`) -> MUST pop `p3` WITHOUT inheriting `p1`'s disabled_tools!
+    let act2_id = ActivationId::new(next_dispatches_1[0].activation.metadata.id.clone());
+    let epoch2 = next_dispatches_1[0].lease_epoch;
+    let (_, next_dispatches_2) = store
+        .complete_activation(
+            &SessionId::new("sess_withdraw_1"),
+            &act2_id,
+            epoch2,
+            None,
+            ActivationTerminalOutcome::Succeeded { usage: None },
+        )
+        .expect("complete act2");
+    assert_eq!(next_dispatches_2.len(), 1);
+    assert!(next_dispatches_2[0]
+        .activation
+        .spec
+        .tool_policy
+        .disabled_tools
+        .is_empty());
+    let q_after_act2 = store
+        .list_session_queues(&SessionId::new("sess_withdraw_1"))
+        .expect("list queues");
+    assert!(q_after_act2.pending.is_empty());
+    assert!(q_after_act2.realtime.is_empty());
 }
 
 #[test]
@@ -426,23 +435,11 @@ fn test_running_activation_grace_period_and_reconnect_reconciliation() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("long running task")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("long running task")),
         })
         .expect("create session");
 
-    let act_id = ActivationId::new(
-        created
-            .initial_activation
-            .as_ref()
-            .unwrap()
-            .metadata
-            .id
-            .clone(),
-    );
+    let act_id = created.spawned_activation_id.expect("spawned activation");
     let epoch1 = dispatches[0].lease_epoch;
 
     let cfg = ConfigRevision::new_merged(
@@ -545,23 +542,11 @@ fn test_context_and_events_full_vs_view_mode_placeholders() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("inspect image")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("inspect image")),
         })
         .expect("create session");
 
-    let act_id = ActivationId::new(
-        created
-            .initial_activation
-            .as_ref()
-            .unwrap()
-            .metadata
-            .id
-            .clone(),
-    );
+    let act_id = created.spawned_activation_id.expect("spawned activation");
     let epoch = dispatches[0].lease_epoch;
     let cfg = ConfigRevision::new_merged(
         "prompt".to_string(),
@@ -870,7 +855,7 @@ async fn test_delete_disconnected_node_guards() {
                 permissions: PermissionPolicyLayer::default(),
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: None,
+            initial_message: None,
         })
         .unwrap();
 
@@ -945,14 +930,10 @@ fn test_automatic_permission_pruning_across_scopes() {
                 permissions: anima_sess_perms,
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("run")],
-                model_override: None,
-                disabled_tools: vec![],
-            }),
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("run")),
         })
         .unwrap();
-    let act_id = anima_resp.initial_activation.unwrap().metadata.id;
+    let act_id = anima_resp.spawned_activation_id.unwrap().to_string();
     let lease_epoch = dispatches[0].lease_epoch;
 
     // Session 2 in `/tmp/u/src/moss-image` (different workspace) with the same subpath grant
@@ -978,7 +959,7 @@ fn test_automatic_permission_pruning_across_scopes() {
                 permissions: moss_sess_perms,
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: None,
+            initial_message: None,
         })
         .unwrap();
 
@@ -1004,7 +985,7 @@ fn test_automatic_permission_pruning_across_scopes() {
                 permissions: float_perms,
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: None,
+            initial_message: None,
         })
         .unwrap();
 
@@ -1203,7 +1184,7 @@ fn test_write_grant_prunes_lower_read_respecting_write_deny() {
                 permissions: sess_perms,
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: None,
+            initial_message: None,
         })
         .unwrap();
     assert_eq!(created.session.metadata.id, "sess_write_prune");

@@ -267,7 +267,7 @@ impl CoreHost for DaemonCoreHost {
         turn_id: &TurnId,
         include_context: bool,
     ) -> Result<BeginTurnOutput, CoreError> {
-        let (drained_items, effective_items) = self
+        let (drained_realtime, effective_items) = self
             .tunnel
             .begin_turn(
                 self.session_id.clone(),
@@ -279,7 +279,7 @@ impl CoreHost for DaemonCoreHost {
             .await
             .map_err(|e| CoreError::HostError(e.to_string()))?;
         Ok(BeginTurnOutput {
-            drained_items,
+            drained_realtime,
             effective_items,
         })
     }
@@ -304,7 +304,7 @@ impl CoreHost for DaemonCoreHost {
         usage: Option<Usage>,
         drain_realtime: bool,
     ) -> Result<CommitModelOutputResult, CoreError> {
-        let (batch_seq, drained_realtime_items) = self
+        let (batch_seq, drained_realtime) = self
             .tunnel
             .commit_batch_with_drain(
                 self.session_id.clone(),
@@ -321,7 +321,7 @@ impl CoreHost for DaemonCoreHost {
             .map_err(|e| CoreError::HostError(e.to_string()))?;
         Ok(CommitModelOutputResult {
             batch_seq,
-            drained_realtime_items,
+            drained_realtime,
         })
     }
 
@@ -604,7 +604,7 @@ impl CoreHost for DaemonCoreHost {
     async fn drain_realtime_messages(
         &self,
         turn_id: Option<TurnId>,
-    ) -> Result<Vec<Item>, CoreError> {
+    ) -> Result<DrainedRealtimeBatch, CoreError> {
         self.tunnel
             .drain_realtime_messages(
                 self.session_id.clone(),

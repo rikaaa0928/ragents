@@ -393,61 +393,14 @@ async fn run_react_loop(
     prompt_parts.extension_prompts = extension_prompts.clone();
     draft.system_prompt = prompt_parts.assemble();
 
-    let active_tools = draft
-        .tools
-        .iter()
-        .filter(|t| {
-            t.enabled
-                && !run_spec
-                    .disabled_tools
-                    .iter()
-                    .any(|disabled| disabled == &t.definition.name)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut disabled_tools_set = std::collections::BTreeSet::new();
+    run_spec.tool_policy.apply_to(&mut disabled_tools_set);
 
-    let active_built_in_tools = cfg
-        .model
-        .built_in_tools
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|name| {
-            !name.is_empty()
-                && !run_spec
-                    .disabled_tools
-                    .iter()
-                    .any(|disabled| disabled == name)
-        })
-        .collect::<Vec<_>>();
+    let (mut active_tools, mut request_tools, active_tool_names) =
+        rebuild_effective_tools(&draft.tools, &cfg.model.built_in_tools, &disabled_tools_set);
 
-    let mut active_tool_names = active_tools
-        .iter()
-        .map(|t| t.definition.name.clone())
-        .collect::<Vec<_>>();
-    for bt in &active_built_in_tools {
-        if !active_tool_names.contains(bt) {
-            active_tool_names.push(bt.clone());
-        }
-    }
-
-    host.report_prepared_config(extension_prompts, active_tool_names)
+    host.report_prepared_config(extension_prompts.clone(), active_tool_names)
         .await?;
-
-    let mut request_tools = active_tools
-        .iter()
-        .map(|t| {
-            Tool::function(t.definition.name.clone())
-                .with_description(t.definition.description.clone())
-                .with_parameters(t.definition.parameters.clone())
-        })
-        .collect::<Vec<_>>();
-
-    for bt in &active_built_in_tools {
-        request_tools.push(Tool::Extension {
-            tool_type: bt.clone(),
-            extra: serde_json::Map::new(),
-        });
-    }
 
     let mut iteration = 0usize;
     let mut final_text = String::new();
@@ -471,13 +424,27 @@ async fn run_react_loop(
 
         let include_context = cached_effective_items.is_none();
         let begin_out = host.begin_turn(&turn_id, include_context).await?;
+        let mut tools_changed = false;
+        for pol in &begin_out.drained_realtime.tool_policies {
+            if pol.apply_to(&mut disabled_tools_set) {
+                tools_changed = true;
+            }
+        }
+        if tools_changed {
+            let (next_active, next_req, next_names) =
+                rebuild_effective_tools(&draft.tools, &cfg.model.built_in_tools, &disabled_tools_set);
+            active_tools = next_active;
+            request_tools = next_req;
+            host.report_prepared_config(extension_prompts.clone(), next_names)
+                .await?;
+        }
         let raw_items = if let Some(initial_items) = begin_out.effective_items {
             cached_effective_items = Some(initial_items.clone());
             initial_items
         } else {
             let cached = cached_effective_items.get_or_insert_with(Vec::new);
-            if !begin_out.drained_items.is_empty() {
-                cached.extend(begin_out.drained_items);
+            if !begin_out.drained_realtime.items.is_empty() {
+                cached.extend(begin_out.drained_realtime.items);
             }
             cached.clone()
         };
@@ -815,11 +782,28 @@ async fn run_react_loop(
 
             // If any real-time messages arrived during the final turn, they were atomically drained
             // inside `commit_model_output_with_drain`; append them to local cache and continue into another Turn.
-            if commit_res.drained_realtime_items.is_empty() {
+            if commit_res.drained_realtime.items.is_empty() {
                 break;
             }
+            let mut tools_changed = false;
+            for pol in &commit_res.drained_realtime.tool_policies {
+                if pol.apply_to(&mut disabled_tools_set) {
+                    tools_changed = true;
+                }
+            }
+            if tools_changed {
+                let (next_active, next_req, next_names) = rebuild_effective_tools(
+                    &draft.tools,
+                    &cfg.model.built_in_tools,
+                    &disabled_tools_set,
+                );
+                active_tools = next_active;
+                request_tools = next_req;
+                host.report_prepared_config(extension_prompts.clone(), next_names)
+                    .await?;
+            }
             if let Some(ref mut cached) = cached_effective_items {
-                cached.extend(commit_res.drained_realtime_items);
+                cached.extend(commit_res.drained_realtime.items);
             }
         }
     }
@@ -832,6 +816,52 @@ async fn run_react_loop(
         last_turn_id,
         compacted_into_session_id: None,
     })
+}
+
+fn rebuild_effective_tools(
+    draft_tools: &[ToolEntry],
+    built_in_tools: &[String],
+    disabled_tools_set: &std::collections::BTreeSet<String>,
+) -> (Vec<ToolEntry>, Vec<Tool>, Vec<String>) {
+    let active_tools = draft_tools
+        .iter()
+        .filter(|t| t.enabled && !disabled_tools_set.contains(&t.definition.name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let active_built_in_tools = built_in_tools
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|name| !name.is_empty() && !disabled_tools_set.contains(name))
+        .collect::<Vec<_>>();
+
+    let mut active_tool_names = active_tools
+        .iter()
+        .map(|t| t.definition.name.clone())
+        .collect::<Vec<_>>();
+    for bt in &active_built_in_tools {
+        if !active_tool_names.contains(bt) {
+            active_tool_names.push(bt.clone());
+        }
+    }
+
+    let mut request_tools = active_tools
+        .iter()
+        .map(|t| {
+            Tool::function(t.definition.name.clone())
+                .with_description(t.definition.description.clone())
+                .with_parameters(t.definition.parameters.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for bt in &active_built_in_tools {
+        request_tools.push(Tool::Extension {
+            tool_type: bt.clone(),
+            extra: serde_json::Map::new(),
+        });
+    }
+
+    (active_tools, request_tools, active_tool_names)
 }
 
 enum ContextProjectionOutcome {

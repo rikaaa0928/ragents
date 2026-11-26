@@ -245,7 +245,7 @@ fn handle_daemon_message(
                     resource_version: Some(act.metadata.resource_version),
                     batch_seq: None,
                     spawned_session_id: None,
-                    drained_items: vec![],
+                    drained_realtime: DrainedRealtimeBatch::default(),
                     error: None,
                 },
                 Err(e) => ServerToDaemonMessage::Ack {
@@ -254,7 +254,7 @@ fn handle_daemon_message(
                     resource_version: None,
                     batch_seq: None,
                     spawned_session_id: None,
-                    drained_items: vec![],
+                    drained_realtime: DrainedRealtimeBatch::default(),
                     error: Some(e.to_string()),
                 },
             };
@@ -287,13 +287,13 @@ fn handle_daemon_message(
                 companion_event,
                 drain_realtime,
             ) {
-                Ok((batch_seq, rv, drained_items)) => ServerToDaemonMessage::Ack {
+                Ok((batch_seq, rv, drained_realtime)) => ServerToDaemonMessage::Ack {
                     request_id: request_id.clone(),
                     ok: true,
                     resource_version: Some(rv),
                     batch_seq: Some(batch_seq),
                     spawned_session_id: None,
-                    drained_items,
+                    drained_realtime,
                     error: None,
                 },
                 Err(e) => ServerToDaemonMessage::Ack {
@@ -302,7 +302,7 @@ fn handle_daemon_message(
                     resource_version: None,
                     batch_seq: None,
                     spawned_session_id: None,
-                    drained_items: vec![],
+                    drained_realtime: DrainedRealtimeBatch::default(),
                     error: Some(e.to_string()),
                 },
             };
@@ -327,17 +327,17 @@ fn handle_daemon_message(
                 turn_id,
                 include_context,
             ) {
-                Ok((drained_items, effective_items)) => ServerToDaemonMessage::BeginTurnReply {
+                Ok((drained_realtime, effective_items)) => ServerToDaemonMessage::BeginTurnReply {
                     request_id: request_id.clone(),
                     ok: true,
-                    drained_items,
+                    drained_realtime,
                     effective_items,
                     error: None,
                 },
                 Err(e) => ServerToDaemonMessage::BeginTurnReply {
                     request_id: request_id.clone(),
                     ok: false,
-                    drained_items: vec![],
+                    drained_realtime: DrainedRealtimeBatch::default(),
                     effective_items: None,
                     error: Some(e.to_string()),
                 },
@@ -374,7 +374,7 @@ fn handle_daemon_message(
                             resource_version: Some(env.resource_version),
                             batch_seq: None,
                             spawned_session_id: None,
-                            drained_items: vec![],
+                            drained_realtime: DrainedRealtimeBatch::default(),
                             error: None,
                         };
                         cache_and_send(state, out_tx, request_id, reply);
@@ -388,7 +388,7 @@ fn handle_daemon_message(
                             resource_version: None,
                             batch_seq: None,
                             spawned_session_id: None,
-                            drained_items: vec![],
+                            drained_realtime: DrainedRealtimeBatch::default(),
                             error: Some(e.to_string()),
                         };
                         cache_and_send(state, out_tx, request_id, reply);
@@ -427,14 +427,23 @@ fn handle_daemon_message(
                 let _ = out_tx.send(cached);
                 return;
             }
-            let reply = match state.store.push_realtime_message(&session_id, content) {
-                Ok(_count) => ServerToDaemonMessage::Ack {
+            let reply = match state.store.enqueue_session_message(
+                &session_id,
+                QueueKind::Realtime,
+                EnqueueSessionMessageRequest {
+                    content,
+                    tool_policy: QueueToolPolicy::default(),
+                    metadata: std::collections::BTreeMap::new(),
+                    model_override: None,
+                },
+            ) {
+                Ok(_) => ServerToDaemonMessage::Ack {
                     request_id: request_id.clone(),
                     ok: true,
                     resource_version: None,
                     batch_seq: None,
                     spawned_session_id: None,
-                    drained_items: vec![],
+                    drained_realtime: DrainedRealtimeBatch::default(),
                     error: None,
                 },
                 Err(e) => ServerToDaemonMessage::Ack {
@@ -443,7 +452,7 @@ fn handle_daemon_message(
                     resource_version: None,
                     batch_seq: None,
                     spawned_session_id: None,
-                    drained_items: vec![],
+                    drained_realtime: DrainedRealtimeBatch::default(),
                     error: Some(e.to_string()),
                 },
             };
@@ -466,17 +475,17 @@ fn handle_daemon_message(
                 lease_epoch,
                 turn_id,
             ) {
-                Ok((items, batch_seq)) => ServerToDaemonMessage::RealtimeMessagesReply {
+                Ok((drained, batch_seq)) => ServerToDaemonMessage::RealtimeMessagesReply {
                     request_id: request_id.clone(),
                     ok: true,
-                    items,
+                    drained,
                     batch_seq,
                     error: None,
                 },
                 Err(e) => ServerToDaemonMessage::RealtimeMessagesReply {
                     request_id: request_id.clone(),
                     ok: false,
-                    items: vec![],
+                    drained: DrainedRealtimeBatch::default(),
                     batch_seq: None,
                     error: Some(e.to_string()),
                 },
@@ -508,7 +517,7 @@ fn handle_daemon_message(
                     resource_version: Some(act.metadata.resource_version),
                     batch_seq: None,
                     spawned_session_id: None,
-                    drained_items: vec![],
+                    drained_realtime: DrainedRealtimeBatch::default(),
                     error: None,
                 },
                 Err(e) => ServerToDaemonMessage::Ack {
@@ -517,7 +526,7 @@ fn handle_daemon_message(
                     resource_version: None,
                     batch_seq: None,
                     spawned_session_id: None,
-                    drained_items: vec![],
+                    drained_realtime: DrainedRealtimeBatch::default(),
                     error: Some(e.to_string()),
                 },
             };
@@ -595,7 +604,7 @@ fn send_ack_ok(
         resource_version,
         batch_seq: None,
         spawned_session_id: None,
-        drained_items: vec![],
+        drained_realtime: DrainedRealtimeBatch::default(),
         error: None,
     });
 }
@@ -611,7 +620,7 @@ fn send_ack_err(
         resource_version: None,
         batch_seq: None,
         spawned_session_id: None,
-        drained_items: vec![],
+        drained_realtime: DrainedRealtimeBatch::default(),
         error: Some(error),
     });
 }

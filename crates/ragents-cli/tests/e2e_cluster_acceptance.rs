@@ -193,17 +193,20 @@ async fn test_e2e_openresponses_http_wasm_tool_and_interactive_permission_approv
                 },
                 extra_tmp_dirs: vec![],
             },
-            initial_activation: Some(InitialActivationRequest {
-                input: vec![Item::user_message("please write approved.txt")],
+            initial_message: Some(EnqueueSessionMessageRequest {
+                content: vec![openresponses_rust::MessageContent::InputText {
+                    text: "please write approved.txt".to_string(),
+                }],
+                tool_policy: QueueToolPolicy::default(),
+                metadata: BTreeMap::new(),
                 model_override: None,
-                disabled_tools: vec![],
             }),
         })
         .await
         .unwrap();
 
     let sess_id = SessionId::new(created.session.metadata.id);
-    let act_id = ActivationId::new(created.initial_activation.unwrap().metadata.id);
+    let act_id = created.spawned_activation_id.expect("spawned activation");
 
     // 5. Watch SSE events: when PermissionRequested arrives, declaratively approve it!
     let mut watch = client.watch_events(Some(&sess_id), 0).await.unwrap();

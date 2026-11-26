@@ -202,46 +202,49 @@ impl RagentsClient {
         Self::parse_response(resp).await
     }
 
-    pub async fn create_activation(
-        &self,
-        req: CreateActivationRequest,
-    ) -> Result<Activation, ClientError> {
-        let url = format!("{}/api/v1/activations", self.base_url);
-        let resp = self.http.post(url).json(&req).send().await?;
-        Self::parse_response(resp).await
-    }
-
-    pub async fn push_realtime_message(
+    pub async fn enqueue_session_message(
         &self,
         session_id: &SessionId,
-        req: PushRealtimeMessageRequest,
-    ) -> Result<PushRealtimeMessageResponse, ClientError> {
-        let url = format!("{}/api/v1/sessions/{}/realtime", self.base_url, session_id);
-        let resp = self.http.post(url).json(&req).send().await?;
-        Self::parse_response(resp).await
-    }
-
-    pub async fn withdraw_realtime_messages(
-        &self,
-        session_id: &SessionId,
-        req: WithdrawRealtimeMessageRequest,
-    ) -> Result<WithdrawRealtimeMessageResponse, ClientError> {
+        queue_kind: QueueKind,
+        req: EnqueueSessionMessageRequest,
+    ) -> Result<EnqueueSessionMessageResponse, ClientError> {
         let url = format!(
-            "{}/api/v1/sessions/{}/realtime/withdraw",
-            self.base_url, session_id
+            "{}/api/v1/sessions/{}/queues/{}",
+            self.base_url,
+            session_id,
+            queue_kind.as_str()
         );
         let resp = self.http.post(url).json(&req).send().await?;
         Self::parse_response(resp).await
     }
 
-    pub async fn withdraw_queued_activation(
+    pub async fn list_session_queues(
         &self,
-        activation_id: &ActivationId,
-    ) -> Result<Activation, ClientError> {
+        session_id: &SessionId,
+    ) -> Result<SessionQueuesResponse, ClientError> {
+        let url = format!("{}/api/v1/sessions/{}/queues", self.base_url, session_id);
+        let resp = self.http.get(url).send().await?;
+        Self::parse_response(resp).await
+    }
+
+    pub async fn withdraw_session_queue_message(
+        &self,
+        session_id: &SessionId,
+        message_id: i64,
+    ) -> Result<WithdrawSessionQueueMessageResponse, ClientError> {
         let url = format!(
-            "{}/api/v1/activations/{}/withdraw",
-            self.base_url, activation_id
+            "{}/api/v1/sessions/{}/queues/{}",
+            self.base_url, session_id, message_id
         );
+        let resp = self.http.delete(url).send().await?;
+        Self::parse_response(resp).await
+    }
+
+    pub async fn resume_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ResumeSessionResponse, ClientError> {
+        let url = format!("{}/api/v1/sessions/{}/resume", self.base_url, session_id);
         let resp = self.http.post(url).send().await?;
         Self::parse_response(resp).await
     }

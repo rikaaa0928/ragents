@@ -63,8 +63,8 @@ pub struct CoreRunSpec {
     pub effective_config: ConfigRevision,
     #[serde(default)]
     pub effective_permissions: PermissionPolicyLayer,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub tool_policy: QueueToolPolicy,
     pub model_endpoint: ModelEndpointConfig,
     pub max_turns: Option<usize>,
 }
@@ -83,7 +83,7 @@ pub struct CoreRunSummary {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BeginTurnOutput {
     #[serde(default)]
-    pub drained_items: Vec<Item>,
+    pub drained_realtime: DrainedRealtimeBatch,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_items: Option<Vec<Item>>,
 }
@@ -91,8 +91,8 @@ pub struct BeginTurnOutput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommitModelOutputResult {
     pub batch_seq: BatchSeq,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub drained_realtime_items: Vec<Item>,
+    #[serde(default)]
+    pub drained_realtime: DrainedRealtimeBatch,
 }
 
 #[async_trait]
@@ -106,7 +106,7 @@ pub trait CoreHost: Send + Sync {
         turn_id: &TurnId,
         include_context: bool,
     ) -> Result<BeginTurnOutput, CoreError> {
-        let drained_items = self.drain_realtime_messages(Some(turn_id.clone())).await?;
+        let drained_realtime = self.drain_realtime_messages(Some(turn_id.clone())).await?;
         let effective_items = if include_context {
             Some(self.load_effective_context().await?)
         } else {
@@ -115,7 +115,7 @@ pub trait CoreHost: Send + Sync {
         self.emit_event(Some(turn_id.clone()), SessionEvent::TurnStarted)
             .await?;
         Ok(BeginTurnOutput {
-            drained_items,
+            drained_realtime,
             effective_items,
         })
     }
@@ -150,14 +150,14 @@ pub trait CoreHost: Send + Sync {
         let batch_seq = self
             .commit_model_output(turn_id, response_id, items, usage)
             .await?;
-        let drained_realtime_items = if drain_realtime {
+        let drained_realtime = if drain_realtime {
             self.drain_realtime_messages(None).await?
         } else {
-            Vec::new()
+            DrainedRealtimeBatch::default()
         };
         Ok(CommitModelOutputResult {
             batch_seq,
-            drained_realtime_items,
+            drained_realtime,
         })
     }
 
@@ -214,8 +214,8 @@ pub trait CoreHost: Send + Sync {
     async fn drain_realtime_messages(
         &self,
         _turn_id: Option<TurnId>,
-    ) -> Result<Vec<Item>, CoreError> {
-        Ok(Vec::new())
+    ) -> Result<DrainedRealtimeBatch, CoreError> {
+        Ok(DrainedRealtimeBatch::default())
     }
 
     /// Delegates background process management (`wait=false`, `status`, `logs`, `stop`) to the host daemon.

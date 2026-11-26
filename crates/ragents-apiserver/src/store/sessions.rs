@@ -17,13 +17,13 @@ impl SqliteStore {
                 ProtocolValidationError::InvalidIdentifier(session_id.to_string()),
             ));
         }
-        if let Some(ref init_act) = req.initial_activation {
-            if init_act.input.is_empty() {
+        if let Some(ref init_msg) = req.initial_message {
+            if init_msg.content.is_empty() {
                 return Err(StoreError::Validation(
                     ProtocolValidationError::EmptyActivationInput,
                 ));
             }
-            if let Some(ref m) = init_act.model_override {
+            if let Some(ref m) = init_msg.model_override {
                 m.validate()?;
             }
         }
@@ -188,40 +188,32 @@ impl SqliteStore {
             Self::save_session_in_tx(&tx, &mut session)?;
             events_to_publish.push(created_ev);
 
-            let initial_activation = if let Some(init_req) = req.initial_activation {
-                let act = Self::create_activation_in_tx(
+            let initial_message_id = if let Some(init_req) = req.initial_message {
+                let msg = Self::insert_queue_message_in_tx(
                     &tx,
-                    CreateActivationRequest {
-                        activation_id: None,
-                        labels: BTreeMap::new(),
-                        spec: ActivationSpec {
-                            session_id: session_id.clone(),
-                            submission_kind: SubmissionKind::Normal,
-                            input: init_req.input,
-                            model_override: init_req.model_override,
-                            disabled_tools: init_req.disabled_tools,
-                            desired_phase: DesiredActivationPhase::Running,
-                            interaction_responses: BTreeMap::new(),
-                        },
-                    },
-                    &mut events_to_publish,
+                    &session_id,
+                    QueueKind::Pending,
+                    &init_req,
                 )?;
-                Some(act)
+                session.status.pending_queue_count = 1;
+                Self::save_session_in_tx(&tx, &mut session)?;
+                Some(msg.id)
             } else {
                 None
             };
 
             dispatches = Self::schedule_pending_in_tx(&tx, &mut events_to_publish)?;
+            let spawned_activation_id = dispatches
+                .iter()
+                .find(|d| d.session.metadata.id == session_id.as_str())
+                .map(|d| ActivationId::new(d.activation.metadata.id.clone()));
             session = Self::load_session_in_tx(&tx, &session_id)?.unwrap();
-            let updated_initial_act = match initial_activation {
-                Some(a) => Self::load_activation_in_tx(&tx, &ActivationId::new(a.metadata.id))?,
-                None => None,
-            };
 
             tx.commit()?;
             CreateSessionResponse {
                 session,
-                initial_activation: updated_initial_act,
+                initial_message_id,
+                spawned_activation_id,
             }
         };
 
@@ -400,7 +392,27 @@ impl SqliteStore {
                             events_to_publish.push(cancel_ev);
                         }
                     }
-                    session.status.queued_activation_count = 0;
+                    let deleted_q = tx.execute(
+                        "DELETE FROM session_queue_messages WHERE session_id = ?1",
+                        params![target_sid.as_str()],
+                    )?;
+                    session.status.realtime_queue_count = 0;
+                    session.status.pending_queue_count = 0;
+                    if deleted_q > 0 {
+                        let q_ev = Self::append_event_in_tx(
+                            &tx,
+                            &target_sid,
+                            None,
+                            None,
+                            None,
+                            SessionEvent::SessionQueueUpdated {
+                                realtime_count: 0,
+                                pending_count: 0,
+                            },
+                        )?;
+                        session.status.event_count = q_ev.event_seq.value() + 1;
+                        events_to_publish.push(q_ev);
+                    }
 
                     // If there is an active activation, request cancellation and notify the assigned daemon
                     if let Some(active_id) = session.status.active_activation_id.clone() {

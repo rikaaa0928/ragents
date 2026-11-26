@@ -347,83 +347,95 @@ pub(crate) async fn handle_list_session_activations(
     Ok(Json(activations))
 }
 
-pub(crate) async fn handle_create_activation(
+pub(crate) async fn handle_enqueue_session_message(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
-    Json(req): Json<CreateActivationRequest>,
-) -> Result<(StatusCode, Json<Activation>), ApiError> {
+    Path((session_id, queue_kind_str)): Path<(String, String)>,
+    Json(req): Json<EnqueueSessionMessageRequest>,
+) -> Result<(StatusCode, Json<EnqueueSessionMessageResponse>), ApiError> {
     state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
             "POST",
-            "/api/v1/activations",
+            &format!("/api/v1/sessions/{session_id}/queues/{queue_kind_str}"),
             &headers,
         )
         .await?;
-    let (act, _) = state.store.create_activation(req)?;
-    Ok((StatusCode::CREATED, Json(act)))
-}
-
-pub(crate) async fn handle_push_realtime_message(
-    State(state): State<ApiServerState>,
-    headers: HeaderMap,
-    Path(session_id): Path<String>,
-    Json(req): Json<PushRealtimeMessageRequest>,
-) -> Result<(StatusCode, Json<PushRealtimeMessageResponse>), ApiError> {
-    state
-        .extensions
-        .authenticate(
-            AuthScope::ClientHttp,
-            "POST",
-            &format!("/api/v1/sessions/{session_id}/realtime"),
-            &headers,
+    let queue_kind = QueueKind::parse(&queue_kind_str).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid queue kind '{queue_kind_str}' (expected 'realtime' or 'pending')"),
         )
-        .await?;
+    })?;
     let id = SessionId::new(session_id);
-    let resp = state
+    let (resp, _) = state
         .store
-        .push_realtime_message_with_options(&id, req.content, req.disabled_tools)?;
+        .enqueue_session_message(&id, queue_kind, req)?;
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
-pub(crate) async fn handle_withdraw_realtime_message(
+pub(crate) async fn handle_list_session_queues(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    Json(req): Json<WithdrawRealtimeMessageRequest>,
-) -> Result<Json<WithdrawRealtimeMessageResponse>, ApiError> {
+) -> Result<Json<SessionQueuesResponse>, ApiError> {
     state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
-            "POST",
-            &format!("/api/v1/sessions/{session_id}/realtime/withdraw"),
+            "GET",
+            &format!("/api/v1/sessions/{session_id}/queues"),
             &headers,
         )
         .await?;
     let id = SessionId::new(session_id);
-    let resp = state.store.withdraw_realtime_messages(&id, req)?;
+    let resp = state.store.list_session_queues(&id)?;
     Ok(Json(resp))
 }
 
-pub(crate) async fn handle_withdraw_activation(
+pub(crate) async fn handle_withdraw_session_queue_message(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
-    Path(activation_id): Path<String>,
-) -> Result<Json<Activation>, ApiError> {
+    Path((session_id, target)): Path<(String, String)>,
+) -> Result<Json<WithdrawSessionQueueMessageResponse>, ApiError> {
+    state
+        .extensions
+        .authenticate(
+            AuthScope::ClientHttp,
+            "DELETE",
+            &format!("/api/v1/sessions/{session_id}/queues/{target}"),
+            &headers,
+        )
+        .await?;
+    let message_id: i64 = target.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid queue message id '{target}'"),
+        )
+    })?;
+    let id = SessionId::new(session_id);
+    let resp = state.store.withdraw_session_queue_message(&id, message_id)?;
+    Ok(Json(resp))
+}
+
+pub(crate) async fn handle_resume_session(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<(StatusCode, Json<ResumeSessionResponse>), ApiError> {
     state
         .extensions
         .authenticate(
             AuthScope::ClientHttp,
             "POST",
-            &format!("/api/v1/activations/{activation_id}/withdraw"),
+            &format!("/api/v1/sessions/{session_id}/resume"),
             &headers,
         )
         .await?;
-    let id = ActivationId::new(activation_id);
-    let act = state.store.withdraw_queued_activation(&id)?;
-    Ok(Json(act))
+    let id = SessionId::new(session_id);
+    let (resp, _) = state.store.resume_session(&id)?;
+    Ok((StatusCode::CREATED, Json(resp)))
 }
 
 pub(crate) async fn handle_get_activation(

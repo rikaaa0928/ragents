@@ -276,21 +276,21 @@ pub fn build_router(state: ApiServerState) -> Router {
             get(http::handle_list_session_activations),
         )
         .route(
-            "/api/v1/sessions/{session_id}/realtime",
-            post(http::handle_push_realtime_message),
+            "/api/v1/sessions/{session_id}/queues",
+            get(http::handle_list_session_queues),
         )
         .route(
-            "/api/v1/sessions/{session_id}/realtime/withdraw",
-            post(http::handle_withdraw_realtime_message),
+            "/api/v1/sessions/{session_id}/queues/{target}",
+            post(http::handle_enqueue_session_message)
+                .delete(http::handle_withdraw_session_queue_message),
         )
-        .route("/api/v1/activations", post(http::handle_create_activation))
+        .route(
+            "/api/v1/sessions/{session_id}/resume",
+            post(http::handle_resume_session),
+        )
         .route(
             "/api/v1/activations/{activation_id}",
             get(http::handle_get_activation).patch(http::handle_patch_activation),
-        )
-        .route(
-            "/api/v1/activations/{activation_id}/withdraw",
-            post(http::handle_withdraw_activation),
         )
         .route("/api/v1/events", get(http::handle_read_events))
         .route("/api/v1/watch", get(http::handle_watch_events))

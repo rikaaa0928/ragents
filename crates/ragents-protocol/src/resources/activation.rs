@@ -1,6 +1,6 @@
 use super::{
     ModelRequestSpec, ObjectMeta, PermissionRequest, PermissionResolutionSpec,
-    ProtocolValidationError,
+    ProtocolValidationError, QueueToolPolicy,
 };
 use crate::ids::*;
 use chrono::{DateTime, Utc};
@@ -20,11 +20,7 @@ pub struct Activation {
 pub enum SubmissionKind {
     #[default]
     Normal,
-    FollowUp,
     Continuation,
-    Steer {
-        target_activation_id: ActivationId,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -79,8 +75,8 @@ pub struct ActivationSpec {
     pub input: Vec<Item>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<ModelRequestSpec>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub tool_policy: QueueToolPolicy,
     #[serde(default)]
     pub desired_phase: DesiredActivationPhase,
     #[serde(default)]

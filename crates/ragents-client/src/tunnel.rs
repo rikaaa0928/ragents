@@ -58,7 +58,7 @@ type AckPayload = (
     Option<ResourceVersion>,
     Option<BatchSeq>,
     Option<SessionId>,
-    Vec<Item>,
+    DrainedRealtimeBatch,
 );
 
 impl DaemonTunnelHandle {
@@ -616,7 +616,7 @@ impl DaemonTunnelHandle {
         items: Vec<Item>,
         companion_event: BatchCompanionEvent,
         drain_realtime: bool,
-    ) -> Result<(BatchSeq, Vec<Item>), ClientError> {
+    ) -> Result<(BatchSeq, DrainedRealtimeBatch), ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::CommitBatch {
@@ -643,7 +643,7 @@ impl DaemonTunnelHandle {
         lease_epoch: LeaseEpoch,
         turn_id: TurnId,
         include_context: bool,
-    ) -> Result<(Vec<Item>, Option<Vec<Item>>), ClientError> {
+    ) -> Result<(DrainedRealtimeBatch, Option<Vec<Item>>), ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::BeginTurn {
@@ -658,10 +658,10 @@ impl DaemonTunnelHandle {
         match resp {
             ServerToDaemonMessage::BeginTurnReply {
                 ok: true,
-                drained_items,
+                drained_realtime,
                 effective_items,
                 ..
-            } => Ok((drained_items, effective_items)),
+            } => Ok((drained_realtime, effective_items)),
             ServerToDaemonMessage::BeginTurnReply {
                 ok: false, error, ..
             } => Err(ClientError::Tunnel(
@@ -761,7 +761,7 @@ impl DaemonTunnelHandle {
         activation_id: ActivationId,
         lease_epoch: LeaseEpoch,
         turn_id: Option<TurnId>,
-    ) -> Result<Vec<Item>, ClientError> {
+    ) -> Result<DrainedRealtimeBatch, ClientError> {
         let request_id = format!("req_{}", Uuid::now_v7());
         let resp = self
             .call(DaemonToServerMessage::DrainRealtimeMessages {
@@ -774,8 +774,8 @@ impl DaemonTunnelHandle {
             .await?;
         match resp {
             ServerToDaemonMessage::RealtimeMessagesReply {
-                ok: true, items, ..
-            } => Ok(items),
+                ok: true, drained, ..
+            } => Ok(drained),
             ServerToDaemonMessage::RealtimeMessagesReply {
                 ok: false, error, ..
             } => Err(ClientError::Tunnel(
@@ -882,13 +882,13 @@ impl DaemonTunnelHandle {
                 resource_version,
                 batch_seq,
                 spawned_session_id,
-                drained_items,
+                drained_realtime,
                 ..
             } => Ok((
                 resource_version,
                 batch_seq,
                 spawned_session_id,
-                drained_items,
+                drained_realtime,
             )),
             ServerToDaemonMessage::Ack {
                 ok: false, error, ..

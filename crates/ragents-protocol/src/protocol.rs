@@ -16,25 +16,18 @@ pub struct CreateSessionRequest {
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     pub spec: SessionSpec,
-    /// Optional inline initial activation to start a conversation in one declarative call
+    /// Optional initial message enqueued into the session's Pending queue in the same transaction
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub initial_activation: Option<InitialActivationRequest>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InitialActivationRequest {
-    pub input: Vec<Item>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<ModelRequestSpec>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disabled_tools: Vec<String>,
+    pub initial_message: Option<EnqueueSessionMessageRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
     pub session: Session,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub initial_activation: Option<Activation>,
+    pub initial_message_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_activation_id: Option<ActivationId>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -68,14 +61,60 @@ pub struct PatchSessionSpecRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateActivationRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activation_id: Option<ActivationId>,
+pub struct EnqueueSessionMessageRequest {
+    pub content: Vec<MessageContent>,
     #[serde(default)]
-    pub labels: BTreeMap<String, String>,
-    pub spec: ActivationSpec,
+    pub tool_policy: QueueToolPolicy,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<ModelRequestSpec>,
 }
 
+impl EnqueueSessionMessageRequest {
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![MessageContent::InputText { text: text.into() }],
+            tool_policy: QueueToolPolicy::default(),
+            metadata: BTreeMap::new(),
+            model_override: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnqueueSessionMessageResponse {
+    pub message: SessionQueueMessage,
+    pub target_session_id: SessionId,
+    pub queue_kind: QueueKind,
+    pub realtime_count: usize,
+    pub pending_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_activation_id: Option<ActivationId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionQueuesResponse {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub realtime: Vec<SessionQueueMessage>,
+    #[serde(default)]
+    pub pending: Vec<SessionQueueMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WithdrawSessionQueueMessageResponse {
+    pub removed_message: SessionQueueMessage,
+    pub session_id: SessionId,
+    pub realtime_count: usize,
+    pub pending_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeSessionResponse {
+    pub session: Session,
+    pub activation: Activation,
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PatchActivationSpecRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,45 +156,6 @@ pub struct WatchQuery {
     pub after_rv: Option<u64>,
     #[serde(default)]
     pub mode: ContentFetchMode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PushRealtimeMessageRequest {
-    pub content: Vec<MessageContent>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disabled_tools: Vec<String>,
-}
-
-impl PushRealtimeMessageRequest {
-    pub fn from_text(text: impl Into<String>) -> Self {
-        Self {
-            content: vec![MessageContent::InputText { text: text.into() }],
-            disabled_tools: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PushRealtimeMessageResponse {
-    pub queued_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_session_id: Option<SessionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spawned_activation_id: Option<ActivationId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inserted_ids: Vec<i64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WithdrawRealtimeMessageRequest {
-    #[serde(default)]
-    pub message_ids: Vec<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WithdrawRealtimeMessageResponse {
-    pub removed_count: usize,
-    pub remaining_count: usize,
 }
 
 // ============================================================================
@@ -408,8 +408,8 @@ pub enum ServerToDaemonMessage {
         batch_seq: Option<BatchSeq>,
         #[serde(skip_serializing_if = "Option::is_none")]
         spawned_session_id: Option<SessionId>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        drained_items: Vec<Item>,
+        #[serde(default)]
+        drained_realtime: DrainedRealtimeBatch,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -417,7 +417,7 @@ pub enum ServerToDaemonMessage {
         request_id: String,
         ok: bool,
         #[serde(default)]
-        drained_items: Vec<Item>,
+        drained_realtime: DrainedRealtimeBatch,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effective_items: Option<Vec<Item>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -435,7 +435,7 @@ pub enum ServerToDaemonMessage {
         request_id: String,
         ok: bool,
         #[serde(default)]
-        items: Vec<Item>,
+        drained: DrainedRealtimeBatch,
         #[serde(skip_serializing_if = "Option::is_none")]
         batch_seq: Option<BatchSeq>,
         #[serde(skip_serializing_if = "Option::is_none")]

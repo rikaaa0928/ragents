@@ -925,8 +925,6 @@ impl SqliteStore {
                         act.status.phase = ActivationPhase::Queued;
                         act.status.assigned_node = None;
                         session.status.active_activation_id = None;
-                        session.status.queued_activation_count =
-                            session.status.queued_activation_count.saturating_add(1);
                         Self::save_activation_in_tx(&tx, &mut act)?;
                         Self::save_session_in_tx(&tx, &mut session)?;
                     } else {

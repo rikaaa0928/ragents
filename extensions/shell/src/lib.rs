@@ -126,7 +126,7 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
                     "enabled": true,
                     "concurrency_safe": false,
                     "name": "shell",
-                    "description": "Execute a shell command on the host system. Supports synchronous blocking execution (wait=true, default) or asynchronous background execution returning process_id and pid (wait=false). For blocking commands, output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file.",
+                    "description": "Execute a shell command on the host system. Supports synchronous blocking execution (wait=true, default) or asynchronous background execution returning process_id and pid (wait=false). For long-running tasks (training, builds, downloads, benchmarks), prefer wait=false with lifecycle='session' and keep the command itself running in the foreground (do NOT detach with `nohup ... &` or `podman/docker run -d`); when it exits naturally, the host pushes `[System Notification: Background Process Exited]` and wakes your session if idle—so avoid sleep-polling or external timer checks. For blocking commands, output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -137,13 +137,13 @@ impl exports::ragent::extension::lifecycle::Guest for ShellExtension {
                             "wait": {
                                 "type": "boolean",
                                 "default": true,
-                                "description": "是否等待命令执行结束。默认为 true（阻塞等待并返回 stdout/stderr/exit_code）；若为 false 则后台运行并立即返回 process_id 和 pid。"
+                                "description": "是否等待命令执行结束。默认为 true（阻塞等待并返回 stdout/stderr/exit_code）；若为 false 则由宿主机托管后台运行并立即返回 process_id 和 pid（耗时任务建议搭配 lifecycle='session'，且命令内不要再用 `&`/`-d` 脱离托管）。"
                             },
                             "lifecycle": {
                                 "type": "string",
                                 "enum": ["activation", "session"],
                                 "default": "activation",
-                                "description": "后台任务的最大生命周期。activation（默认）：当前 activation 结束后自动清理仍在运行的进程；session：跨 activation 保持运行，直至被主动停止或 session 关闭。"
+                                "description": "后台任务的最大生命周期。activation（默认）：当前 activation 结束后自动清理仍在运行的进程；session：跨 activation 与上下文压缩持续运行，直到自然结束、主动停止或 session 关闭。进程自然结束时系统会自动推送退出通知并在会话空闲时自动唤醒你，无需额外定时轮询。"
                             },
                             "timeout": {
                                 "type": "number",
@@ -324,7 +324,18 @@ fn handle_shell(args: &serde_json::Value) -> Result<ToolResult, String> {
             error,
         })
     } else if resp.ok {
-        let proc_json = resp.process.unwrap_or(serde_json::Value::Null);
+        let mut proc_json = resp.process.unwrap_or(serde_json::Value::Null);
+        if lifecycle == "session" {
+            if let Some(obj) = proc_json.as_object_mut() {
+                obj.insert(
+                    "note".to_string(),
+                    serde_json::Value::String(
+                        "lifecycle='session': stays running across turns/compactions. When this process exits naturally, the host pushes `[System Notification: Background Process Exited]` and wakes this session automatically if idle; do NOT sleep-poll or schedule a fallback timer unless monitoring an externally detached daemon."
+                            .to_string(),
+                    ),
+                );
+            }
+        }
         let output = serde_json::to_string_pretty(&proc_json).unwrap_or_default();
         Ok(ToolResult {
             success: true,

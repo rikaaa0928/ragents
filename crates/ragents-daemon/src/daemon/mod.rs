@@ -713,7 +713,7 @@ impl AgentDaemon {
                 extra_tmp_dirs,
                 effective_config,
                 effective_permissions: runtime_permissions,
-                disabled_tools: activation.spec.disabled_tools.clone(),
+                tool_policy: activation.spec.tool_policy.clone(),
                 model_endpoint,
                 max_turns: daemon.config.max_turns,
             };

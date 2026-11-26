@@ -41,6 +41,13 @@ pub enum StoreError {
 }
 
 #[derive(Debug, Clone)]
+pub struct CreateActivationRequest {
+    pub activation_id: Option<ActivationId>,
+    pub labels: BTreeMap<String, String>,
+    pub spec: ActivationSpec,
+}
+
+#[derive(Debug, Clone)]
 pub struct ScheduledDispatch {
     pub node_id: NodeId,
     pub session: Session,

@@ -139,7 +139,7 @@ async fn test_in_process_executor_single_turn_without_tools() {
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -229,7 +229,7 @@ async fn test_in_process_executor_with_wasm_file_editor_extension() {
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -321,7 +321,7 @@ async fn test_subprocess_executor_with_wasm_file_editor_extension() {
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local-secret".to_string(),
@@ -563,7 +563,7 @@ async fn test_multi_directory_auto_permission_escalation_loop_in_single_shell_ca
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -737,7 +737,7 @@ async fn test_wasm_external_file_dynamic_mount_and_http_fetch_permission_unifica
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -990,7 +990,7 @@ async fn test_blocking_shell_timeout_preserves_partial_output_and_kills_process_
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -1178,7 +1178,7 @@ async fn test_file_editor_pagination_non_overlapping_edits_and_shell_output_trun
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -1310,7 +1310,7 @@ async fn test_openresponses_sse_streaming_deltas_and_transient_retry() {
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: format!("http://{addr}/v1"),
             api_key: "sk-local".to_string(),
@@ -1464,7 +1464,7 @@ async fn test_wasm_skills_extension_discovers_agents_skills_and_loads_skill() {
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-local".to_string(),
@@ -1645,7 +1645,7 @@ async fn test_extension_filter_env_strips_secrets_from_session_execution() {
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig::default(),
         max_turns: None,
     };
@@ -1956,7 +1956,7 @@ async fn test_permissions_extension_prompt_and_end_to_end_allow_and_deny() {
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".to_string(),
             api_key: "sk-test".to_string(),
@@ -2333,7 +2333,7 @@ async fn test_in_process_executor_batches_read_read_write_read_in_order() {
         extra_tmp_dirs: vec![],
         effective_config: cfg,
         effective_permissions: PermissionPolicyLayer::default(),
-        disabled_tools: vec![],
+        tool_policy: QueueToolPolicy::default(),
         model_endpoint: ModelEndpointConfig {
             base_url: "http://127.0.0.1:9999/v1".into(),
             api_key: "sk-test".into(),
@@ -2606,6 +2606,239 @@ async fn test_sse_stream_handles_keepalive_comments_and_times_out_when_stalled()
     );
     let _ = hold_tx.send(true);
     let _ = srv_stall.await;
+}
+
+#[tokio::test]
+async fn test_dynamic_tool_policy_reenable_mid_activation_on_realtime_drain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("note.txt"), "initial-content\n").unwrap();
+
+    let wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/file_editor/target/wasm32-wasip2/release/ragent_file_editor_extension.wasm");
+    if !wasm_path.exists() {
+        eprintln!("skipping: file_editor wasm not built at {}", wasm_path.display());
+        return;
+    }
+
+    struct DynamicToolHost {
+        items: Mutex<Vec<Item>>,
+        pending_realtime: Mutex<Vec<DrainedRealtimeBatch>>,
+        reported_tools: Mutex<Vec<Vec<String>>>,
+        turn_counter: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CoreHost for DynamicToolHost {
+        async fn load_effective_context(&self) -> Result<Vec<Item>, CoreError> {
+            Ok(self.items.lock().unwrap().clone())
+        }
+        async fn report_prepared_config(
+            &self,
+            _extension_prompts: std::collections::BTreeMap<String, String>,
+            effective_tools: Vec<String>,
+        ) -> Result<(), CoreError> {
+            self.reported_tools.lock().unwrap().push(effective_tools);
+            Ok(())
+        }
+        async fn commit_model_output(
+            &self,
+            _turn_id: &TurnId,
+            _response_id: Option<String>,
+            items: Vec<Item>,
+            _usage: Option<Usage>,
+        ) -> Result<BatchSeq, CoreError> {
+            self.items.lock().unwrap().extend(items);
+            Ok(BatchSeq::new(1))
+        }
+        async fn commit_tool_output(
+            &self,
+            _turn_id: &TurnId,
+            _call_id: &str,
+            _tool_name: &str,
+            _success: bool,
+            _duration_ms: u64,
+            items: Vec<Item>,
+        ) -> Result<BatchSeq, CoreError> {
+            self.items.lock().unwrap().extend(items);
+            Ok(BatchSeq::new(2))
+        }
+        async fn emit_event(
+            &self,
+            _turn_id: Option<TurnId>,
+            _event: SessionEvent,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn check_permission(
+            &self,
+            _extension_id: Option<&str>,
+            capability: CapabilityRequest,
+            _reason: Option<String>,
+        ) -> Result<PermissionOutcome, CoreError> {
+            Ok(PermissionOutcome::allowed_with(capability, true))
+        }
+        async fn drain_realtime_messages(
+            &self,
+            turn_id: Option<TurnId>,
+        ) -> Result<DrainedRealtimeBatch, CoreError> {
+            let mut guard = self.pending_realtime.lock().unwrap();
+            if turn_id.is_some() {
+                let idx = self.turn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx == 1 && !guard.is_empty() {
+                    return Ok(guard.remove(0));
+                }
+                return Ok(DrainedRealtimeBatch::default());
+            } else if !guard.is_empty() {
+                return Ok(guard.remove(0));
+            }
+            Ok(DrainedRealtimeBatch::default())
+        }
+    }
+
+    struct DynamicToolModel {
+        seen_tool_lists: Mutex<Vec<Vec<String>>>,
+        step: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelBackend for DynamicToolModel {
+        async fn create_response(
+            &self,
+            _endpoint: &ModelEndpointConfig,
+            request: CreateResponseBody,
+        ) -> Result<ResponseResource, CoreError> {
+            let tool_names: Vec<String> = serde_json::to_value(&request.tools)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| {
+                    arr.into_iter()
+                        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.seen_tool_lists.lock().unwrap().push(tool_names);
+
+            let s = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match s {
+                0 => Ok(make_openresponses_resource(
+                    "r1",
+                    "gpt-4.1",
+                    vec![Item::FunctionCall {
+                        id: Some("fc1".into()),
+                        call_id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"note.txt"}"#.into(),
+                        status: Some(openresponses_rust::FunctionCallStatus::Completed),
+                    }],
+                    None,
+                )),
+                1 => Ok(make_openresponses_resource(
+                    "r2",
+                    "gpt-4.1",
+                    vec![Item::FunctionCall {
+                        id: Some("fc2".into()),
+                        call_id: "c2".into(),
+                        name: "write_file".into(),
+                        arguments: r#"{"path":"out.txt","content":"unlocked!"}"#.into(),
+                        status: Some(openresponses_rust::FunctionCallStatus::Completed),
+                    }],
+                    None,
+                )),
+                2 => Ok(make_openresponses_resource(
+                    "r3",
+                    "gpt-4.1",
+                    vec![Item::assistant_message("after write")],
+                    None,
+                )),
+                _ => Ok(make_openresponses_resource(
+                    "r4",
+                    "gpt-4.1",
+                    vec![Item::assistant_message("final silent")],
+                    None,
+                )),
+            }
+        }
+    }
+
+    let host = Arc::new(DynamicToolHost {
+        items: Mutex::new(vec![Item::user_message("Start muted observation")]),
+        pending_realtime: Mutex::new(vec![
+            // Drained at begin_turn of Turn 2: re-enables write_file!
+            DrainedRealtimeBatch {
+                items: vec![Item::user_message("Realtime: enable write_file now!")],
+                tool_policies: vec![QueueToolPolicy::with_enabled(["write_file".to_string()])],
+            },
+            // Drained at commit_model_output_with_drain of Turn 3: disables write_file again!
+            DrainedRealtimeBatch {
+                items: vec![Item::user_message("Realtime: disable write_file again")],
+                tool_policies: vec![QueueToolPolicy::with_disabled(["write_file".to_string()])],
+            },
+        ]),
+        reported_tools: Mutex::new(vec![]),
+        turn_counter: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    let cfg = ConfigRevision::new_merged(
+        "sys".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![ExtensionSpec {
+            name: "file_editor".to_string(),
+            path: wasm_path.to_string_lossy().to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+            allowed_dirs: vec![],
+            filter_env: vec![],
+        }],
+    );
+
+    let run_spec = CoreRunSpec {
+        session_id: SessionId::new("sess_dyn"),
+        activation_id: ActivationId::new("act_dyn"),
+        workspace_root: ws.clone(),
+        session_tmp_dir: tmp.path().join("tmp"),
+        extra_tmp_dirs: vec![],
+        effective_config: cfg,
+        effective_permissions: PermissionPolicyLayer::default(),
+        tool_policy: QueueToolPolicy::with_disabled(["write_file".to_string()]),
+        model_endpoint: ModelEndpointConfig {
+            base_url: "http://127.0.0.1:9999/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        },
+        max_turns: Some(6),
+    };
+
+    let model = Arc::new(DynamicToolModel {
+        seen_tool_lists: Mutex::new(vec![]),
+        step: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    let summary = InProcessExecutor
+        .execute(
+            run_spec,
+            host.clone(),
+            model.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dynamic tool policy activation should succeed");
+    assert_eq!(summary.final_text, "final silent");
+    assert_eq!(std::fs::read_to_string(ws.join("out.txt")).unwrap(), "unlocked!");
+
+    let seen = model.seen_tool_lists.lock().unwrap().clone();
+    assert_eq!(seen.len(), 4);
+    assert!(!seen[0].contains(&"write_file".to_string()), "Turn 1 must disable write_file");
+    assert!(seen[1].contains(&"write_file".to_string()), "Turn 2 must re-enable write_file mid-activation");
+    assert!(seen[2].contains(&"write_file".to_string()), "Turn 3 keeps write_file enabled");
+    assert!(!seen[3].contains(&"write_file".to_string()), "Turn 4 disables write_file after commit drain");
+
+    let reported = host.reported_tools.lock().unwrap().clone();
+    assert_eq!(reported.len(), 3);
+    assert!(!reported[0].contains(&"write_file".to_string()));
+    assert!(reported[1].contains(&"write_file".to_string()));
+    assert!(!reported[2].contains(&"write_file".to_string()));
 }
 
 

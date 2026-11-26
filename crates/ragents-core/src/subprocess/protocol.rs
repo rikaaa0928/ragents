@@ -111,7 +111,7 @@ pub enum ParentToWorkerMessage {
         result: Result<PermissionOutcome, String>,
     },
     DrainRealtimeMessagesReply {
-        result: Result<Vec<Item>, String>,
+        result: Result<DrainedRealtimeBatch, String>,
     },
     ManageProcessReply {
         result: Result<Option<ProcessActionResponse>, String>,

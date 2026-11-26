@@ -5,7 +5,6 @@ use crate::helpers::{
 };
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use openresponses_rust::Item;
 use ragents_apiserver::{
     serve_tcp, ApiServerExtensions, ApiServerState, ApiserverConfig, ClusterModelCatalog,
     SqliteStore, StaticTokenAuthnPlugin, DEFAULT_LEASE_TTL_MS,
@@ -143,22 +142,22 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             permissions: PermissionPolicyLayer::default(),
                             extra_tmp_dirs: vec![],
                         },
-                        initial_activation: Some(InitialActivationRequest {
-                            input: vec![Item::user_message(prompt_text)],
+                        initial_message: Some(EnqueueSessionMessageRequest {
+                            content: vec![openresponses_rust::MessageContent::InputText {
+                                text: prompt_text,
+                            }],
+                            tool_policy: QueueToolPolicy::default(),
+                            metadata: BTreeMap::new(),
                             model_override: None,
-                            disabled_tools: vec![],
                         }),
                     })
                     .await?;
                 let sess_id = SessionId::new(created.session.metadata.id);
-                let act_id = ActivationId::new(
-                    created
-                        .initial_activation
-                        .expect("initial activation created")
-                        .metadata
-                        .id,
-                );
-                watch_activation_to_completion(&up_client, &sess_id, &act_id).await?;
+                if let Some(act_id) = created.spawned_activation_id {
+                    watch_activation_to_completion(&up_client, &sess_id, &act_id).await?;
+                } else {
+                    println!("Session {} enqueued initial message {:?}", sess_id, created.initial_message_id);
+                }
                 cancel.cancel();
             } else {
                 tokio::signal::ctrl_c().await?;
@@ -300,10 +299,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             permissions: PermissionPolicyLayer::default(),
                             extra_tmp_dirs: vec![],
                         },
-                        initial_activation: prompt.map(|p| InitialActivationRequest {
-                            input: vec![Item::user_message(p)],
+                        initial_message: prompt.map(|p| EnqueueSessionMessageRequest {
+                            content: vec![openresponses_rust::MessageContent::InputText { text: p }],
+                            tool_policy: QueueToolPolicy::default(),
+                            metadata: BTreeMap::new(),
                             model_override: None,
-                            disabled_tools: vec![],
                         }),
                     })
                     .await?;
@@ -311,12 +311,13 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 let sess_id = SessionId::new(created.session.metadata.id.clone());
                 println!("Created session: {sess_id}");
 
-                if let Some(act) = created.initial_activation {
-                    let act_id = ActivationId::new(act.metadata.id);
+                if let Some(act_id) = created.spawned_activation_id {
                     println!("Submitted initial activation: {act_id}");
                     if wait {
                         watch_activation_to_completion(&client, &sess_id, &act_id).await?;
                     }
+                } else if let Some(msg_id) = created.initial_message_id {
+                    println!("Enqueued initial message id={msg_id}");
                 }
                 Ok(())
             }
@@ -392,24 +393,27 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             wait,
             prompt,
         } => {
-            let (sess_id, act_id) = if let Some(existing_sess_id) = session {
+            let (sess_id, act_id, msg_id) = if let Some(existing_sess_id) = session {
                 let s_id = SessionId::new(existing_sess_id);
-                let act = client
-                    .create_activation(CreateActivationRequest {
-                        activation_id: None,
-                        labels: BTreeMap::new(),
-                        spec: ActivationSpec {
-                            session_id: s_id.clone(),
-                            submission_kind: SubmissionKind::Normal,
-                            input: vec![Item::user_message(prompt)],
+                let resp = client
+                    .enqueue_session_message(
+                        &s_id,
+                        QueueKind::Pending,
+                        EnqueueSessionMessageRequest {
+                            content: vec![openresponses_rust::MessageContent::InputText {
+                                text: prompt,
+                            }],
+                            tool_policy: QueueToolPolicy::default(),
+                            metadata: BTreeMap::new(),
                             model_override: model.map(ModelRequestSpec::new),
-                            disabled_tools: vec![],
-                            desired_phase: DesiredActivationPhase::Running,
-                            interaction_responses: BTreeMap::new(),
                         },
-                    })
+                    )
                     .await?;
-                (act.spec.session_id, ActivationId::new(act.metadata.id))
+                (
+                    resp.target_session_id,
+                    resp.spawned_activation_id,
+                    Some(resp.message.id),
+                )
             } else {
                 let scheduling = build_scheduling_mode(node, workdir, floating)?;
                 let parsed_exts = parse_extension_specs(&extensions)?;
@@ -428,27 +432,33 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             permissions: PermissionPolicyLayer::default(),
                             extra_tmp_dirs: vec![],
                         },
-                        initial_activation: Some(InitialActivationRequest {
-                            input: vec![Item::user_message(prompt)],
+                        initial_message: Some(EnqueueSessionMessageRequest {
+                            content: vec![openresponses_rust::MessageContent::InputText {
+                                text: prompt,
+                            }],
+                            tool_policy: QueueToolPolicy::default(),
+                            metadata: BTreeMap::new(),
                             model_override: None,
-                            disabled_tools: vec![],
                         }),
                     })
                     .await?;
                 let s_id = SessionId::new(created.session.metadata.id);
-                let a_id = ActivationId::new(
-                    created
-                        .initial_activation
-                        .expect("initial activation")
-                        .metadata
-                        .id,
-                );
-                (s_id, a_id)
+                (s_id, created.spawned_activation_id, created.initial_message_id)
             };
 
-            println!("session={sess_id} activation={act_id}");
-            if wait {
-                watch_activation_to_completion(&client, &sess_id, &act_id).await?;
+            match act_id {
+                Some(a_id) => {
+                    println!("session={sess_id} activation={a_id}");
+                    if wait {
+                        watch_activation_to_completion(&client, &sess_id, &a_id).await?;
+                    }
+                }
+                None => {
+                    println!(
+                        "session={sess_id} queued_message_id={}",
+                        msg_id.unwrap_or_default()
+                    );
+                }
             }
             Ok(())
         }
@@ -462,24 +472,27 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 .map(|text| openresponses_rust::MessageContent::InputText { text })
                 .collect();
             let resp = client
-                .push_realtime_message(
+                .enqueue_session_message(
                     &sess_id,
-                    PushRealtimeMessageRequest {
+                    QueueKind::Realtime,
+                    EnqueueSessionMessageRequest {
                         content: blocks,
-                        disabled_tools: vec![],
+                        tool_policy: QueueToolPolicy::default(),
+                        metadata: BTreeMap::new(),
+                        model_override: None,
                     },
                 )
                 .await?;
-            let effective_sid = resp.target_session_id.as_ref().unwrap_or(&sess_id);
+            let effective_sid = resp.target_session_id;
             if let Some(ref act_id) = resp.spawned_activation_id {
                 println!(
-                    "Enqueued real-time message block(s) into idle session {} and automatically spawned activation {} (total pending: {})",
-                    effective_sid, act_id, resp.queued_count
+                    "Enqueued real-time message block(s) into idle session {} and automatically spawned activation {} (realtime queued: {}, pending queued: {})",
+                    effective_sid, act_id, resp.realtime_count, resp.pending_count
                 );
             } else {
                 println!(
-                    "Enqueued real-time message block(s) into session {} (total pending: {})",
-                    effective_sid, resp.queued_count
+                    "Enqueued real-time message block(s) into session {} (realtime queued: {}, pending queued: {})",
+                    effective_sid, resp.realtime_count, resp.pending_count
                 );
             }
             Ok(())
