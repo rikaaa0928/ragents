@@ -16,7 +16,10 @@ use serde_json::json;
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::AtomicU64,
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
@@ -80,13 +83,20 @@ impl TunnelReplyCache {
 }
 
 #[derive(Clone)]
+pub(crate) struct DaemonPeerConnection {
+    pub(crate) conn_id: u64,
+    pub(crate) out_tx: mpsc::UnboundedSender<ServerToDaemonMessage>,
+    pub(crate) cancel: CancellationToken,
+}
+
+#[derive(Clone)]
 pub struct ApiServerState {
     pub store: SqliteStore,
     pub lease_ttl_ms: u64,
     pub extensions: ApiServerExtensions,
     pub model_catalog: Arc<ClusterModelCatalog>,
-    pub(crate) daemon_peers:
-        Arc<Mutex<HashMap<NodeId, mpsc::UnboundedSender<ServerToDaemonMessage>>>>,
+    pub(crate) daemon_peers: Arc<Mutex<HashMap<NodeId, DaemonPeerConnection>>>,
+    pub(crate) next_tunnel_conn_id: Arc<AtomicU64>,
     pub(crate) pending_node_ext:
         Arc<Mutex<HashMap<String, oneshot::Sender<NodeExtensionCallResponse>>>>,
     pub(crate) tunnel_reply_cache: Arc<Mutex<TunnelReplyCache>>,
@@ -110,6 +120,7 @@ impl ApiServerState {
             extensions: ApiServerExtensions::default(),
             model_catalog,
             daemon_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_tunnel_conn_id: Arc::new(AtomicU64::new(0)),
             pending_node_ext: Arc::new(Mutex::new(HashMap::new())),
             tunnel_reply_cache: Arc::new(Mutex::new(TunnelReplyCache::default())),
             shutdown: CancellationToken::new(),
@@ -155,7 +166,7 @@ impl ApiServerState {
                     .lock()
                     .expect("peers mutex poisoned")
                     .get(&node_id)
-                    .cloned();
+                    .map(|p| p.out_tx.clone());
                 if let Some(tx) = maybe_tx {
                     let _ = tx.send(ServerToDaemonMessage::DispatchActivation {
                         session: Box::new(session),
@@ -186,7 +197,7 @@ impl ApiServerState {
                     .lock()
                     .expect("peers mutex poisoned")
                     .get(&node_id)
-                    .cloned();
+                    .map(|p| p.out_tx.clone());
                 if let Some(tx) = maybe_tx {
                     let _ = tx.send(ServerToDaemonMessage::ReconcileActivation {
                         session_id,
@@ -212,7 +223,7 @@ impl ApiServerState {
                             .lock()
                             .expect("peers mutex poisoned")
                             .values()
-                            .cloned()
+                            .map(|p| p.out_tx.clone())
                             .collect();
                     for tx in senders {
                         let _ = tx.send(ServerToDaemonMessage::CleanupSession {

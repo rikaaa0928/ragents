@@ -216,22 +216,21 @@ impl AgentDaemon {
                         }
                         let epoch = hb_tunnel.current_epoch();
                         let count = hb_runners.load(Ordering::Relaxed);
-                        let running_ids: Vec<ActivationId> = hb_tasks
-                            .lock()
-                            .expect("active_tasks mutex poisoned")
-                            .keys()
-                            .cloned()
-                            .collect();
-                        if hb_tunnel
-                            .heartbeat_with_activations_timeout(
+                        let hb_fut = {
+                            let guard = hb_tasks.lock().expect("active_tasks mutex poisoned");
+                            let running_ids: Vec<ActivationId> = guard.keys().cloned().collect();
+                            hb_tunnel.start_heartbeat_with_activations_timeout(
                                 hb_node_id.clone(),
                                 count,
                                 Some(running_ids),
                                 hb_timeout,
                             )
-                            .await
-                            .is_err()
-                        {
+                        };
+                        if let Err(err) = hb_fut.await {
+                            eprintln!(
+                                "[ragents-daemon] node '{}' heartbeat failed on epoch={}: {}; forcing disconnect",
+                                hb_node_id, epoch, err
+                            );
                             hb_tunnel.force_disconnect_if_epoch(epoch);
                         }
                     }
@@ -359,6 +358,11 @@ impl AgentDaemon {
                 };
 
                 if disconnected {
+                    eprintln!(
+                        "[ragents-daemon] node '{}' tunnel disconnected (epoch={}), starting reconnect loop",
+                        daemon.config.node_id,
+                        tunnel.current_epoch()
+                    );
                     let mut backoff_ms = 100u64;
                     loop {
                         tokio::select! {
@@ -369,55 +373,69 @@ impl AgentDaemon {
                                 return;
                             }
                         }
-                        if let Ok((new_tunnel, new_rx)) = connect_daemon_tunnel_with_token(
+                        match connect_daemon_tunnel_with_token(
                             &ws_url_for_loop,
                             daemon.config.auth_token.as_deref(),
                         )
                         .await
                         {
-                            let hostname = std::env::var("HOSTNAME")
-                                .unwrap_or_else(|_| "localhost".to_string());
-                            let os = std::env::consts::OS.to_string();
-                            let arch = std::env::consts::ARCH.to_string();
-                            let running_ids: Vec<ActivationId> = active_tasks
-                                .lock()
-                                .expect("active_tasks mutex poisoned")
-                                .keys()
-                                .cloned()
-                                .collect();
-                            if let Ok((_, _, reconnected_node_spec, _)) = new_tunnel
-                                .register_node_with_models_and_running_activations(
-                                    daemon.config.node_id.clone(),
-                                    hostname,
-                                    os,
-                                    arch,
-                                    daemon.config.labels.clone(),
-                                    daemon.effective_supported_models(),
-                                    daemon.config.use_cluster_models,
-                                    daemon.effective_default_model(),
-                                    Some(daemon.config.default_system_prompt.clone()),
-                                    daemon.config.default_permissions.clone(),
-                                    daemon.config.installed_extension_names(),
-                                    daemon.config.effective_allowed_workspace_dir_strings(),
-                                    daemon.config.max_concurrent_runners,
-                                    Some(running_ids.clone()),
-                                )
-                                .await
-                            {
-                                daemon.sync_grants_from_node_spec(&reconnected_node_spec);
-                                let count = active_runners.load(Ordering::Relaxed);
-                                let _ = new_tunnel
-                                    .heartbeat_with_activations(
+                            Ok((new_tunnel, new_rx)) => {
+                                let hostname = std::env::var("HOSTNAME")
+                                    .unwrap_or_else(|_| "localhost".to_string());
+                                let os = std::env::consts::OS.to_string();
+                                let arch = std::env::consts::ARCH.to_string();
+                                let running_ids: Vec<ActivationId> = active_tasks
+                                    .lock()
+                                    .expect("active_tasks mutex poisoned")
+                                    .keys()
+                                    .cloned()
+                                    .collect();
+                                match new_tunnel
+                                    .register_node_with_models_and_running_activations(
                                         daemon.config.node_id.clone(),
-                                        count,
-                                        Some(running_ids),
+                                        hostname,
+                                        os,
+                                        arch,
+                                        daemon.config.labels.clone(),
+                                        daemon.effective_supported_models(),
+                                        daemon.config.use_cluster_models,
+                                        daemon.effective_default_model(),
+                                        Some(daemon.config.default_system_prompt.clone()),
+                                        daemon.config.default_permissions.clone(),
+                                        daemon.config.installed_extension_names(),
+                                        daemon.config.effective_allowed_workspace_dir_strings(),
+                                        daemon.config.max_concurrent_runners,
+                                        Some(running_ids.clone()),
                                     )
-                                    .await;
-                                tunnel.replace_connection(&new_tunnel);
-                                push_rx = new_rx;
-                                break;
+                                    .await
+                                {
+                                    Ok((_, _, reconnected_node_spec, _)) => {
+                                        daemon.sync_grants_from_node_spec(&reconnected_node_spec);
+                                        tunnel.replace_connection(&new_tunnel);
+                                        push_rx = new_rx;
+                                        eprintln!(
+                                            "[ragents-daemon] node '{}' tunnel reconnected (new epoch={}, running_activations={})",
+                                            daemon.config.node_id,
+                                            tunnel.current_epoch(),
+                                            running_ids.len()
+                                        );
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "[ragents-daemon] node '{}' re-register failed during reconnect: {}",
+                                            daemon.config.node_id, err
+                                        );
+                                        new_tunnel.force_disconnect();
+                                    }
+                                }
                             }
-                            new_tunnel.force_disconnect();
+                            Err(err) => {
+                                eprintln!(
+                                    "[ragents-daemon] node '{}' reconnect dial failed: {}",
+                                    daemon.config.node_id, err
+                                );
+                            }
                         }
                         backoff_ms = (backoff_ms * 2).min(2000);
                     }
@@ -451,6 +469,17 @@ impl AgentDaemon {
         tokio::spawn(async move {
             let sess_id = SessionId::new(session.metadata.id.clone());
             let act_id = ActivationId::new(activation.metadata.id.clone());
+            if active_tasks
+                .lock()
+                .expect("active_tasks mutex poisoned")
+                .contains_key(&act_id)
+            {
+                eprintln!(
+                    "[ragents-daemon] ignoring duplicate dispatch for already-active activation {} (session {})",
+                    act_id, sess_id
+                );
+                return;
+            }
             daemon.sync_grants_from_node_spec(&node_spec);
             daemon.sync_session_grants(&sess_id, &session.spec.permissions);
 
@@ -563,24 +592,33 @@ impl AgentDaemon {
                 Mutex<HashMap<PermissionRequestId, oneshot::Sender<PermissionResolutionSpec>>>,
             > = Arc::new(Mutex::new(HashMap::new()));
 
-            active_tasks
-                .lock()
-                .expect("active_tasks mutex poisoned")
-                .insert(
-                    act_id.clone(),
-                    ActiveActivationControl {
-                        session_id: sess_id.clone(),
-                        cancel: task_cancel.clone(),
-                        permission_waiters: permission_waiters.clone(),
-                    },
-                );
+            {
+                use std::collections::hash_map::Entry;
+                let mut tasks_guard = active_tasks.lock().expect("active_tasks mutex poisoned");
+                match tasks_guard.entry(act_id.clone()) {
+                    Entry::Occupied(_) => {
+                        eprintln!(
+                            "[ragents-daemon] ignoring concurrent duplicate dispatch for activation {} (session {})",
+                            act_id, sess_id
+                        );
+                        return;
+                    }
+                    Entry::Vacant(v) => {
+                        v.insert(ActiveActivationControl {
+                            session_id: sess_id.clone(),
+                            cancel: task_cancel.clone(),
+                            permission_waiters: permission_waiters.clone(),
+                        });
+                    }
+                }
+            }
             lease_epochs
                 .lock()
                 .expect("lease_epochs poisoned")
                 .insert(act_id.clone(), lease_epoch);
             active_runners.fetch_add(1, Ordering::Relaxed);
 
-            if tunnel
+            if let Err(err) = tunnel
                 .accept_activation(
                     sess_id.clone(),
                     act_id.clone(),
@@ -589,8 +627,11 @@ impl AgentDaemon {
                     effective_permission.clone(),
                 )
                 .await
-                .is_err()
             {
+                eprintln!(
+                    "[ragents-daemon] accept_activation failed for {} (session {}, epoch={}): {}",
+                    act_id, sess_id, lease_epoch, err
+                );
                 active_runners.fetch_sub(1, Ordering::Relaxed);
                 active_tasks
                     .lock()
@@ -742,9 +783,9 @@ impl AgentDaemon {
             match exec_res {
                 Ok(summary) => {
                     if summary.compacted_into_session_id.is_none() {
-                        let _ = tunnel
+                        if let Err(err) = tunnel
                             .complete_activation(
-                                sess_id,
+                                sess_id.clone(),
                                 act_id.clone(),
                                 lease_epoch,
                                 summary.last_turn_id,
@@ -752,24 +793,36 @@ impl AgentDaemon {
                                     usage: summary.total_usage,
                                 },
                             )
-                            .await;
+                            .await
+                        {
+                            eprintln!(
+                                "[ragents-daemon] complete_activation(Succeeded) failed for {} (session {}, epoch={}): {}",
+                                act_id, sess_id, lease_epoch, err
+                            );
+                        }
                     }
                 }
                 Err(CoreError::Cancelled) => {
-                    let _ = tunnel
+                    if let Err(err) = tunnel
                         .complete_activation(
-                            sess_id,
+                            sess_id.clone(),
                             act_id.clone(),
                             lease_epoch,
                             None,
                             ActivationTerminalOutcome::Cancelled,
                         )
-                        .await;
+                        .await
+                    {
+                        eprintln!(
+                            "[ragents-daemon] complete_activation(Cancelled) failed for {} (session {}, epoch={}): {}",
+                            act_id, sess_id, lease_epoch, err
+                        );
+                    }
                 }
                 Err(err) => {
-                    let _ = tunnel
+                    if let Err(comp_err) = tunnel
                         .complete_activation(
-                            sess_id,
+                            sess_id.clone(),
                             act_id.clone(),
                             lease_epoch,
                             None,
@@ -777,7 +830,13 @@ impl AgentDaemon {
                                 error: err.to_string(),
                             },
                         )
-                        .await;
+                        .await
+                    {
+                        eprintln!(
+                            "[ragents-daemon] complete_activation(Failed) failed for {} (session {}, epoch={}): {}",
+                            act_id, sess_id, lease_epoch, comp_err
+                        );
+                    }
                 }
             }
 

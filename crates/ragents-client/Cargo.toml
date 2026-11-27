@@ -15,6 +15,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+socket2 = "0.6"
 tokio-tungstenite.workspace = true
 eventsource-stream.workspace = true
 bytes.workspace = true

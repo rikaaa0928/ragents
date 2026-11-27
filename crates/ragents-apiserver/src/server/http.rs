@@ -114,11 +114,14 @@ pub(crate) async fn handle_delete_node(
         .await?;
     let id = NodeId::new(node_id);
     let deleted = state.store.delete_node(&id)?;
-    state
+    if let Some(peer) = state
         .daemon_peers
         .lock()
         .expect("peers mutex poisoned")
-        .remove(&id);
+        .remove(&id)
+    {
+        peer.cancel.cancel();
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
         "deleted_node": deleted,
@@ -151,7 +154,7 @@ pub(crate) async fn handle_node_extension_call(
         .lock()
         .expect("peers mutex poisoned")
         .get(&id)
-        .cloned();
+        .map(|p| p.out_tx.clone());
     let Some(daemon_tx) = maybe_tx else {
         return Ok(Json(NodeExtensionCallResponse {
             ok: false,

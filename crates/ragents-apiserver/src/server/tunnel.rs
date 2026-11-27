@@ -1,4 +1,4 @@
-use super::{ApiError, ApiServerState};
+use super::{ApiError, ApiServerState, DaemonPeerConnection};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -9,7 +9,10 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use ragents_protocol::*;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn handle_daemon_tunnel(
     ws: WebSocketUpgrade,
@@ -29,14 +32,30 @@ pub(crate) async fn handle_daemon_tunnel(
 }
 
 async fn run_daemon_tunnel_socket(socket: WebSocket, state: ApiServerState) {
+    let conn_id = state.next_tunnel_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let conn_cancel = state.shutdown.child_token();
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerToDaemonMessage>();
 
+    let writer_cancel = conn_cancel.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if let Ok(text) = serde_json::to_string(&msg) {
-                if ws_sender.send(Message::Text(text.into())).await.is_err() {
+        loop {
+            tokio::select! {
+                biased;
+                _ = writer_cancel.cancelled() => {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), ws_sender.close()).await;
                     break;
+                }
+                maybe_msg = out_rx.recv() => {
+                    let Some(msg) = maybe_msg else {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), ws_sender.close()).await;
+                        break;
+                    };
+                    if let Ok(text) = serde_json::to_string(&msg) {
+                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -46,8 +65,9 @@ async fn run_daemon_tunnel_socket(socket: WebSocket, state: ApiServerState) {
 
     loop {
         let next_frame = tokio::select! {
+            biased;
+            _ = conn_cancel.cancelled() => break,
             f = ws_receiver.next() => f,
-            _ = state.shutdown.cancelled() => break,
         };
         let Some(Ok(frame)) = next_frame else {
             break;
@@ -67,19 +87,27 @@ async fn run_daemon_tunnel_socket(socket: WebSocket, state: ApiServerState) {
             Err(_) => continue,
         };
 
-        handle_daemon_message(&state, &out_tx, &mut registered_node_id, incoming);
+        handle_daemon_message(
+            &state,
+            conn_id,
+            &conn_cancel,
+            &out_tx,
+            &mut registered_node_id,
+            incoming,
+        );
     }
 
     if let Some(node_id) = registered_node_id {
         let mut guard = state.daemon_peers.lock().expect("peers mutex poisoned");
         if guard
             .get(&node_id)
-            .map(|existing| existing.same_channel(&out_tx))
+            .map(|existing| existing.conn_id == conn_id)
             .unwrap_or(false)
         {
             guard.remove(&node_id);
         }
     }
+    conn_cancel.cancel();
     writer_task.abort();
 }
 
@@ -107,6 +135,8 @@ fn cache_and_send(
 
 fn handle_daemon_message(
     state: &ApiServerState,
+    conn_id: u64,
+    conn_cancel: &CancellationToken,
     out_tx: &mpsc::UnboundedSender<ServerToDaemonMessage>,
     registered_node_id: &mut Option<NodeId>,
     incoming: DaemonToServerMessage,
@@ -129,11 +159,27 @@ fn handle_daemon_message(
             max_concurrent_runners,
             running_activation_ids,
         } => {
-            state
+            if let Some(prev) = state
                 .daemon_peers
                 .lock()
                 .expect("peers mutex poisoned")
-                .insert(node_id.clone(), out_tx.clone());
+                .insert(
+                    node_id.clone(),
+                    DaemonPeerConnection {
+                        conn_id,
+                        out_tx: out_tx.clone(),
+                        cancel: conn_cancel.clone(),
+                    },
+                )
+            {
+                if prev.conn_id != conn_id {
+                    eprintln!(
+                        "[ragents-apiserver] node '{}' re-registered on conn_id={}; cancelling superseded conn_id={}",
+                        node_id, conn_id, prev.conn_id
+                    );
+                    prev.cancel.cancel();
+                }
+            }
             *registered_node_id = Some(node_id.clone());
 
             let effective_dirs = if allowed_workspace_dirs.is_empty() {
@@ -207,19 +253,42 @@ fn handle_daemon_message(
             node_id,
             active_runners,
             running_activation_ids,
-        } => match state.store.heartbeat_node_with_activations(
-            &node_id,
-            active_runners,
-            running_activation_ids,
-            state.lease_ttl_ms,
-        ) {
-            Ok((node, _)) => {
-                send_ack_ok(out_tx, request_id, Some(node.metadata.resource_version));
+        } => {
+            let is_current_conn = registered_node_id.as_ref() == Some(&node_id)
+                && state
+                    .daemon_peers
+                    .lock()
+                    .expect("peers mutex poisoned")
+                    .get(&node_id)
+                    .map(|p| p.conn_id == conn_id)
+                    .unwrap_or(false);
+            if !is_current_conn {
+                eprintln!(
+                    "[ragents-apiserver] ignoring stale Heartbeat for node '{}' from conn_id={} (superseded)",
+                    node_id, conn_id
+                );
+                send_ack_err(
+                    out_tx,
+                    request_id,
+                    format!("stale tunnel connection conn_id={conn_id} for node {node_id}"),
+                );
+                conn_cancel.cancel();
+                return;
             }
-            Err(e) => {
-                send_ack_err(out_tx, request_id, e.to_string());
+            match state.store.heartbeat_node_with_activations(
+                &node_id,
+                active_runners,
+                running_activation_ids,
+                state.lease_ttl_ms,
+            ) {
+                Ok((node, _)) => {
+                    send_ack_ok(out_tx, request_id, Some(node.metadata.resource_version));
+                }
+                Err(e) => {
+                    send_ack_err(out_tx, request_id, e.to_string());
+                }
             }
-        },
+        }
         DaemonToServerMessage::AcceptActivation {
             request_id,
             session_id,
@@ -623,4 +692,142 @@ fn send_ack_err(
         drained_realtime: DrainedRealtimeBatch::default(),
         error: Some(error),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SqliteStore;
+    use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn test_handle_daemon_message_rejects_stale_conn_heartbeat() {
+        let store = SqliteStore::open_in_memory().expect("open store");
+        let state = ApiServerState::new(store, 30_000);
+        let node_id = NodeId::new("node_fenced");
+
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let cancel1 = CancellationToken::new();
+        let mut reg1 = None;
+
+        // 1. conn_id = 1 registers node_fenced
+        handle_daemon_message(
+            &state,
+            1,
+            &cancel1,
+            &tx1,
+            &mut reg1,
+            DaemonToServerMessage::RegisterNode {
+                request_id: "reg_1".into(),
+                node_id: node_id.clone(),
+                hostname: "h".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                labels: BTreeMap::new(),
+                local_models: vec!["gpt-4.1".into()],
+                use_cluster_models: true,
+                default_model: Some("gpt-4.1".into()),
+                default_system_prompt: None,
+                default_permissions: PermissionPolicyLayer::default(),
+                installed_extensions: vec![],
+                allowed_workspace_dirs: vec!["/tmp".into()],
+                max_concurrent_runners: 4,
+                running_activation_ids: Some(vec![]),
+            },
+        );
+        let _ = rx1.recv().await.expect("reg 1 reply");
+
+        // 2. conn_id = 2 re-registers node_fenced -> supersedes and cancels conn_id = 1
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let cancel2 = CancellationToken::new();
+        let mut reg2 = None;
+        handle_daemon_message(
+            &state,
+            2,
+            &cancel2,
+            &tx2,
+            &mut reg2,
+            DaemonToServerMessage::RegisterNode {
+                request_id: "reg_2".into(),
+                node_id: node_id.clone(),
+                hostname: "h".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                labels: BTreeMap::new(),
+                local_models: vec!["gpt-4.1".into()],
+                use_cluster_models: true,
+                default_model: Some("gpt-4.1".into()),
+                default_system_prompt: None,
+                default_permissions: PermissionPolicyLayer::default(),
+                installed_extensions: vec![],
+                allowed_workspace_dirs: vec!["/tmp".into()],
+                max_concurrent_runners: 4,
+                running_activation_ids: Some(vec![]),
+            },
+        );
+        let _ = rx2.recv().await.expect("reg 2 reply");
+        assert!(cancel1.is_cancelled());
+
+        // 3. Create session & accept activation on conn_id = 2
+        let (created, _) = state
+            .store
+            .create_session(CreateSessionRequest {
+                session_id: Some(SessionId::new("sess_fenced")),
+                labels: BTreeMap::new(),
+                spec: SessionSpec {
+                    scheduling: SchedulingMode::Pinned {
+                        node_id: node_id.clone(),
+                        workspace_path: "/tmp".into(),
+                    },
+                    sources: vec![],
+                    producer: None,
+                    desired_phase: DesiredSessionPhase::Open,
+                    system_prompt: None,
+                    model: Some(ModelRequestSpec::new("gpt-4.1")),
+                    extensions: vec![],
+                    permissions: PermissionPolicyLayer::default(),
+                    extra_tmp_dirs: vec![],
+                },
+                initial_message: Some(EnqueueSessionMessageRequest::from_text("go")),
+            })
+            .expect("create sess");
+        let act_id = created.spawned_activation_id.expect("spawned act");
+        let act = state.store.get_activation(&act_id).unwrap().unwrap();
+        state
+            .store
+            .accept_activation(
+                &SessionId::new("sess_fenced"),
+                &act_id,
+                act.status.lease_epoch,
+                ConfigRevision::new_merged("sys".into(), ModelRequestSpec::new("gpt-4.1"), vec![]),
+                PermissionSnapshot::from_effective_policy(PermissionPolicyLayer::default()),
+            )
+            .expect("accept act");
+
+        // 4. Even if conn_id = 1 still delivers an already-buffered stale Heartbeat with empty running_activation_ids,
+        //    it MUST be rejected and MUST NOT interrupt `act_id`!
+        handle_daemon_message(
+            &state,
+            1,
+            &cancel1,
+            &tx1,
+            &mut reg1,
+            DaemonToServerMessage::Heartbeat {
+                request_id: "hb_stale_1".into(),
+                node_id: node_id.clone(),
+                active_runners: 0,
+                running_activation_ids: Some(vec![]),
+            },
+        );
+        match rx1.recv().await.expect("stale hb reply") {
+            ServerToDaemonMessage::Ack { ok, error, .. } => {
+                assert!(!ok);
+                assert!(error.unwrap_or_default().contains("stale tunnel connection"));
+            }
+            other => panic!("expected Ack error, got {other:?}"),
+        }
+
+        let act_after = state.store.get_activation(&act_id).unwrap().unwrap();
+        assert_eq!(act_after.status.phase, ActivationPhase::Running);
+    }
 }

@@ -411,3 +411,195 @@ async fn test_tunnel_reconnect_preserves_inflight_rpc_and_deduplicates_request_i
     tunnel.set_auto_reconnect(false);
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_stale_superseded_tunnel_heartbeat_cannot_interrupt_new_activation() {
+    let store = SqliteStore::open_in_memory().expect("open store");
+    let state = ApiServerState::new(store, DEFAULT_LEASE_TTL_MS);
+    let cancel = CancellationToken::new();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = serve_tcp(listener, state, cancel.clone())
+        .await
+        .expect("serve");
+    let base_url = format!("http://{addr}");
+
+    let client = RagentsClient::new(&base_url);
+    let (stale_tunnel, mut stale_push_rx) = connect_daemon_tunnel(&client.ws_tunnel_url())
+        .await
+        .expect("connect stale tunnel");
+
+    stale_tunnel
+        .register_node(
+            NodeId::new("node_fence_1"),
+            "test-host".to_string(),
+            "linux".to_string(),
+            "x86_64".to_string(),
+            BTreeMap::new(),
+            vec!["gpt-4.1".to_string()],
+            Some("gpt-4.1".to_string()),
+            vec!["shell".to_string()],
+            4,
+        )
+        .await
+        .expect("register stale tunnel");
+
+    client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_fence_1")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Floating {
+                    node_selector: BTreeMap::new(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: Some("System".to_string()),
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("first activation")),
+        })
+        .await
+        .expect("create sess 1");
+
+    let (sess1, act1, epoch1) = match stale_push_rx.recv().await.expect("push 1") {
+        DaemonPushEvent::DispatchActivation {
+            session,
+            activation,
+            lease_epoch,
+            ..
+        } => (
+            SessionId::new(session.metadata.id),
+            ActivationId::new(activation.metadata.id),
+            lease_epoch,
+        ),
+        other => panic!("expected DispatchActivation, got {other:?}"),
+    };
+
+    let cfg = ConfigRevision::new_merged(
+        "System".to_string(),
+        ModelRequestSpec::new("gpt-4.1"),
+        vec![],
+    );
+    let perm = PermissionSnapshot::from_effective_policy(PermissionPolicyLayer::default());
+    stale_tunnel
+        .accept_activation(sess1.clone(), act1.clone(), epoch1, cfg.clone(), perm.clone())
+        .await
+        .expect("accept act1");
+
+    // Reconnect on a brand-new tunnel WITHOUT closing `stale_tunnel` from the client side first
+    // (simulating a half-open / NAT-stalled old socket whose buffered frames flush late).
+    let (new_tunnel, mut new_push_rx) = connect_daemon_tunnel(&client.ws_tunnel_url())
+        .await
+        .expect("connect new tunnel");
+    new_tunnel
+        .register_node_with_running_activations(
+            NodeId::new("node_fence_1"),
+            "test-host".to_string(),
+            "linux".to_string(),
+            "x86_64".to_string(),
+            BTreeMap::new(),
+            vec!["gpt-4.1".to_string()],
+            Some("gpt-4.1".to_string()),
+            None,
+            PermissionPolicyLayer::default(),
+            vec!["shell".to_string()],
+            vec!["/tmp".to_string()],
+            4,
+            Some(vec![act1.clone()]),
+        )
+        .await
+        .expect("register new tunnel");
+
+    // Server should cancel & close `stale_tunnel` upon new registration.
+    let stale_disc = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while let Some(ev) = stale_push_rx.recv().await {
+            if matches!(ev, DaemonPushEvent::Disconnected) {
+                return true;
+            }
+        }
+        true
+    })
+    .await
+    .expect("stale tunnel must be disconnected by server");
+    assert!(stale_disc);
+
+    // Create & accept a second activation on `new_tunnel`.
+    client
+        .create_session(CreateSessionRequest {
+            session_id: Some(SessionId::new("sess_fence_2")),
+            labels: BTreeMap::new(),
+            spec: SessionSpec {
+                scheduling: SchedulingMode::Floating {
+                    node_selector: BTreeMap::new(),
+                },
+                sources: vec![],
+                producer: None,
+                desired_phase: DesiredSessionPhase::Open,
+                system_prompt: Some("System".to_string()),
+                model: Some(ModelRequestSpec::new("gpt-4.1")),
+                extensions: vec![],
+                permissions: PermissionPolicyLayer::default(),
+                extra_tmp_dirs: vec![],
+            },
+            initial_message: Some(EnqueueSessionMessageRequest::from_text("second activation")),
+        })
+        .await
+        .expect("create sess 2");
+
+    let (sess2, act2, epoch2) = match new_push_rx.recv().await.expect("push 2") {
+        DaemonPushEvent::DispatchActivation {
+            session,
+            activation,
+            lease_epoch,
+            ..
+        } => (
+            SessionId::new(session.metadata.id),
+            ActivationId::new(activation.metadata.id),
+            lease_epoch,
+        ),
+        other => panic!("expected DispatchActivation 2, got {other:?}"),
+    };
+    new_tunnel
+        .accept_activation(sess2.clone(), act2.clone(), epoch2, cfg, perm)
+        .await
+        .expect("accept act2");
+
+    // Even if a stale Heartbeat with only `[act1]` (missing `act2`) was sent on `stale_tunnel`
+    // (or attempted right before close), it must fail / be ignored and MUST NOT interrupt `act2`.
+    let _ = stale_tunnel
+        .heartbeat_with_activations(NodeId::new("node_fence_1"), 1, Some(vec![act1]))
+        .await;
+
+    let act2_after = client
+        .get_activation(&act2)
+        .await
+        .expect("get act2")
+        .expect("act2 exists");
+    assert_eq!(act2_after.status.phase, ActivationPhase::Running);
+    assert_eq!(act2_after.status.lease_epoch, epoch2);
+
+    new_tunnel
+        .complete_activation(
+            sess2,
+            act2.clone(),
+            epoch2,
+            None,
+            ActivationTerminalOutcome::Succeeded { usage: None },
+        )
+        .await
+        .expect("complete act2 succeeds without lease_epoch mismatch");
+
+    let act2_done = client
+        .get_activation(&act2)
+        .await
+        .expect("get act2 done")
+        .expect("act2 done exists");
+    assert_eq!(act2_done.status.phase, ActivationPhase::Succeeded);
+
+    cancel.cancel();
+}

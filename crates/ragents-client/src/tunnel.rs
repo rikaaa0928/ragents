@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, Notify};
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio_tungstenite::{client_async_tls_with_config, tungstenite::Message as WsMessage};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -59,6 +59,13 @@ type AckPayload = (
     Option<BatchSeq>,
     Option<SessionId>,
     DrainedRealtimeBatch,
+);
+
+type PendingReplyMap = Arc<Mutex<HashMap<String, oneshot::Sender<ServerToDaemonMessage>>>>;
+type PreparedSingleCall = (
+    String,
+    PendingReplyMap,
+    oneshot::Receiver<ServerToDaemonMessage>,
 );
 
 impl DaemonTunnelHandle {
@@ -531,6 +538,85 @@ impl DaemonTunnelHandle {
         .await
     }
 
+    /// Synchronously registers the pending reply waiter and pushes a single-attempt RPC
+    /// into the active connection's `out_tx`, without awaiting. Callers can hold an external lock
+    /// (such as `active_tasks`) across this synchronous step before `.await`ing `await_single_call`.
+    fn enqueue_single_call(
+        &self,
+        request_id: String,
+        msg: DaemonToServerMessage,
+    ) -> Result<PreparedSingleCall, ClientError> {
+        let (is_disc, out_tx, pending, conn_disc) = {
+            let guard = self.inner.lock().expect("tunnel mutex poisoned");
+            (
+                guard.disconnected.load(Ordering::Acquire),
+                guard.out_tx.clone(),
+                guard.pending.clone(),
+                guard.disconnected.clone(),
+            )
+        };
+        if is_disc {
+            return Err(ClientError::Tunnel("tunnel disconnected".into()));
+        }
+        let (tx, rx) = oneshot::channel();
+        pending
+            .lock()
+            .expect("pending mutex poisoned")
+            .insert(request_id.clone(), tx);
+        if conn_disc.load(Ordering::Acquire) || out_tx.send(msg).is_err() {
+            pending
+                .lock()
+                .expect("pending mutex poisoned")
+                .remove(&request_id);
+            return Err(ClientError::Tunnel("tunnel write channel closed".into()));
+        }
+        Ok((request_id, pending, rx))
+    }
+
+    async fn await_single_call(
+        prepared: Result<PreparedSingleCall, ClientError>,
+        timeout: std::time::Duration,
+    ) -> Result<ServerToDaemonMessage, ClientError> {
+        let (request_id, pending, rx) = prepared?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_)) => Err(ClientError::Tunnel(
+                "tunnel response channel dropped".into(),
+            )),
+            Err(_) => {
+                pending
+                    .lock()
+                    .expect("pending mutex poisoned")
+                    .remove(&request_id);
+                Err(ClientError::Tunnel("tunnel call timed out".into()))
+            }
+        }
+    }
+
+    /// Synchronously enqueues a `Heartbeat` with the given snapshot and returns a future for its reply.
+    pub fn start_heartbeat_with_activations_timeout(
+        &self,
+        node_id: NodeId,
+        active_runners: u32,
+        running_activation_ids: Option<Vec<ActivationId>>,
+        timeout: std::time::Duration,
+    ) -> impl std::future::Future<Output = Result<ResourceVersion, ClientError>> + Send {
+        let request_id = format!("req_{}", Uuid::now_v7());
+        let prepared = self.enqueue_single_call(
+            request_id.clone(),
+            DaemonToServerMessage::Heartbeat {
+                request_id,
+                node_id,
+                active_runners,
+                running_activation_ids,
+            },
+        );
+        async move {
+            let resp = Self::await_single_call(prepared, timeout).await?;
+            Self::expect_ack(resp).map(|(rv, _, _, _)| rv.unwrap_or_default())
+        }
+    }
+
     pub async fn heartbeat_with_activations_timeout(
         &self,
         node_id: NodeId,
@@ -538,21 +624,13 @@ impl DaemonTunnelHandle {
         running_activation_ids: Option<Vec<ActivationId>>,
         timeout: std::time::Duration,
     ) -> Result<ResourceVersion, ClientError> {
-        let request_id = format!("req_{}", Uuid::now_v7());
-        let resp = self
-            .call_with_timeout_internal(
-                DaemonToServerMessage::Heartbeat {
-                    request_id,
-                    node_id,
-                    active_runners,
-                    running_activation_ids,
-                },
-                timeout,
-                1,
-                false,
-            )
-            .await?;
-        Self::expect_ack(resp).map(|(rv, _, _, _)| rv.unwrap_or_default())
+        self.start_heartbeat_with_activations_timeout(
+            node_id,
+            active_runners,
+            running_activation_ids,
+            timeout,
+        )
+        .await
     }
 
     pub async fn accept_activation(
@@ -943,8 +1021,30 @@ pub async fn connect_daemon_tunnel_with_token(
             req.headers_mut().insert("Authorization", val);
         }
     }
+    let uri = req.uri().clone();
+    let raw_host = uri
+        .host()
+        .ok_or_else(|| ClientError::Tunnel("websocket url missing host".into()))?;
+    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
+    let port = uri
+        .port_u16()
+        .or_else(|| match uri.scheme_str() {
+            Some("wss") => Some(443),
+            Some("ws") => Some(80),
+            _ => None,
+        })
+        .ok_or_else(|| ClientError::Tunnel("unsupported websocket url scheme".into()))?;
+    let tcp_stream = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| ClientError::Tunnel(format!("websocket tcp connect failed: {e}")))?;
+    let _ = tcp_stream.set_nodelay(true);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(15))
+        .with_interval(std::time::Duration::from_secs(5));
+    let _ = socket2::SockRef::from(&tcp_stream).set_tcp_keepalive(&keepalive);
+
     crate::ensure_rustls_crypto_provider();
-    let (ws_stream, _) = connect_async(req)
+    let (ws_stream, _) = client_async_tls_with_config(req, tcp_stream, None, None)
         .await
         .map_err(|e| ClientError::WebSocket(Box::new(e)))?;
     let (mut ws_sink, mut ws_source) = ws_stream.split();
@@ -963,13 +1063,22 @@ pub async fn connect_daemon_tunnel_with_token(
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 _ = writer_cancel.cancelled() => {
-                    let _ = ws_sink.close().await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        ws_sink.close(),
+                    )
+                    .await;
                     break;
                 }
                 maybe_msg = out_rx.recv() => {
                     let Some(msg) = maybe_msg else {
-                        let _ = ws_sink.close().await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            ws_sink.close(),
+                        )
+                        .await;
                         break;
                     };
                     if let Ok(text) = serde_json::to_string(&msg) {
@@ -992,6 +1101,7 @@ pub async fn connect_daemon_tunnel_with_token(
     tokio::spawn(async move {
         loop {
             let frame = tokio::select! {
+                biased;
                 _ = reader_cancel.cancelled() => break,
                 next_frame = ws_source.next() => match next_frame {
                     Some(Ok(frame)) => frame,
